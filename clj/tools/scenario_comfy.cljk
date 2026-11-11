@@ -1,0 +1,122 @@
+(ns tools.scenario-comfy
+  "scenario-first の self-hosted (murakumo fleet / gad ComfyUI) ランナー —
+  scenario_seedance.cljs (hosted fal.ai) の対になる実行系。
+
+  エンジン切り替え設計 (superproject ADR-2607252400):
+  - scenario EDN の :scene/engine がエンジン選択の正本。
+      \"seedance-2.0\"      → tools/scenario_seedance.cljs (nbb, fal.ai)
+      \"ltx-2.3\" | \"wan2.2-ti2v-5b\" | \"hunyuanvideo-1.5\" → 本ツール (JVM, gad)
+    未指定は seedance (hosted)。CLI --engine で override 可。
+  - 出力契約は両ランナーで同一: <out-dir>/ に beat クリップ + t<秒>.png
+    (0.35s グリッド) + manifest.edn {:duration :beats [{:beat/id :window
+    :frames}]}。composer (compose_arc00*.clj) はこの契約だけに依存するので
+    エンジン非依存 — 実測 6 エンジンすべて同じ組版を通した
+    (cloud-murakumo resources/video-engine-comparison.edn)。
+  - hosted seedance は multi-shot 1 クリップ / self-hosted は 1 beat =
+    1 クリップ (仮想タイムライン連結) — この差も manifest 契約が吸収する。
+
+  キャラ参照 (i2v): 各 beat の :action 中の最初の @ImageN を cast の ref
+  画像に解決して 1 枚だけ渡す (self-hosted graph は単一参照)。@ImageN が
+  無い beat は t2v。
+
+  usage:
+    COMFY_URL=http://127.0.0.1:18188 \\
+    kbb -M -m tools.scenario-comfy <scenario.edn> <refs-dir> <out-dir> [--engine <id>]
+  (cloud-murakumo を deps に持つ context で実行 — 例: clj/deps.edn の :dev)"
+  (:require [cloud-murakumo.engine :as eng]
+            [cloud-murakumo.executor :as ex]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str])
+  (:import [java.lang ProcessBuilder]))
+
+(def comfy-engines #{"ltx-2.3" "wan2.2-ti2v-5b" "hunyuanvideo-1.5"})
+
+(defn- sh! [& argv]
+  (let [p (.start (doto (ProcessBuilder. ^java.util.List (vec argv))
+                    (.redirectErrorStream true)))
+        out (slurp (.getInputStream p))]
+    (when-not (zero? (.waitFor p))
+      (throw (ex-info "command failed" {:argv argv :out out})))
+    out))
+
+(defn- beat-ref
+  "beat の :action 中の最初の @ImageN → cast の :ref ファイル名 (無ければ nil)。"
+  [beat cast]
+  (when-let [[_ n] (re-find #"@Image(\d)" (or (:action beat) ""))]
+    (:ref (nth cast (dec (Long/parseLong n)) nil))))
+
+(defn- beat-prompt [scenario beat]
+  (let [names (into {} (map (fn [c] [(:image c) (:name c)]) (:scene/cast scenario)))
+        act (reduce (fn [a [img nm]] (str/replace a (str img " (" nm ")") nm))
+                    (:action beat) names)]
+    (str (:scene/style scenario) ". "
+         (:shot beat) ": " (:location beat) ". " act ".")))
+
+(defn generate-beat!
+  [{:keys [engine comfy-url refs-dir out-dir scenario]} {:keys [beat/id] :as beat}]
+  (let [ref (beat-ref beat (:scene/cast scenario))
+        job {:gen.job/engine :comfy
+             :gen.job/modality :video
+             :gen.job/model engine
+             :gen.job/input (cond-> {:prompt (beat-prompt scenario beat)
+                                     :params {:width 768 :height 448 :frames 49
+                                              :seed (+ 1000 (or id 0))}}
+                              ref (assoc :refs [(str (io/file refs-dir ref))]))}
+        inv (-> (eng/invocation job)
+                (assoc-in [:backend :url] comfy-url))
+        {:keys [outputs]} (ex/execute inv)
+        dst (io/file out-dir (str "beat" id ".mp4"))]
+    (io/copy (io/file (first outputs)) dst)
+    dst))
+
+(defn- clip-duration [f]
+  (Double/parseDouble
+   (str/trim (sh! "ffprobe" "-v" "error" "-show_entries" "format=duration"
+                  "-of" "default=noprint_wrappers=1:nokey=1" (str f)))))
+
+(defn- sample-frames!
+  "仮想タイムライン: beat i のクリップを [off, off+dur) に置き、0.35s グリッドで
+  フレームを抜いて global 時刻名 t<g>.png で保存。manifest.edn を書く。"
+  [out-dir scenario clips]
+  (let [durs (mapv clip-duration clips)
+        offs (vec (reductions + 0.0 durs))
+        beats (vec (map-indexed
+                    (fn [i clip]
+                      (let [off (nth offs i) du (nth durs i)
+                            frames (loop [t 0.1 acc []]
+                                     (if (>= t (- du 0.04))
+                                       acc
+                                       (let [g (+ off t)
+                                             fn* (format "t%.2f.png" g)]
+                                         (sh! "ffmpeg" "-v" "error" "-ss" (format "%.2f" t)
+                                              "-i" (str clip) "-frames:v" "1" "-y"
+                                              (str (io/file out-dir fn*)))
+                                         (recur (+ t 0.35) (conj acc fn*)))))]
+                        {:beat/id i :window [off (+ off du)] :frames frames}))
+                    clips))]
+    (spit (io/file out-dir "manifest.edn")
+          (pr-str {:scene/id (:scene/id scenario)
+                   :video "virtual" :duration (last offs) :beats beats}))))
+
+(defn -main [& args]
+  (let [[scenario-path refs-dir out-dir & flags] args
+        scenario (edn/read-string (slurp scenario-path))
+        engine (or (second (drop-while #(not= "--engine" %) flags))
+                   (:scene/engine scenario))
+        comfy-url (or (System/getenv "COMFY_URL")
+                      (System/getenv "MURAKUMO_COMFY_URL")
+                      (throw (ex-info "COMFY_URL not set" {})))]
+    (when-not (contains? comfy-engines engine)
+      (throw (ex-info "not a self-hosted comfy engine — hosted seedance は tools/scenario_seedance.cljs を使う"
+                      {:engine engine :self-hosted comfy-engines})))
+    (io/make-parents (io/file out-dir "x"))
+    (let [ctx {:engine engine :comfy-url comfy-url :refs-dir refs-dir
+               :out-dir out-dir :scenario scenario}
+          clips (mapv (fn [b]
+                        (println "=== beat" (:beat/id b)
+                                 (if (beat-ref b (:scene/cast scenario)) "(i2v)" "(t2v)") "===")
+                        (generate-beat! ctx b))
+                      (:scene/beats scenario))]
+      (sample-frames! out-dir scenario clips)
+      (println "wrote" (str (io/file out-dir "manifest.edn"))))))

@@ -1,0 +1,97 @@
+{
+  "_note": "Sample storyboard in the ai.gftd.mangaka.page record shape (post-lexicon-extension). Coordinates are integer permille (‰, 0-1000) of the full board (外枠, bleed included). Panel gaze.* coords are panel-local permille. Used by komawari_blueprint_pdf.py to render a layout blueprint PDF demonstrating printGeometry (内枠/仕上がり/断ち切り), bleed (断ち切り), shot (引き/寄り + move) and gaze (視線範囲/遷移/印象).",
+  "pages": [
+    {
+      "pageNum": 1,
+      "pageTitle": "Arc0-1 開幕 — Renの部屋 / establishing",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 55, "gutterPermille": 13 },
+      "rhythm": { "tempo": "release", "opensOn": "hiki", "climaxPanelOrder": 1, "readingPath": [1, 2, 3] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 470, "bleed": ["top", "left", "right"],
+          "shot": { "scale": "WS", "framing": "hiki", "angle": "eye", "move": "pull-back", "emphasis": 85 },
+          "gaze": { "focusX": 500, "focusY": 360, "regionX": 80, "regionY": 80, "regionW": 840, "regionH": 760, "entryX": 880, "entryY": 140, "exitX": 760, "exitY": 880, "impression": "awe" },
+          "speakers": [] },
+        { "order": 2, "x": 510, "y": 490, "w": 473, "h": 493, "bleed": [],
+          "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "push-in", "emphasis": 50 },
+          "gaze": { "focusX": 500, "focusY": 440, "regionX": 120, "regionY": 120, "regionW": 760, "regionH": 760, "entryX": 500, "entryY": 60, "exitX": 70, "exitY": 520, "impression": "tension" },
+          "speakers": ["ren"] },
+        { "order": 3, "x": 17, "y": 490, "w": 473, "h": 493, "bleed": ["left", "bottom"],
+          "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 62 },
+          "gaze": { "focusX": 540, "focusY": 420, "regionX": 200, "regionY": 150, "regionW": 640, "regionH": 640, "entryX": 940, "entryY": 470, "exitX": 500, "exitY": 920, "impression": "dread" },
+          "speakers": ["ren"] }
+      ]
+    },
+    {
+      "pageNum": 2,
+      "pageTitle": "侵入 / action — accel",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 55, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "accel", "opensOn": "yori", "climaxPanelOrder": 5, "readingPath": [1, 2, 3, 4, 5] },
+      "panels": [
+        { "order": 1, "x": 510, "y": 17, "w": 473, "h": 300, "bleed": ["top", "right"],
+          "shot": { "scale": "ECU", "framing": "yori", "angle": "low", "move": "push-in", "emphasis": 70 },
+          "gaze": { "focusX": 520, "focusY": 420, "regionX": 200, "regionY": 150, "regionW": 600, "regionH": 600, "entryX": 880, "entryY": 120, "exitX": 80, "exitY": 600, "impression": "tension" },
+          "speakers": [] },
+        { "order": 2, "x": 17, "y": 17, "w": 473, "h": 300, "bleed": ["top", "left"],
+          "shot": { "scale": "CU", "framing": "yori", "angle": "dutch", "move": "static", "emphasis": 55 },
+          "gaze": { "focusX": 480, "focusY": 440, "regionX": 180, "regionY": 160, "regionW": 640, "regionH": 600, "entryX": 920, "entryY": 200, "exitX": 480, "exitY": 920, "impression": "ominous" },
+          "speakers": [] },
+        { "order": 3, "x": 510, "y": 330, "w": 473, "h": 300, "bleed": [],
+          "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "pan-left", "emphasis": 50 },
+          "gaze": { "focusX": 600, "focusY": 500, "regionX": 120, "regionY": 200, "regionW": 760, "regionH": 520, "entryX": 500, "entryY": 60, "exitX": 70, "exitY": 540, "impression": "speed" },
+          "speakers": ["yuto"] },
+        { "order": 4, "x": 17, "y": 330, "w": 473, "h": 300, "bleed": [],
+          "shot": { "scale": "insert", "framing": "yori", "angle": "high", "move": "static", "emphasis": 45 },
+          "gaze": { "focusX": 500, "focusY": 500, "regionX": 250, "regionY": 250, "regionW": 500, "regionH": 500, "entryX": 920, "entryY": 200, "exitX": 500, "exitY": 940, "impression": "tension" },
+          "speakers": [] },
+        { "order": 5, "x": 17, "y": 645, "w": 966, "h": 338, "bleed": ["bottom", "left", "right"],
+          "shot": { "scale": "WS", "framing": "hiki", "angle": "worms-eye", "move": "pull-back", "emphasis": 95 },
+          "gaze": { "focusX": 500, "focusY": 480, "regionX": 60, "regionY": 100, "regionW": 880, "regionH": 760, "entryX": 920, "entryY": 120, "exitX": 120, "exitY": 820, "impression": "impact" },
+          "speakers": ["yuto", "ren"] }
+      ]
+    },
+    {
+      "pageNum": 3,
+      "pageTitle": "対峙 / splash — hold",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 55, "gutterPermille": 13 },
+      "rhythm": { "tempo": "hold", "opensOn": "hiki", "climaxPanelOrder": 1, "readingPath": [1] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 1000, "bleed": ["top", "right", "bottom", "left"],
+          "shot": { "scale": "WS", "framing": "hiki", "angle": "birds-eye", "move": "pull-back", "emphasis": 100 },
+          "gaze": { "focusX": 500, "focusY": 440, "regionX": 60, "regionY": 60, "regionW": 880, "regionH": 880, "entryX": 900, "entryY": 120, "exitX": 120, "exitY": 880, "impression": "impact" },
+          "speakers": ["yuto"] }
+      ]
+    },
+    {
+      "pageNum": 4,
+      "pageTitle": "会話 / dialogue — sustain grid",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 55, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "sustain", "opensOn": "yori", "climaxPanelOrder": 5, "readingPath": [1, 2, 3, 4, 5, 6] },
+      "panels": [
+        { "order": 1, "x": 508, "y": 17, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "MCU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 45 },
+          "gaze": { "focusX": 500, "focusY": 400, "regionX": 150, "regionY": 150, "regionW": 700, "regionH": 600, "entryX": 880, "entryY": 120, "exitX": 80, "exitY": 500, "impression": "calm" },
+          "speakers": ["ren"] },
+        { "order": 2, "x": 17, "y": 17, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 45 },
+          "gaze": { "focusX": 480, "focusY": 420, "regionX": 160, "regionY": 150, "regionW": 680, "regionH": 600, "entryX": 920, "entryY": 200, "exitX": 480, "exitY": 940, "impression": "calm" },
+          "speakers": ["yuto"] },
+        { "order": 3, "x": 508, "y": 342, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 48 },
+          "gaze": { "focusX": 520, "focusY": 460, "regionX": 140, "regionY": 180, "regionW": 720, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 80, "exitY": 520, "impression": "calm" },
+          "speakers": ["ren", "yuto"] },
+        { "order": 4, "x": 17, "y": 342, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 },
+          "gaze": { "focusX": 500, "focusY": 420, "regionX": 160, "regionY": 160, "regionW": 680, "regionH": 580, "entryX": 920, "entryY": 200, "exitX": 480, "exitY": 940, "impression": "melancholy" },
+          "speakers": ["ren"] },
+        { "order": 5, "x": 508, "y": 671, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 58 },
+          "gaze": { "focusX": 500, "focusY": 420, "regionX": 220, "regionY": 200, "regionW": 560, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 80, "exitY": 520, "impression": "tension" },
+          "speakers": ["yuto"] },
+        { "order": 6, "x": 17, "y": 671, "w": 475, "h": 312, "bleed": [],
+          "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 48 },
+          "gaze": { "focusX": 500, "focusY": 460, "regionX": 150, "regionY": 180, "regionW": 700, "regionH": 560, "entryX": 920, "entryY": 200, "exitX": 500, "exitY": 940, "impression": "calm" },
+          "speakers": ["ren"] }
+      ]
+    }
+  ]
+}

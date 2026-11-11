@@ -1,0 +1,41 @@
+(ns mangaka.runtime
+  "Process-wide wiring (JVM): picks the durable store backend and holds the
+  in-memory langchain.db connection used for chat conversation checkpoints.
+  (Generation / comfy_run graphs are one-shot and use throwaway per-call
+  conns — see comfy/fresh-scratch — so they never touch this conn.)
+
+  Backend selection: KOTOBA_XRPC_URL present → kotoba-datomic, else the
+  in-memory store (the default, fully-exercised path)."
+  (:require [mangaka.store :as store]
+            [mangaka.store.kotoba :as kotoba]
+            [mangaka.checkpoint :as chk]
+            [mangaka.blob :as blob]
+            [langchain.db :as db]))
+
+(defn make-store []
+  (if (or (System/getenv "KOTOBA_XRPC_URL") (System/getenv "KOTOBA_URL"))
+    (kotoba/kotoba-store)
+    (store/mem-store)))
+
+(defn make-blobs
+  "Filesystem blob store when MANGAKA_BLOB_DIR is set (persistent), else
+  in-memory."
+  []
+  (if-let [dir (System/getenv "MANGAKA_BLOB_DIR")]
+    (blob/fs-blobs dir)
+    (blob/mem-blobs)))
+
+(defn scratch-conn
+  "A langchain.db conn carrying the latest-only checkpoint schema, for chat
+  conversation continuity (bounded: one checkpoint datom per thread)."
+  []
+  (db/create-conn chk/schema))
+
+(defonce ^{:doc "Lazily-built singletons for the running server."} state
+  (delay {:store (make-store)
+          :scratch (scratch-conn)
+          :blobs (make-blobs)}))
+
+(defn store* [] (:store @state))
+(defn scratch* [] (:scratch @state))
+(defn blobs* [] (:blobs @state))

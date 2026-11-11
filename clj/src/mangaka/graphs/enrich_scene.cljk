@@ -1,0 +1,40 @@
+(ns mangaka.graphs.enrich-scene
+  "enrichScene — derive structured metadata for a stored scene with the LLM
+  (the environment counterpart of enrichCharacters). Loads the scene by :id,
+  asks for a JSON object describing it, and stores the parsed map under
+  :scene/enrichment. Offline (no ANTHROPIC_API_KEY) the mock reply doesn't
+  parse, so a stub is stored and :llm-applied is false. Requires :id."
+  (:require [langgraph.graph :as g]
+            [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(def ^:private system
+  "You are a manga art director. Given a scene, reply with ONLY a JSON object:
+  {\"mood\":\"…\", \"lighting\":\"…\", \"palette\":[…], \"props\":[…]}. No prose.")
+
+(defn make [store]
+  (-> (g/state-graph {:channels {:input {} :scene {} :enrichment {} :applied {} :result {}}})
+      (g/add-node :enrich
+                  (fn [{:keys [input]}]
+                    (domain/require-input! input [:id])
+                    (let [scene (or (store/load-scene store (:id input))
+                                    (throw (ex-info (str "scene not found: " (:id input)) {:type :bad-input})))
+                          user  (str "Scene: " (:scene/name scene) "\n" (:scene/prompt scene))
+                          derived (llm/complete-json system user)]
+                      {:scene scene
+                       :applied (some? derived)
+                       :enrichment (or derived {:note "no structured enrichment (offline/mock)"})})))
+      (g/add-node :persist
+                  (fn [{:keys [input enrichment applied]}]
+                    (store/save-scene! store {:id (:id input) :enrichment (pr-str enrichment)})
+                    {:result {:scene-id (:id input)
+                              :enrichment enrichment
+                              :llm-applied (boolean applied)}}))
+      (g/set-entry-point :enrich)
+      (g/add-edge :enrich :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(def handler util/result-handler)

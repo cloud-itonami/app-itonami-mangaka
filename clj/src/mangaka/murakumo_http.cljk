@@ -1,0 +1,101 @@
+(ns mangaka.murakumo-http
+  "mangaka's binding of the shared murakumo generation client to this JVM host.
+
+  Why mangaka needs an HTTP route at all, when it already depends on
+  cloud-murakumo in-process: the in-process paths do not have a working
+  credential.
+
+    :seedance  -- hosted fal.ai. mangaka.video pinned it as the default model,
+                  but murakumo.edn itself records that no real API key has ever
+                  been exercised for it, and backend-token returns nothing
+                  here, so generate-video! degraded to a placeholder SVG every
+                  time. A panel pipeline that always stubs is not a pipeline.
+    :comfy     -- self-hosted, and cloud-murakumo.executor CAN drive it in
+                  process, but it needs a reachable ComfyUI endpoint. That is
+                  the same unset COMFY_POD_URL that had dougaka shipping
+                  flat-colour cards nightly (ADR-2607299960).
+
+  The public generation API is the one route that is actually working: a
+  generation-scope token exists, and real clips were produced through it on
+  2026-07-29 (ltx-2.3 and wan2.2-ti2v-5b). Everything expensive about talking
+  to it — the host that accepts the token, rebasing advertised artifact URLs,
+  the accepted geometry and frame ranges, digest verification, cold-start
+  retry — lives in murakumo.generation, so this namespace is only the four
+  host primitives.
+
+  Auth: env MURAKUMO_GENERATION_TOKEN. Read here, passed down, never logged."
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [jsonista.core :as j]
+            [murakumo.generation :as gen]
+            [murakumo.generation.client :as client])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.nio.file Files]
+           [java.security MessageDigest]
+           [java.time Duration]))
+
+(def ^:private mapper (j/object-mapper {:decode-key-fn true}))
+
+(defn token []
+  (let [t (str/trim (str (or (System/getenv "MURAKUMO_GENERATION_TOKEN") "")))]
+    (when-not (str/blank? t) t)))
+
+(defn base-url [] (gen/endpoint (System/getenv "MURAKUMO_GENERATION_URL")))
+
+(defn- http ^HttpClient []
+  (-> (HttpClient/newBuilder) (.connectTimeout (Duration/ofSeconds 20)) (.build)))
+
+(defn request!
+  "method+url(+body map) -> {:status int :body map}. A transport failure comes
+  back as status 0 rather than an exception, so the client's own reporting
+  stays the single place a failure is explained."
+  [method url body token]
+  (try
+    (let [b (doto (HttpRequest/newBuilder (URI/create url))
+              (.timeout (Duration/ofSeconds 60))
+              (.header "authorization" (str "Bearer " token)))
+          _ (if body
+              (doto b
+                (.header "content-type" "application/json")
+                (.method method (HttpRequest$BodyPublishers/ofString
+                                 (j/write-value-as-string body))))
+              (.method b method (HttpRequest$BodyPublishers/noBody)))
+          resp (.send (http) (.build b) (HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp)
+       :body (when (seq (.body resp))
+               (try (j/read-value (.body resp) mapper) (catch Exception _ nil)))})
+    (catch Exception e {:status 0 :error (.getMessage e)})))
+
+(defn download! [url out token]
+  (try
+    (let [b (doto (HttpRequest/newBuilder (URI/create url))
+              (.timeout (Duration/ofMinutes 5)))
+          _ (when token (.header b "authorization" (str "Bearer " token)))
+          resp (.send (http) (.build b) (HttpResponse$BodyHandlers/ofInputStream))]
+      (when (<= 200 (.statusCode resp) 299)
+        (io/copy (.body resp) (io/file out))
+        out))
+    (catch Exception _ nil)))
+
+(defn sha256-hex [f]
+  (let [d (.digest (MessageDigest/getInstance "SHA-256")
+                   (Files/readAllBytes (.toPath (io/file f))))]
+    (apply str (map #(format "%02x" (bit-and % 0xff)) d))))
+
+(defn opts []
+  {:base (base-url) :token (token)
+   :request! request! :download! download! :sha256-hex sha256-hex
+   :delete! (fn [p] (io/delete-file (io/file p) true))
+   :sleep! (fn [ms] (Thread/sleep (long ms)))})
+
+(defn video!
+  "Panel-source clip from the fleet's self-hosted :video models.
+
+  Returns {:file :cid :job-id} or nil (the client warns with the reason, so a
+  stub never reads as a successful render)."
+  [{:keys [prompt seconds width height seed model]} out]
+  (client/video! {:prompt prompt :seconds seconds :width width :height height
+                  :seed seed :model model}
+                 (str out) (opts)))

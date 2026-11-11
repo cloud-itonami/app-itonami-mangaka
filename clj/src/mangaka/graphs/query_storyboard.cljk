@@ -1,0 +1,39 @@
+(ns mangaka.graphs.query-storyboard
+  "Datalog queries over the decomposed storyboard, exposed over HTTP — the
+  payoff of storing storyboards as datoms (rather than opaque blobs): clients
+  can ask \"which documents / panels feature character X\" (documentsByCharacter)
+  or \"which documents are set in scene Y\" (documentsByScene). No Python
+  equivalent — these became possible only once the data model went
+  Datomic-native."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]))
+
+(defn make
+  "documentsByCharacter — requires :character (a name like \"Nei\" or a full
+  ref \":character/Nei\")."
+  [store]
+  (util/single-node
+   :query
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:character])
+     ;; resolve case-insensitively against the stored cast; fall back to the
+     ;; normalized input (→ empty result) when no panel features the character.
+     (let [ref (or (store/resolve-character-ref store (:character input))
+                   (domain/character-ref (:character input)))]
+       {:character ref
+        :documents (store/documents-with-character store ref)
+        :panels (store/panels-with-character store ref)}))))
+
+(defn make-by-scene
+  "documentsByScene — requires :scene (a scene id like \"scene-rens-room\")."
+  [store]
+  (util/single-node
+   :query-scene
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:scene])
+     {:scene (:scene input)
+      :documents (store/documents-with-scene store (:scene input))
+      :panels (store/panels-with-scene store (:scene input))})))
+
+(def handler util/result-handler)

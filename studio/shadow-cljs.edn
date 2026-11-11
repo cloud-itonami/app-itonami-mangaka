@@ -1,0 +1,11 @@
+;; The editor bundle, compiled from the kami-genko library on the classpath.
+;;
+;; `:asset-path "js"` is RELATIVE, and has to be: this page is served under a
+;; path prefix (app.itonami.cloud/mangaka/), and the fleet dispatcher strips
+;; that prefix before the Worker sees the request. An absolute asset path would
+;; be correct on neither side of that strip.
+{:deps   {:aliases [:cljs]}
+ :builds {:studio {:target     :browser
+                   :output-dir "dist/js"
+                   :asset-path "js"
+                   :modules    {:genko-app {:init-fn kami.mangaka.genko-app/main}}}}}

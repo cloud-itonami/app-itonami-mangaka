@@ -1,0 +1,193 @@
+(ns mangaka.graphs.generate-page
+  "mangaka_generate_page — render a composed page image for a stored
+  storyboard document. Unlike the other generation graphs, its :plan
+  *reads* the durable store: it loads the document and composes the
+  diffusion prompt from the page's title, base tags and panel shots
+  (the storyboard SSoT drives the render). Requires :doc-id.
+
+  A plan→render→persist graph (see mangaka.graphs.gen); the store-read
+  is injected by closing `plan*` over the store in `make`."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kami.mangaka.page :as page-compose])
+            #?(:clj [kami.mangaka.genko-project :as genko-project])
+            [langgraph.graph :as g]
+            [mangaka.blob :as blob]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.gen :as gen]
+            [mangaka.store :as store])
+  #?(:clj (:import [java.awt AlphaComposite]
+                   [java.awt.image BufferedImage]
+                   [java.io ByteArrayInputStream ByteArrayOutputStream]
+                   [javax.imageio ImageIO]
+                   [java.nio.file Files]
+                   [java.util Base64])))
+
+(defn- compose-prompt
+  "Builds a page-level prompt from a storyboard lexicon — title, the cast
+  appearing across the panels, distinct shots, the backgrounds (resolved scene
+  prompts) and base tags. Mirrors how generate_panel composes, so the page
+  render reflects the actual storyboard content."
+  [lexicon scene-prompts extra]
+  (let [shots (->> (:panels lexicon) (keep :shot) distinct (str/join ", "))
+        cast  (->> (:panels lexicon) (mapcat :focal) (remove str/blank?) distinct (str/join ", "))]
+    (->> [(when-let [t (not-empty (:pageTitle lexicon))] (str "manga page: " t))
+          "full manga page layout, multiple panels, monochrome, screentone"
+          (not-empty cast)
+          (not-empty shots)
+          (some->> scene-prompts seq distinct (str/join ", "))
+          (some->> (:baseTags lexicon) seq (str/join ", "))
+          extra]
+         (remove nil?) (str/join ", "))))
+
+(defn- plan* [store {:keys [doc-id prompt negative seed width height model]}]
+  (let [doc (store/load-document store doc-id)
+        _   (when-not doc
+              (throw (ex-info (str "document not found: " doc-id) {:type :bad-input})))
+        lexicon (domain/export-lexicon (:page doc))
+        ;; resolve the panels' linked scenes to their prompts (the backgrounds)
+        scene-prompts (->> (:panels lexicon) (keep :scene) distinct
+                           (keep #(:scene/prompt (store/load-scene store %))))]
+    {:prompt (compose-prompt lexicon scene-prompts prompt)
+     :negative (or negative "lowres, bad anatomy, worst quality")
+     :seed (or seed 0) :width (or width 896) :height (or height 1280) :model model}))
+
+(defn- persist [store input spec render]
+  (let [pid (or (:page-render-id input) (domain/page-render-id (:doc-id input)))]
+    (store/save-page-render! store {:id pid :doc-id (:doc-id input)
+                                    :prompt (:prompt spec) :seed (:seed spec) :model (:model spec)
+                                    :image-key (:image-key render)
+                                    :image-b64 (when-not (:image-key render) (:image-b64 render))
+                                    :image-mime (:mime render)})
+    {:page-render-id pid :doc-id (:doc-id input) :image-b64 (:image-b64 render)
+     :image-key (:image-key render) :image-url (:image-url render)
+     :mime (:mime render) :source (:source render) :seed (:seed spec) :run-id (:run-id render)}))
+
+(def ^:private opts {:require [:doc-id]})
+
+#?(:clj
+   (defn- compose-input-page [page]
+     {:layout (:page/layout page)
+      :panels
+      (mapv (fn [idx panel]
+              {:id (str "panel-" idx)
+               :rect (:panel/rect panel)
+               :size (or (:panel/size panel) "half")
+               :tone (:panel/tone panel)
+               :dialogue (mapv (fn [b]
+                                 {:text (:bubble/text b)
+                                  :speaker (:bubble/speaker b)
+                                  :bubble (keyword (or (:bubble/shape b) "oval"))
+                                  :weight (:bubble/weight b)
+                                  :scale (:bubble/scale b)
+                                  :pos (:bubble/pos b) :width (:bubble/width b)
+                                  :height (:bubble/height b)
+                                  :tail-target (:bubble/tail-target b)
+                                  :writing-mode (:bubble/writing-mode b)
+                                  :columns (:bubble/columns b)
+                                  :emotion (:bubble/emotion b)})
+                               (:panel/bubbles panel))
+               :sfx (mapv (fn [s] {:text (:sfx/text s) :scale (:sfx/scale s)
+                                    :style (:sfx/style s)})
+                          (:panel/sfx panel))})
+            (range) (:page/panels page))}))
+
+#?(:clj
+   (defn- panel-image-b64 [store blobs {:keys [id]}]
+     (let [render (store/load-panel store id)]
+       (or (:panel/image-b64 render)
+           (when-let [key (:panel/image-key render)]
+             (:b64 (blob/fetch blobs key)))))))
+
+#?(:clj
+   (defn- resolve-layer-b64 [blobs image]
+     (or (:image-b64 image)
+         (when-let [key (:image-key image)] (:b64 (blob/fetch blobs key))))))
+
+#?(:clj
+   (defn- flatten-layers [blobs render]
+     (let [{:keys [background characters props]} (:layers render)
+           layers (keep identity (concat [background] characters props))
+           decoded (keep (fn [layer]
+                           (when-let [b64 (resolve-layer-b64 blobs layer)]
+                             (when-let [image (ImageIO/read
+                                               (ByteArrayInputStream.
+                                                (.decode (Base64/getDecoder) ^String b64)))]
+                               [layer image])))
+                         layers)]
+       (when-let [[_ first-image] (first decoded)]
+         (let [canvas (BufferedImage. (.getWidth first-image) (.getHeight first-image)
+                                      BufferedImage/TYPE_INT_ARGB)
+               g (.createGraphics canvas)]
+           (try
+             (doseq [[layer image] decoded :when image]
+               (.setComposite g (AlphaComposite/getInstance AlphaComposite/SRC_OVER
+                                                            (float (or (:opacity layer) 1.0))))
+               (.drawImage g image 0 0 (.getWidth canvas) (.getHeight canvas) nil))
+             (let [out (ByteArrayOutputStream.)]
+               (ImageIO/write canvas "png" out)
+               (.encodeToString (Base64/getEncoder) (.toByteArray out)))
+             (finally (.dispose g))))))))
+
+#?(:clj
+   (defn- compose-render [store blobs spec]
+     (let [dir (.toFile (Files/createTempDirectory "mangaka-page-compose-"
+                                                   (make-array java.nio.file.attribute.FileAttribute 0)))
+           out (io/file dir "page.png")
+           renders (if (:renders spec)
+                     (mapv (fn [idx render] {:index idx :layer-render render})
+                           (range) (:renders spec))
+                     (store/renders-for-document store (:doc-id spec)))
+           files (into {}
+                       (keep (fn [{:keys [index layer-render] :as header}]
+                               (when-let [b64 (if layer-render
+                                                (flatten-layers blobs layer-render)
+                                                (panel-image-b64 store blobs header))]
+                                 (let [f (io/file dir (str "panel-" index ".png"))]
+                                   (Files/write (.toPath f)
+                                                (.decode (Base64/getDecoder) ^String b64)
+                                                (make-array java.nio.file.OpenOption 0))
+                                   [(str "panel-" index) f]))))
+                       renders)]
+       (try
+         (page-compose/compose-page! (compose-input-page (:page spec)) files (.getPath out))
+         {:image-b64 (.encodeToString (Base64/getEncoder)
+                                     (Files/readAllBytes (.toPath out)))
+          :mime "image/png" :source "deterministic-compose"}
+         (finally
+           (doseq [f (.listFiles dir)] (.delete f))
+           (.delete dir))))))
+
+#?(:clj
+   (defn- build-compose [store blobs]
+     (-> (g/state-graph {:channels {:input {} :spec {} :render {} :result {}}})
+         (g/add-node :plan
+                     (fn [{:keys [input]}]
+                       (let [spec (plan* store input)
+                             doc (store/load-document store (:doc-id input))
+                             projected (when-let [genko (:genko input)]
+                                         (genko-project/doc->page genko))]
+                         {:spec (cond-> (assoc spec :doc-id (:doc-id input)
+                                                   :page (or (:page projected) (:page doc)))
+                                  projected (assoc :renders (:renders projected)))})))
+         (g/add-node :compose
+                     (fn [{:keys [spec]}]
+                       (let [render (compose-render store blobs spec)]
+                         {:render (if (and blobs (:image-b64 render))
+                                    (let [key (blob/put! blobs (:image-b64 render) (:mime render))]
+                                      (assoc render :image-key key :image-url (str "/blob/" key)))
+                                    render)})))
+         (g/add-node :persist
+                     (fn [{:keys [input spec render]}]
+                       {:result (persist store input spec render)}))
+         (g/set-entry-point :plan)
+         (g/add-edge :plan :compose)
+         (g/add-edge :compose :persist)
+         (g/set-finish-point :persist)
+         (g/compile-graph))))
+
+(defn make [store blobs]
+  #?(:clj (build-compose store blobs)
+     :cljs (gen/build store blobs {:plan #(plan* store %) :persist persist})))
+(defn handler [compiled] (gen/handler compiled opts))
+(defn stream-handler [compiled] (gen/stream-handler compiled opts))

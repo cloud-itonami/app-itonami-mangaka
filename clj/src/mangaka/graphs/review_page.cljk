@@ -1,0 +1,55 @@
+(ns mangaka.graphs.review-page
+  "完成ページのEDN-queryable QA入口。画像のVLM評価値と、storyboard EDNから
+  決定論的に計算するlayout/lettering診断を統合する。画像再生成・レイアウト修正・
+  文字修正を :repair-scope で分離し、モデルの主観的な総合点だけに依存しない。"
+  (:require [kami.mangaka.qa.score :as qa]
+            [mangaka.blob :as blob]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.util :as util]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(defn- review-prompt [page]
+  (str "Review this COMPLETE manga page against the authoritative storyboard EDN="
+       (pr-str page)
+       ". Return JSON only with integer 0-100 keys: prompt_alignment, "
+       "character_identity, required_object_presence, spatial_continuity, "
+       "object_orientation, action_continuity, dialogue_progression, page_composition, "
+       "panel_rhythm, reading_flow, lettering_quality, balloon_placement, sfx_integration, "
+       "manga_expression, pose_physics, speaker_tail_alignment, semantic_line_breaking, "
+       "psychological_lettering. Judge Japanese right-to-left reading order, pose/furniture "
+       "contact, phone orientation, face/hand/focal-object occlusion, balloon size and tails, "
+       "semantic Japanese line breaks, emotion-specific typography, and SFX integration. "
+       "Do not reward polish when the depicted story is wrong."))
+
+(defn- page-image [store blobs doc-id input]
+  (or (:image-b64 input)
+      (let [render (store/load-page-render store (domain/page-render-id doc-id))]
+        (or (:page-render/image-b64 render)
+            (when-let [key (:page-render/image-key render)]
+              (:b64 (blob/fetch blobs key)))))))
+
+(defn make
+  ([store] (make store nil))
+  ([store blobs]
+  (util/single-node
+   :review-page
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [doc (store/load-document store (:doc-id input))]
+       (when-not doc
+         (throw (ex-info (str "document not found: " (:doc-id input))
+                         {:type :bad-input})))
+       (let [image (page-image store blobs (:doc-id input) input)
+             raw-axes (or (:axes input)
+                          (when image (llm/vision-json (review-prompt (:page doc)) image)))
+             structure (qa/page-structure (:page doc))
+             review (qa/page-review (or raw-axes {}) structure
+                                    (or (:threshold input) 75))]
+         (store/save-page-render!
+          store {:id (domain/page-render-id (:doc-id input)) :doc-id (:doc-id input)
+                 :score (:total review) :review (pr-str review)})
+         (assoc review :doc-id (:doc-id input)
+                :vision-applied (boolean (and image raw-axes)))))))))
+
+(def handler util/result-handler)

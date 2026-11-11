@@ -1,0 +1,97 @@
+(ns mangaka.kami-test
+  "The storyboard → KAMI clj engine bridge (mangaka.kami): a storyboard page
+  flows through the same pure path as any KAMI scene —
+  scene → ECS → render-IR frame → ipc/pack — verifiable with no GPU."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.edn]
+            [kotoba.lang.text :as str]
+            [kami.scene :as scene]
+            [mangaka.domain :as domain]
+            [mangaka.kami :as k]
+            [mangaka.preview :as preview]
+            [mangaka.seed :as seed]
+            [mangaka.store :as store]))
+
+(def page
+  {:page/title "Arc01"
+   :page/panels [{:panel/index 0 :panel/rect [0.05 0.05 0.9 0.4] :panel/shot "wide"}
+                 {:panel/index 1 :panel/rect [0.05 0.55 0.9 0.4] :panel/shot "close"}]})
+
+(deftest storyboard->snapshot-is-a-valid-kami-scene
+  (let [snap (k/storyboard->snapshot page)]
+    (is (= 3 (count (:snapshot/entities snap))) "1 camera + 2 panel quads")
+    (is (= 2 (count (:snapshot/assets snap))) "quad mesh + panel material")
+    (is (true? (scene/valid? snap)) "structurally valid KAMI scene")
+    (is (= 1 (count (filter :camera/active? (:snapshot/entities snap)))) "exactly one active camera")))
+
+(deftest panel-rect-helper
+  (testing "domain/panel-rect (shared by KAMI bridge + SVG preview)"
+    (is (= [0.1 0.2 0.3 0.4] (domain/panel-rect {:panel/rect [0.1 0.2 0.3 0.4]} 0)) "valid passes through")
+    (doseq [bad [nil [0.1 0.2] "x" [0.1 0.2 "w" 0.3] [0 0 0 0 0]]]
+      (let [r (domain/panel-rect {:panel/rect bad} 2)]
+        (is (= 4 (count r)))
+        (is (every? number? r)) "malformed → numeric default"))))
+
+(deftest malformed-rect-does-not-crash
+  (testing "a missing / wrong-arity / non-numeric rect falls back to a default"
+    (doseq [bad [nil [0.1 0.2] "x" [0.1 0.2 "w" 0.3] [0.1 0.2 0.3 0.4 0.5]]]
+      (let [snap (k/storyboard->snapshot {:page/panels [{:panel/index 0 :panel/rect bad}]})]
+        (is (= 2 (count (:snapshot/entities snap))) "camera + 1 panel, no crash")
+        (is (true? (scene/valid? snap)))))))
+
+(deftest panel-content-carried-in-material-params
+  (testing "each panel quad carries its storyboard content (shot/focal/scene/bubbles)"
+    (let [snap (k/storyboard->snapshot
+                {:page/panels [{:panel/index 0 :panel/rect [0.0 0.0 1.0 0.5]
+                                :panel/shot "wide" :panel/focal [":character/Nei"]
+                                :panel/scene "scene-rooftop"
+                                :panel/bubbles [{:bubble/text "起動"}]}]})
+          panel (first (filter :material/params (:snapshot/entities snap)))
+          params (clojure.edn/read-string (:material/params panel))]
+      (is (= "wide" (:shot params)))
+      (is (= [":character/Nei"] (:focal params)))
+      (is (= "scene-rooftop" (:scene params)) "the background scene reaches the render-IR")
+      (is (= ["起動"] (:bubbles params))))))
+
+(deftest storyboard->frame-render-ir
+  (let [frame (k/storyboard->frame page)]
+    (is (some? (:frame/camera frame)))
+    (is (= 1 (count (:frame/passes frame))))
+    (is (pos? (count (get-in frame [:frame/passes 0 :pass/draws]))) "panels produce draws")))
+
+(deftest storyboard->packed-bytes-for-gpu
+  (let [{:keys [buffer len columns meta]} (k/storyboard->packed page)]
+    (is (pos? len) "non-empty KamiFrame buffer")
+    (is (= len (count buffer)))
+    (is (seq columns))
+    (is (map? meta))))
+
+(deftest empty-page-yields-camera-only
+  (let [snap (k/storyboard->snapshot {:page/panels []})]
+    (is (= 1 (count (:snapshot/entities snap))) "just the camera")
+    (is (true? (scene/valid? snap)))))
+
+(deftest svg-preview
+  (testing "page→SVG renders panels, shot/focal labels, bubble text, and is xss-escaped"
+    (let [svg (preview/page->svg
+               {:page/title "Arc01 <x>"
+                :page/panels [{:panel/index 0 :panel/rect [0.05 0.05 0.9 0.4]
+                               :panel/shot "wide" :panel/focal [":character/Nei"]
+                               :panel/bubbles [{:bubble/text "起動"}]}
+                              {:panel/index 1 :panel/rect "bad-rect"}]})]
+      (is (str/starts-with? svg "<svg"))
+      (is (= 2 (count (re-seq #"<rect[^>]*stroke" svg))) "one bordered rect per panel (bad rect defaulted)")
+      (is (str/includes? svg "wide"))
+      (is (str/includes? svg "Nei"))
+      (is (str/includes? svg "起動"))
+      (is (str/includes? svg "&lt;x&gt;") "title is HTML-escaped"))))
+
+(deftest seed-document-is-usable-end-to-end
+  (testing "the boot-seed storyboard round-trips, is character-queryable, and renders via KAMI"
+    (let [st (store/mem-store)]
+      (store/save-document! st seed/sample-document)
+      (let [doc (store/load-document st "gh-arc0-1-p1")]
+        (is (= 4 (count (:page/panels (:page doc)))) "4-panel page round-trips")
+        (is (contains? (set (store/documents-with-character st ":character/Nei")) "gh-arc0-1-p1"))
+        (is (true? (scene/valid? (k/storyboard->snapshot (:page doc)))))
+        (is (pos? (count (get-in (k/storyboard->frame (:page doc)) [:frame/passes 0 :pass/draws]))))))))

@@ -1,0 +1,31 @@
+{
+  "name": "mangaka",
+  "compatibility_date": "2026-07-30",
+  "observability": { "enabled": true },
+
+  // Uploaded into ai-gftd-repository-dispatch with --dispatch-namespace, so
+  // this Worker has no URL of its own. itonami-fleet-dispatch reaches it as the
+  // first path segment and strips it:
+  //
+  //     app.itonami.cloud/mangaka/          ->  this Worker sees /
+  //     app.itonami.cloud/mangaka/js/…      ->  this Worker sees /js/…
+  //
+  // The script name must stay `mangaka`, because the router dispatches on the
+  // repository name — this repo is cloud-itonami/mangaka. Adding an app to
+  // app.itonami.cloud is uploading a Worker into the namespace; the router has
+  // no per-app routes to edit and no table of apps to keep in sync.
+  //
+  // Static assets only, and no `main`. The studio talks to the reader
+  // (mangaka.itonami.cloud) directly from the browser — both /api/ and /img/
+  // there send access-control-allow-origin: *, so a proxy here would be a
+  // second copy of the reader's routing with nothing to gain and its own way to
+  // go stale.
+  "assets": { "directory": "dist" }
+
+  // No D1, no R2, no secrets. This surface reads the reader's public API and
+  // writes nothing: what a person assembles lives in their own browser
+  // (localStorage, keyed per work) until they export it as storyboard EDN.
+  // Publishing back into the mangaka pipeline is a separate, authenticated
+  // path — the reader's POST /api/work/:rkey — and is deliberately not wired
+  // into a page that anyone can open.
+}

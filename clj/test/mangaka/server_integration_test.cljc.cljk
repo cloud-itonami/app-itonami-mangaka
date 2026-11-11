@@ -1,0 +1,99 @@
+(ns mangaka.server-integration-test
+  "End-to-end test against the *real* http-kit server (boots a socket on a test
+  port), covering paths the ring-handler unit tests can't: the actual server
+  wiring, the startup seed, the SSE `/runs/stream` as-channel path, and the
+  raw `/preview/:id` route. Uses the http-kit client over the wire."
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.text :as str]
+            [org.httpkit.client :as hc]
+            [mangaka.server :as server]))
+
+(def ^:private port 18137)
+(def ^:private base (str "http://localhost:" port))
+
+(use-fixtures :once
+  (fn [run]
+    (server/start! port)
+    (try (run) (finally (server/stop!)))))
+
+(defn- GET [path] @(hc/get (str base path) {:as :text}))
+(defn- POST [path body] @(hc/post (str base path)
+                                  {:headers {"content-type" "application/edn"} :body body :as :text}))
+
+(deftest health-over-real-http
+  (let [{:keys [status body]} (GET "/health")]
+    (is (= 200 status))
+    (is (str/includes? body ":status"))))
+
+(deftest seed-present-after-boot
+  (testing "the startup seed populated the real server's store"
+    (let [{:keys [status body]} (POST "/xrpc/ai.gftd.mangaka.listCharacters" "{}")]
+      (is (= 200 status))
+      (is (str/includes? body "char-nei")))
+    (let [{:keys [body]} (GET "/preview/gh-arc0-1-p1")]
+      (is (str/starts-with? body "<svg")))))
+
+(deftest runs-stream-sse-over-real-http
+  (testing "the SSE /runs/stream path streams metadata → node* → values → end"
+    (let [{:keys [status body]}
+          (POST "/runs/stream"
+                "{:nsid \"ai.gftd.mangaka.mangakaGeneratePanel\" :input {:prompt \"neon\" :seed 1}}")]
+      (is (= 200 status))
+      (is (str/includes? body "\"event\":\"metadata\""))
+      (is (str/includes? body "\"event\":\"node\""))   ; per-superstep frames
+      (is (str/includes? body "\"event\":\"values\""))
+      (is (str/includes? body "\"event\":\"end\"")))))
+
+(deftest runs-stream-emits-error-frame-on-graph-failure
+  (testing "a graph that throws mid-stream yields an SSE error frame (not a dropped connection)"
+    ;; :tags 123 makes the plan node throw (same trigger as the 500 unit test);
+    ;; over SSE there's no HTTP status mid-stream, so the failure must surface
+    ;; as a 'data: {"event":"error"...}' frame, still followed by 'end'.
+    (let [{:keys [status body]}
+          (POST "/runs/stream"
+                "{:nsid \"ai.gftd.mangaka.mangakaGeneratePanel\" :input {:prompt \"x\" :tags 123}}")]
+      (is (= 200 status) "the stream itself opens 200 even though the graph fails")
+      (is (str/includes? body "\"event\":\"metadata\""))
+      (is (str/includes? body "\"event\":\"error\"") "the graph failure surfaces as an error frame")
+      (is (str/includes? body "graph error") "with a message")
+      (is (not (str/includes? body "\"event\":\"values\"")) "no values frame when it threw before completing")
+      (is (str/includes? body "\"event\":\"end\"") "the stream still closes cleanly"))))
+
+(deftest runs-stream-bad-input-is-not-labeled-graph-error
+  (testing "a streamed graph with missing required input reports the validation message, not 'graph error'"
+    ;; mangakaGeneratePanel requires :prompt; an empty input throws :bad-input.
+    ;; The SSE surface should classify it like the HTTP 400 path — a clean
+    ;; validation message, not the misleading 'graph error' prefix.
+    (let [{:keys [status body]}
+          (POST "/runs/stream" "{:nsid \"ai.gftd.mangaka.mangakaGeneratePanel\" :input {}}")]
+      (is (= 200 status))
+      (is (str/includes? body "\"event\":\"error\""))
+      (is (str/includes? body "prompt is required") "the validation message is surfaced verbatim")
+      (is (not (str/includes? body "graph error")) "client input errors aren't mislabeled as graph errors")
+      (is (str/includes? body "\"event\":\"end\"")))))
+
+(deftest runs-stream-resolves-short-assistant-id
+  (testing "the SSE path resolves a short assistant_id (resolve-entry), like /runs does"
+    ;; mirrors the langgraph SDK contract on the streaming endpoint — uses the
+    ;; short id (:mangaka_generate_panel), not the full NSID. Covers resolve-entry.
+    (let [{:keys [status body]}
+          (POST "/runs/stream" "{:assistant_id \"mangaka_generate_panel\" :input {:prompt \"neon\" :seed 1}}")]
+      (is (= 200 status))
+      (is (str/includes? body "\"event\":\"node\"") "the graph actually streamed (resolved + ran)")
+      (is (str/includes? body "\"event\":\"values\""))
+      (is (str/includes? body "\"event\":\"end\"")))))
+
+(deftest runs-stream-non-streaming-graph-emits-single-values-frame
+  (testing "a graph with no :stream handler still works over SSE (metadata → values → end, no node frames)"
+    ;; stats is a single-shot graph (no :stream) — the SSE :else branch should
+    ;; invoke! it and emit one values frame, not per-node frames.
+    (let [{:keys [status body]}
+          (POST "/runs/stream" "{:nsid \"ai.gftd.mangaka.stats\" :input {}}")]
+      (is (= 200 status))
+      (is (str/includes? body "\"event\":\"metadata\""))
+      (is (str/includes? body "\"event\":\"values\"") "the result arrives as a values frame")
+      (is (not (str/includes? body "\"event\":\"node\"")) "no per-node frames for a non-streaming graph")
+      (is (str/includes? body "\"event\":\"end\"")))))
+
+(deftest unknown-nsid-404-over-real-http
+  (is (= 404 (:status (POST "/xrpc/ai.gftd.mangaka.nope" "{}")))))

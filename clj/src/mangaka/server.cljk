@@ -1,0 +1,271 @@
+(ns mangaka.server
+  "HTTP surface — the Clojure analog of the Python `server.py` FastAPI app,
+  on reitit-ring + http-kit:
+
+    GET  /health /ok         liveness / readiness
+    POST /xrpc/{nsid}        NSID → registry handler (the primary surface)
+    POST /runs               invoke a graph by {assistant_id|nsid, input, thread_id}
+    POST /runs/stream        same, as Server-Sent Events
+    GET  /                   the ClojureScript Studio UI
+
+  Optional `LG_API_KEY` enforces `x-api-key` on /runs paths (the /xrpc
+  surface is unauthenticated — trust at the tunnel layer, as in server.py).
+
+  Bodies are JSON (jsonista) or EDN. JSON string keys with a slash decode
+  to namespaced keywords (\"page/number\" → :page/number), so the
+  storyboard structure round-trips over JSON unchanged."
+  (:require [reitit.ring :as ring]
+            [org.httpkit.server :as hk]
+            [ring.util.response :as resp]
+            [jsonista.core :as j]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [mangaka.runtime :as rt]
+            [mangaka.store :as store]
+            [mangaka.blob :as blob]
+            [mangaka.preview :as preview]
+            [mangaka.seed :as seed]
+            [mangaka.graphs.registry :as reg])
+  (:gen-class))
+
+(defonce ^:private server (atom nil))
+
+(def ^:private cors-headers
+  "Permissive CORS so a separate-origin frontend works — notably the
+  `amu compile --target wasm32-browser` Studio on :8280 calling the API on :8088 (otherwise the
+  browser blocks every XRPC fetch). Tighten the origin for a real deployment."
+  {"access-control-allow-origin" "*"
+   "access-control-allow-methods" "GET, POST, OPTIONS"
+   "access-control-allow-headers" "content-type, accept, x-api-key"
+   "access-control-max-age" "86400"})
+
+(def ^:private registry
+  (delay (reg/build (rt/store*) (rt/scratch*) (rt/blobs*))))
+
+;; ───────────────────────── body / response helpers ─────────────────────────
+
+(defn- read-body
+  "Parses the request body as EDN or JSON. Throws ex-info {:type :bad-body}
+  on malformed input so the handler can answer 400 rather than 500."
+  [{:keys [headers body]}]
+  (when body
+    (let [s (slurp body)
+          ct (get headers "content-type" "")]
+      (when (seq s)
+        (try
+          (if (str/includes? ct "edn")
+            (edn/read-string s)
+            (j/read-value s j/keyword-keys-object-mapper))
+          (catch Exception e
+            (throw (ex-info "malformed request body" {:type :bad-body :cause (.getMessage e)}))))))))
+
+(defn- wants-json?
+  "EDN is the default wire format (data is EDN/Datomic-native); JSON is
+  served only when the client asks for it via Accept or a JSON content-type
+  (e.g. the browser Studio). `Accept: application/edn` always wins."
+  [req]
+  (let [accept (str (get-in req [:headers "accept"]))
+        ct     (str (get-in req [:headers "content-type"]))]
+    (and (not (str/includes? accept "edn"))
+         (or (str/includes? accept "json")
+             (str/includes? ct "json")))))
+
+(defn- data-resp
+  "Serializes `data` as EDN (default) or JSON (when the request asks)."
+  ([req data] (data-resp req 200 data))
+  ([req status data]
+   (if (wants-json? req)
+     {:status status :headers {"content-type" "application/json"} :body (j/write-value-as-string data)}
+     {:status status :headers {"content-type" "application/edn"} :body (pr-str data)})))
+
+(defn- with-body
+  "Reads + parses the body, calling (f parsed); answers 400 on bad input."
+  [req f]
+  (try (f (or (read-body req) {}))
+       (catch clojure.lang.ExceptionInfo e
+         (if (= :bad-body (:type (ex-data e)))
+           (data-resp req 400 {:error (.getMessage e)})
+           (throw e)))))
+
+(defn- api-key-ok? [req]
+  (let [required (System/getenv "LG_API_KEY")]
+    (or (str/blank? required)
+        (= required (get-in req [:headers "x-api-key"])))))
+
+;; ───────────────────────── dispatch ─────────────────────────
+
+(defn- bad-input? [e] (= :bad-input (:type (ex-data e))))
+
+(defn- error-message
+  "User-facing error string for a thrown exception, distinguishing client
+  input errors (:bad-input → the validation message verbatim) from genuine
+  graph failures (prefixed + logged to stderr). Shared by the HTTP (invoke!)
+  and SSE (stream) surfaces so both classify failures the same way."
+  [ident e]
+  (if (bad-input? e)
+    (.getMessage e)
+    (do (binding [*out* *err*] (println "[mangaka] graph" ident "failed:" (.getMessage e)))
+        (str "graph error: " (.getMessage e)))))
+
+(defn- invoke!
+  "Runs a graph handler. Returns {:ok true :result …}, or {:ok false :status
+  404|400|500 :error …} — never throws, so the HTTP layer always replies with
+  a structured JSON error (mirrors server.py's error events)."
+  [ident input thread-id]
+  ;; resolve via the registry's single resolver (NSID or short assistant id),
+  ;; shared with the SSE path — no duplicate resolution logic to drift.
+  (if-let [h (:handler (reg/resolve-entry @registry ident))]
+    (try
+      {:ok true :result (h input thread-id)}
+      (catch Throwable e
+        {:ok false :status (if (bad-input? e) 400 500)
+         :error (error-message ident e) :data (ex-data e)}))
+    {:ok false :status 404 :error (str "unknown graph/nsid: " ident)}))
+
+;; ───────────────────────── handlers ─────────────────────────
+
+(defn- health-handler [req]
+  (data-resp req {:status "ok" :app "mangaka.gftd.ai" :impl "clj"
+                  :store (.getSimpleName (class (rt/store*)))
+                  :nsids (reg/nsids @registry)}))
+
+(defn- xrpc-handler [req]
+  (with-body req
+    (fn [input]
+      (let [nsid (get-in req [:path-params :nsid])
+            {:keys [ok result status error]} (invoke! nsid input (:thread-id input))]
+        (if ok (data-resp req result) (data-resp req (or status 404) {:error error}))))))
+
+(defn- runs-handler [req]
+  (if-not (api-key-ok? req)
+    (data-resp req 401 {:error "missing/invalid x-api-key"})
+    (with-body req
+      (fn [{:keys [assistant_id nsid input thread_id]}]
+        (let [{:keys [ok result status error]} (invoke! (or nsid assistant_id) (or input {}) thread_id)]
+          (if ok (data-resp req result) (data-resp req (or status 404) {:error error})))))))
+
+(defn- preview-handler
+  "GET /preview/:id → the storyboard's SVG as image/svg+xml, so a page can
+  embed it directly (`<img src=\"/preview/{id}\">`). 404 (a tiny SVG) if absent."
+  [req]
+  (let [id  (get-in req [:path-params :id])
+        doc (store/load-document (rt/store*) id)]
+    (if doc
+      {:status 200 :headers {"content-type" "image/svg+xml"} :body (preview/page->svg (:page doc))}
+      {:status 404 :headers {"content-type" "image/svg+xml"}
+       :body "<svg xmlns='http://www.w3.org/2000/svg'/>"})))
+
+(defn- blob-handler
+  "GET /blob/:key → the content-addressed image bytes (the key generation
+  returns as :image-url). 404 if absent."
+  [req]
+  (let [{:keys [b64 mime]} (blob/fetch (rt/blobs*) (get-in req [:path-params :key]))]
+    (if b64
+      {:status 200 :headers {"content-type" (or mime "application/octet-stream")}
+       :body (java.io.ByteArrayInputStream. (.decode (java.util.Base64/getDecoder) ^String b64))}
+      {:status 404 :headers {"content-type" "text/plain"} :body "blob not found"})))
+
+(defn- sse-frame [event data]
+  (str "data: " (j/write-value-as-string {:event event :data data}) "\n\n"))
+
+(defn- runs-stream-handler [req]
+  (if-not (api-key-ok? req)
+    (data-resp req 401 {:error "missing/invalid x-api-key"})
+    (with-body req
+     (fn [{:keys [assistant_id nsid input thread_id]}]
+      (let [ident (or nsid assistant_id)]
+      (hk/as-channel
+       req
+       {:on-open
+        (fn [ch]
+          (hk/send! ch {:status 200
+                        :headers (merge cors-headers
+                                        {"Content-Type" "text/event-stream"
+                                         "Cache-Control" "no-cache"
+                                         "Connection" "keep-alive"})}
+                    false)
+          (hk/send! ch (sse-frame "metadata" {:assistant ident :accepted true}) false)
+          (let [entry (reg/resolve-entry @registry ident)
+                stream (:stream entry)]
+            (cond
+              (nil? entry)
+              (hk/send! ch (sse-frame "error" (str "unknown graph/nsid: " ident)) false)
+
+              stream
+              ;; per-node streaming: emit a frame as each graph node runs,
+              ;; then the final values frame.
+              (try
+                (let [result (stream (or input {}) thread_id
+                                     (fn [ev] (hk/send! ch (sse-frame "node" ev) false)))]
+                  (hk/send! ch (sse-frame "values" result) false))
+                ;; classify the same way as the HTTP path: :bad-input streams the
+                ;; clean validation message, genuine failures a "graph error" (+ log)
+                (catch Throwable e
+                  (hk/send! ch (sse-frame "error" (error-message ident e)) false)))
+
+              :else
+              (let [{:keys [ok result error]} (invoke! ident (or input {}) thread_id)]
+                (hk/send! ch (sse-frame (if ok "values" "error") (if ok result error)) false))))
+          (hk/send! ch (sse-frame "end" {}) true))}))))))
+
+;; ───────────────────────── routes ─────────────────────────
+
+(defn- wrap-cors
+  "Adds CORS headers to map responses and answers OPTIONS preflight. Leaves
+  non-map responses (the SSE as-channel result) untouched — the SSE handler
+  sets its own CORS headers in on-open."
+  [handler]
+  (fn [req]
+    (if (= :options (:request-method req))
+      {:status 204 :headers cors-headers}
+      (let [resp (handler req)]
+        (if (map? resp) (update resp :headers merge cors-headers) resp)))))
+
+(def app
+  (wrap-cors
+   (ring/ring-handler
+    (ring/router
+     [["/" {:get (fn [_] (some-> (resp/resource-response "public/index.html")
+                                 (resp/content-type "text/html")))}]
+      ["/health" {:get health-handler}]
+      ["/ok"     {:get health-handler}]
+      ["/preview/:id" {:get preview-handler}]
+      ["/blob/:key" {:get blob-handler}]
+      ["/xrpc/:nsid" {:post xrpc-handler}]
+      ["/runs"        {:post runs-handler}]
+      ["/runs/stream" {:post runs-stream-handler}]])
+    (ring/routes
+     (ring/create-resource-handler {:path "/" :root "public"})
+     (ring/create-default-handler
+      {:not-found (constantly {:status 404 :headers {"content-type" "application/json"}
+                               :body "{\"error\":\"not found\"}"})})))))
+
+(defn- seed!
+  "Best-effort startup seed so a fresh (in-memory) store isn't empty — the
+  bundled GhostHacker cast/scenes are re-imported each boot (idempotent
+  upsert by id). Disable with MANGAKA_NO_SEED. Never blocks startup."
+  []
+  (when-not (System/getenv "MANGAKA_NO_SEED")
+    (try
+      (let [{:keys [result]} (invoke! "ai.gftd.mangaka.importGhosthacker" {} nil)]
+        (when result
+          (println (str "  seeded ghosthacker: " (count (:characters result)) " characters, "
+                        (count (:scenes result)) " scenes"))))
+      (invoke! "ai.gftd.mangaka.saveDocument" seed/sample-document nil)
+      (println (str "  seeded storyboard: " (:id seed/sample-document)))
+      (catch Throwable e
+        (binding [*out* *err*] (println "[mangaka] seed skipped:" (.getMessage e)))))))
+
+(defn start!
+  ([] (start! (Integer/parseInt (or (System/getenv "PORT") "8088"))))
+  ([port]
+   (reset! server (hk/run-server app {:port port :legacy-return-value? false}))
+   (println (str "mangaka.gftd.ai (clj) listening on :" port
+                 "  store=" (.getSimpleName (class (rt/store*)))))
+   (seed!)
+   @server))
+
+(defn stop! []
+  (when-let [s @server] (hk/server-stop! s) (reset! server nil)))
+
+(defn -main [& _] (start!) @(promise))

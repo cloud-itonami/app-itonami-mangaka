@@ -1,0 +1,33 @@
+(ns mangaka.video-test
+  "mangaka.video's own offline-degrade contract, independent of the graph
+  wiring (generate-panel-video-test covers that). No SEEDANCE_API_KEY /
+  MURAKUMO_BACKEND_TOKEN is set in CI/dev by default, so generate-video!
+  exercises its real no-token stub branch here (same shape as
+  comfy_test.cljc testing mangaka.comfy/render-panel's real stub branch)."
+  (:require [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [mangaka.video :as video]))
+
+(deftest compose-video-prompt-appends-the-motion-tail
+  (is (str/includes? (video/compose-video-prompt "shiro on a rooftop") "shiro on a rooftop"))
+  (is (str/includes? (video/compose-video-prompt "shiro on a rooftop") "no scene change"))
+  (testing "a blank prompt still yields just the motion tail, not a leading comma"
+    (is (= video/motion-tail (video/compose-video-prompt "")))))
+
+(deftest generate-video-without-a-token-degrades-to-a-stub
+  (testing "no SEEDANCE_API_KEY / MURAKUMO_BACKEND_TOKEN -> never throws,
+            returns a clearly-marked stub instead of a fabricated success"
+    (let [r (video/generate-video! {:prompt "a quiet alley" :duration-sec 4})]
+      (is (nil? (:video-file r)))
+      (is (= "stub" (:source r)))
+      (is (= video/default-model (:model r)))
+      (is (string? (:error r))))))
+
+(deftest sample-frames-with-no-video-file-degrades-to-one-placeholder
+  (testing "video-file nil (the generate-video! stub shape) -> exactly one
+            placeholder svg frame, never throws, never fabricates N samples"
+    (let [frames (video/sample-frames! {:video-file nil :prompt "a quiet alley" :n 5})]
+      (is (= 1 (count frames)))
+      (is (= "image/svg+xml" (:mime (first frames))))
+      (is (string? (:image-b64 (first frames))))
+      (is (= 0 (:time-ms (first frames)))))))

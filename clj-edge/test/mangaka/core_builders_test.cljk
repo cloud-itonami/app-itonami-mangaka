@@ -1,0 +1,64 @@
+(ns mangaka.core-builders-test
+  "Pure SSoT builder tests for the mangaka EDGE edition — run AS ClojureScript."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [mangaka.core :as core]))
+
+(deftest tx-edn-builders
+  (testing "character->tx-edn defaults status=active"
+    (let [[m] (edn/read-string (core/character->tx-edn {:id "ch1" :name "Nei" :created-at "t"}))]
+      (is (= "ch1" (:character/id m)))
+      (is (= "Nei" (:character/name m)))
+      (is (= "active" (:character/status m)))))
+  (testing "work->tx-edn defaults status=draft"
+    (let [[m] (edn/read-string (core/work->tx-edn {:id "w1" :title "T" :created-at "t"}))]
+      (is (= "draft" (:work/status m))))))
+
+(deftest query-edn
+  (is (= '[:find (pull ?e [*]) :where [?e :character/id ?id]] (edn/read-string (core/q-list-characters))))
+  (is (= '[:find (pull ?e [*]) :where [?e :work/id ?id]] (edn/read-string (core/q-list-works)))))
+
+(deftest decoders
+  (is (= [{:character/id "c1" :character/name "N"}]
+         (core/shape-pull-rows [[(pr-str {:db/id 1 :character/id "c1" :character/name "N"})]])))
+  (is (= {:work/id "w1"} (core/pulled-entity (pr-str {:db/id 9 :work/id "w1"})))))
+
+(deftest d1-single-vertex
+  (testing "character + work both → vertex_mangaka, kind-discriminated"
+    (let [c (core/entity->d1 "did:web:mangaka.gftd.ai" (core/build-character {:id "ch1" :name "Nei"}))
+          w (core/entity->d1 "did:web:mangaka.gftd.ai" (core/build-work {:id "w1" :title "T"}))]
+      (is (re-find #"INSERT OR REPLACE INTO vertex_mangaka " (:sql c)))
+      (is (re-find #"\bname\b" (:sql c)))
+      (is (some #{"character"} (:params c)))
+      (is (some #{"at://did:web:mangaka.gftd.ai/ai.gftd.mangaka.character/ch1"} (:params c)))
+      (is (re-find #"INSERT OR REPLACE INTO vertex_mangaka " (:sql w)))
+      (is (some #{"work"} (:params w)))))
+  (testing "non-entity → nil"
+    (is (nil? (core/entity->d1 "did:web:x" [:db/retractEntity 7])))))
+
+(deftest hierarchy-kinds
+  (testing "chapter/page/panel/environment all → vertex_mangaka, kind-discriminated"
+    (doseq [[kind ent col] [["chapter" (core/build-chapter {:id "c1" :work-id "w1" :title "T"}) "title"]
+                            ["page" (core/build-page {:id "p1" :chapter-id "c1" :page-number 3}) "page_number"]
+                            ["panel" (core/build-panel {:id "n1" :page-id "p1" :panel-number 2}) "panel_number"]
+                            ["environment" (core/build-environment {:id "e1" :name "Rooftop"}) "name"]]]
+      (let [{:keys [sql params]} (core/entity->d1 "did:web:mangaka.gftd.ai" ent)]
+        (is (re-find #"INSERT OR REPLACE INTO vertex_mangaka " sql))
+        (is (re-find (re-pattern col) sql) (str kind " missing col " col))
+        (is (some #{kind} params)))))
+  (testing "page-number coerced from string"
+    (let [[m] (edn/read-string (core/page->tx-edn {:id "p1" :chapter-id "c" :page-number "5"}))]
+      (is (= 5 (:page/page-number m)))))
+  (testing "generatePanel: image-key kept in the kotoba datom, dropped from the D1 shadow"
+    (let [in {:id "n1" :page-id "p1" :panel-number 0 :prompt "x" :seed 7 :image-key "sha256-k"}
+          [m] (edn/read-string (core/panel->tx-edn in))
+          {:keys [sql]} (core/entity->d1 "did:web:mangaka.gftd.ai" (core/build-panel in))]
+      (is (= "sha256-k" (:panel/image-key m)))       ; kotoba keeps it
+      (is (= 7 (:panel/seed m)))
+      (is (not (re-find #"image" sql)))))            ; vertex_mangaka has no image col
+  (testing "relation queries inline the parent id"
+    (let [q (edn/read-string (core/q-pages-for-chapter "c1"))]
+      (is (some (fn [c] (and (vector? c) (= :page/chapter-id (second c)) (= "c1" (nth c 2)))) q)))))
+
+(deftest pagination
+  (is (= {:works ["a"] :total 3 :offset 1 :limit 1} (core/paginate ["x" "a" "b"] :works 1 1))))

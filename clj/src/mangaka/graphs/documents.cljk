@@ -1,0 +1,160 @@
+(ns mangaka.graphs.documents
+  "Storyboard document CRUD as langgraph-clj graphs over the durable store
+  — save/load/list (the Python save_document / load_document /
+  list_documents). Each graph is a single-node state-graph so the
+  surface stays uniform with the larger generation graphs and gains
+  checkpointing/streaming for free."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.store :as store]
+            [mangaka.domain :as domain]))
+
+(defn make-save [store]
+  (util/single-node
+   :save
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (domain/valid-page! (:page input))
+     (store/save-document! store {:id (:id input)
+                                  :kind (:kind input)
+                                  :title (:title input)
+                                  :page (:page input)}))))
+
+(defn make-load [store]
+  (util/single-node
+   :load
+   (fn [{:keys [input]}]
+     (let [doc (store/load-document store (:id input))]
+       (when doc
+         (assoc doc :lexicon (domain/export-lexicon (:page doc))))))))
+
+(defn make-list [store]
+  (util/single-node :list (fn [{:keys [input]}]
+                            (util/paginate (store/list-documents store) input :documents))))
+
+(defn make-delete
+  "Hard-delete a storyboard document and its component graph. Requires :id.
+  Idempotent: deleting an absent doc returns {:deleted false}, not an error."
+  [store]
+  (util/single-node
+   :delete
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (store/delete-document! store (:id input)))))
+
+(defn make-duplicate
+  "Clone a storyboard document under a new id — for reusing a page's layout
+  (e.g. the next page of a chapter). Requires :id (source); :new-id defaults to
+  `<id>-copy`, and an optional :page-number renumbers the clone. Won't overwrite
+  an existing target. Returns {:id :new-id :ok}."
+  [store]
+  (util/single-node
+   :duplicate
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (let [src    (or (store/load-document store (:id input))
+                      (throw (ex-info (str "document not found: " (:id input)) {:type :bad-input})))
+           new-id (or (not-empty (str (:new-id input))) (str (:id input) "-copy"))
+           _      (when (store/load-document store new-id)
+                    (throw (ex-info (str "target document already exists: " new-id) {:type :bad-input})))
+           page   (cond-> (:page src)
+                    (:page-number input) (assoc :page/number (:page-number input)))]
+       (store/save-document! store {:id new-id :kind (:kind src) :page page})
+       {:id (:id input) :new-id new-id :ok true}))))
+
+(defn- load-page! [store doc-id]
+  (or (store/load-document store doc-id)
+      (throw (ex-info (str "document not found: " doc-id) {:type :bad-input}))))
+
+(defn- save-page! [store doc page]
+  (store/save-document! store {:id (:id doc) :kind (:kind doc) :title (:title doc) :page page}))
+
+(defn- check-panel-patch! [panel]
+  (when (some? panel)
+    (when-not (map? panel)
+      (throw (ex-info "panel must be a map" {:type :bad-input})))
+    ;; same field-type guards as the save boundary — a patch with a string
+    ;; :panel/focal would otherwise corrupt the datom graph just as a full save would.
+    (domain/valid-panel! panel)))
+
+(defn make-update-panel
+  "Edit one panel of a stored storyboard in place: merge `:panel` into the
+  panel at `:panel-index`, then re-save the page (atomic). Editor primitive —
+  avoids client-side read-modify-write. Requires :doc-id and :panel-index."
+  [store]
+  (util/single-node
+   :update-panel
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id :panel-index])
+     (let [{:keys [doc-id panel-index panel]} input
+           _      (check-panel-patch! panel)
+           doc    (load-page! store doc-id)
+           panels (vec (:page/panels (:page doc)))]
+       (when-not (and (nat-int? panel-index) (< panel-index (count panels)))
+         (throw (ex-info (str "panel-index out of range: " panel-index) {:type :bad-input})))
+       (let [page (update-in (:page doc) [:page/panels panel-index] merge panel)]
+         (save-page! store doc page)
+         {:doc-id doc-id :panel-index panel-index
+          :panel (get-in page [:page/panels panel-index])})))))
+
+(defn make-add-panel
+  "Append a panel to a stored storyboard (its :panel/index defaults to the new
+  last index), then re-save. Requires :doc-id."
+  [store]
+  (util/single-node
+   :add-panel
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [{:keys [doc-id panel]} input
+           _      (check-panel-patch! panel)
+           doc    (load-page! store doc-id)
+           panels (vec (:page/panels (:page doc)))
+           idx    (count panels)
+           panel  (merge {:panel/index idx} panel)
+           page   (assoc (:page doc) :page/panels (conj panels panel))]
+       (save-page! store doc page)
+       {:doc-id doc-id :panel-index idx :total (inc idx) :panel panel}))))
+
+(defn make-remove-panel
+  "Remove the panel at `:panel-index` and reindex the remaining panels so
+  :panel/index stays contiguous (the KAMI bridge / listRenders depend on it),
+  then re-save. Requires :doc-id and :panel-index."
+  [store]
+  (util/single-node
+   :remove-panel
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id :panel-index])
+     (let [{:keys [doc-id panel-index]} input
+           doc    (load-page! store doc-id)
+           panels (vec (:page/panels (:page doc)))]
+       (when-not (and (nat-int? panel-index) (< panel-index (count panels)))
+         (throw (ex-info (str "panel-index out of range: " panel-index) {:type :bad-input})))
+       (let [kept (into (subvec panels 0 panel-index) (subvec panels (inc panel-index)))
+             reindexed (into [] (map-indexed (fn [i p] (assoc p :panel/index i))) kept)
+             page (assoc (:page doc) :page/panels reindexed)]
+         (save-page! store doc page)
+         {:doc-id doc-id :removed panel-index :total (count reindexed)})))))
+
+(defn make-reorder-panels
+  "Reorder a stored storyboard's panels by `:order` — a permutation of the
+  current indices 0..n-1 giving the new sequence (e.g. [2 0 1]) — then reindex
+  to match the new positions and re-save. Requires :doc-id and :order."
+  [store]
+  (util/single-node
+   :reorder-panels
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id :order])
+     (let [{:keys [doc-id order]} input
+           doc    (load-page! store doc-id)
+           panels (vec (:page/panels (:page doc)))
+           n      (count panels)]
+       (when-not (and (sequential? order) (= (sort order) (range n)))
+         (throw (ex-info (str "order must be a permutation of 0.." (dec n))
+                         {:type :bad-input :n n :order order})))
+       (let [reordered (into [] (map-indexed (fn [i old] (assoc (nth panels old) :panel/index i))) order)
+             page (assoc (:page doc) :page/panels reordered)]
+         (save-page! store doc page)
+         {:doc-id doc-id :order (vec order) :total n})))))
+
+(def handler
+  "Shared single-node handler — see mangaka.graphs.util/result-handler."
+  util/result-handler)

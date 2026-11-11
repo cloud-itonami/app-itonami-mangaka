@@ -1,0 +1,27 @@
+{;; mangaka-reader Worker — pure cljc render (manga-viewer SSR index +
+ ;; DATA-driven reader parity) + thin cljs workerd host (ADR-2607070500
+ ;; follow-up: viewer 1本化). Classpath is west sibling layout, same
+ ;; convention as app-aozora's cljs builds.
+ :paths ["src" "test"
+         ;; kotoba-lang/manga-viewer — the SAME view code aozora.app /manga
+         ;; compiles in (works-grid/reader hiccup + css)
+         "../../../kotoba-lang/manga-viewer/src"
+         ;; shitsuke.hiccup — portable hiccup→HTML for SSR
+         "../../../kotoba-lang/shitsuke/src"
+         ;; html.core — shitsuke.hiccup's own dependency. Consuming shitsuke by
+         ;; SOURCE PATH (rather than as a git dep) means its deps are not
+         ;; resolved for us, so they have to be listed here too. Without it the
+         ;; worker build fails at "the required namespace html.core is not
+         ;; available", which is a confusing way to say "you took the source
+         ;; and left the dependency behind".
+         "../../../kotoba-lang/html/src"]
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "7e1dbe0aece831138e6106c59d2b26375d0f60c4"
+         :deps/root "lib/kotoba.text"}
+       org.clojure/clojurescript {:mvn/version "1.11.132"}
+        thheller/shadow-cljs {:mvn/version "2.28.20"}}}

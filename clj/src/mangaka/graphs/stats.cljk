@@ -1,0 +1,12 @@
+(ns mangaka.graphs.stats
+  "stats — a Datalog-powered overview of the durable store (document /
+  character / scene / render counts). No input. A small dashboard/health
+  surface that demonstrates the datom model: every count is a one-line
+  collection query (see mangaka.store/stats)."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.store :as store]))
+
+(defn make [store]
+  (util/single-node :stats (fn [_] (store/stats store))))
+
+(def handler util/result-handler)

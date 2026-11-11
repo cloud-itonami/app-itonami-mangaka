@@ -1,0 +1,77 @@
+{
+  "@context": "https://gftd.ai/ns/magatama/v1",
+  "@id": "did:web:mangaka.gftd.ai",
+  "component": {
+    "env": {},
+    "path": "src/app.cljc"
+  },
+  "convoSystemPrompt": "You are ai-gftd-wasm-mangaka agent. Team-based manga creation platform — help users produce manga pages and panels across the full pipeline (story → layout → panel → pose → scene-3d → render → letter). Respond helpfully in the users language.",
+  "deploy": {},
+  "duties": ["勤労の義務"],
+  "governance": {
+    "raci": "responsible",
+    "classification": "internal",
+    "complianceFrameworks": ["mangaka-policy"]
+  },
+  "kpi": ["credits の獲得"],
+  "name": "ai-gftd-wasm-mangaka",
+  "nanoid": "mng4k4x1",
+  "performerType": "service",
+  "profile": {
+    "agentType": "semi-autonomous",
+    "capabilities": [
+      "edge-assets",
+      "bpmn-dispatch"
+    ],
+    "description": "Thin Cloudflare edge facade for Mangaka. Page, panel, scene-3d, cine pipeline, and Hume-emotion business logic runs in AgentGateway MCP + pod-side LangServer workers. Domain data persists to Cloudflare D1 (ai-gftd-mangaka) via the internal /_d1 endpoint.",
+    "displayName": "Mangaka",
+    "isBot": true
+  },
+  "project": "mangaka",
+  "routes": [
+    {
+      "host": "mangaka.gftd.ai",
+      "paths": ["/"],
+      "tls": true
+    }
+  ],
+  "runtimeType": "worker",
+  "build": {
+    "guestLanguage": "ts",
+    "role": "thin-edge"
+  },
+  "space": {
+    "channels": [
+      {
+        "default": true,
+        "description": "Public manga feed — new works, chapters, pages",
+        "kind": "public",
+        "name": "mangaka-feed"
+      }
+    ],
+    "description": "Team-based manga creation platform",
+    "historyVisibility": "world-readable",
+    "joinRule": "public",
+    "name": "Mangaka"
+  },
+  "triggers": {
+    "subscribeRepos": {
+      "collections": [
+        "app.bsky.feed.post",
+        "app.bsky.feed.like",
+        "app.bsky.graph.follow",
+        "ai.gftd.mangaka.work",
+        "ai.gftd.mangaka.chapter",
+        "ai.gftd.mangaka.page",
+        "ai.gftd.mangaka.panel",
+        "ai.gftd.mangaka.character",
+        "ai.gftd.mangaka.environment",
+        "ai.gftd.mangaka.asset",
+        "ai.gftd.mangaka.scene3d",
+        "ai.gftd.mangaka.cineRun",
+        "ai.gftd.mangaka.cinePanel"
+      ]
+    }
+  },
+  "uiType": "appview"
+}

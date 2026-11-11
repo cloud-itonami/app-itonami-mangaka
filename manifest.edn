@@ -1,0 +1,44 @@
+;; mangaka — actor manifest.
+;;
+;; itonami.cloud's default apps each belong to an app org, and **the app
+;; declares its own membership** so the host keeps no list of apps. A list on
+;; the host means two places to edit when an app is added, and eventually only
+;; one of them gets updated. `itonami-fleet-dispatch` therefore has no per-app
+;; routes: adding an app is uploading a Worker into the namespace.
+;;
+;; `:app/mount`, the script name in studio/wrangler.jsonc, and this repository's
+;; name are the same string — they agree by being one string rather than through
+;; a mapping table.
+{:actor/id      "mangaka"
+ :actor/glyph   "漫画家"
+ :actor/purpose "AI が描いた manga を公開し(reader)、公開済みのページを下絵に人が原稿を組み直す(studio)。組んだ原稿は storyboard EDN として書き出され、mangaka のパイプラインの入力に戻る。"
+
+ :app/mount     "/mangaka"
+ :app/host      "app.itonami.cloud"
+ :app/default?  true
+ :app/repo      "cloud-itonami/mangaka"
+ :app/org       {:organization/id "mangaka"
+                 :organization/name "mangaka — 漫画"
+                 :organization/did "did:web:app.itonami.cloud:org:mangaka"}
+
+ ;; The two surfaces are deliberately on different planes.
+ ;;
+ ;; The reader is a dynamic service: it draws from D1 work rows and R2 page
+ ;; images, so it lives on a Worker custom domain (mangaka.itonami.cloud) rather
+ ;; than on the static sites plane, where its 作品一覧 would freeze at publish
+ ;; time.
+ ;;
+ ;; The studio is the opposite: static assets and nothing else. It reads the
+ ;; reader's public API from the browser and writes nothing, so it needs no
+ ;; bindings and no secrets.
+ :app/surface   [{:path "/mangaka/" :method :get
+                  :doc "原稿スタジオ — 作品一覧、選ぶと公開ページを下絵にした原稿が開く"}]
+ :app/reads     [{:origin "https://mangaka.itonami.cloud/api"
+                  :doc "作品カタログ(公開・CORS 開放)。studio が宣言する genko-catalog。"}
+                 {:origin "https://mangaka.itonami.cloud/img"
+                  :doc "公開ページ画像。下絵として WebGL の texture に上がる。"}]
+ :app/writes    []
+
+ ;; The editor is not implemented here.
+ :app/upstream  {:repo "kotoba-lang/kami-genko"
+                 :doc "原稿 (genko) の doc モデルと編集 UI。studio/deps.edn が pin する。"}}

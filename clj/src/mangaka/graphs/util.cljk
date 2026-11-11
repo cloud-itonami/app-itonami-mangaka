@@ -1,0 +1,51 @@
+(ns mangaka.graphs.util
+  "Shared graph scaffolding for the non-generation graphs (the generation
+  plan→render→persist graphs use mangaka.graphs.gen).
+
+  `single-node` builds the common shape: one node whose return value is
+  placed on the :result channel, invoked with {:input …}. Handlers then
+  read `(:result (g/invoke g {:input input}))`."
+  (:require [langgraph.graph :as g]))
+
+(defn single-node
+  "A one-node graph. `f` is (state → result-value); its return is placed on
+  the :result channel. Returns the compiled graph."
+  [node f]
+  (-> (g/state-graph {:channels {:input {} :result {}}})
+      (g/add-node node (fn [state] {:result (f state)}))
+      (g/set-entry-point node)
+      (g/set-finish-point node)
+      (g/compile-graph)))
+
+(defn- ->nat
+  "Coerce v to a non-negative long, falling back to `default` for nil or
+  non-numeric input. JSON clients may send :offset/:limit as a string
+  (\"10\") or garbage; coerce rather than 500 — mirroring how the generation
+  graphs tolerate malformed numeric params."
+  [v default]
+  (max 0 (long (or (cond
+                     (integer? v) v
+                     (number? v)  (long v)
+                     (string? v)  (parse-long v)   ; "10" → 10, "abc" → nil
+                     :else        nil)
+                   default))))
+
+(defn paginate
+  "Slice `items` by input :offset/:limit (defaults 0 / 100) and wrap them
+  under key `k` with :total/:offset/:limit — the repository list-API
+  convention: every list API takes offset+limit and reports total.
+  Bad offset/limit (negative, string, non-numeric) degrade to safe defaults."
+  [items input k]
+  (let [total  (count items)
+        offset (->nat (:offset input) 0)
+        limit  (->nat (:limit input) 100)]
+    {k (vec (take limit (drop offset items)))
+     :total total :offset offset :limit limit}))
+
+(defn result-handler
+  "The standard handler for a `single-node` graph: (input, _thread-id) →
+  invoke with {:input input} and return the :result. Input validation lives
+  in the node (throw {:type :bad-input}), so this stays trivial and shared."
+  [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

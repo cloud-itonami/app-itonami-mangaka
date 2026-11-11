@@ -1,0 +1,204 @@
+(ns production-loop-video
+  "mangaka video-first production agent loop — discover un-rendered panels,
+  generate them via ai.gftd.mangaka.mangakaGeneratePanelFromVideo (seedance
+  clip -> frame-sample -> 8-axis rubric critique -> persist, see
+  mangaka.graphs.generate-panel-video), then assemble any document whose
+  panels are now all rendered (ai.gftd.mangaka.mangakaGeneratePage — the
+  EXISTING page-compose step, unmodified: it only ever reads a panel's
+  :panel/image-b64 / :panel/image-key, so a seedance-sourced panel composes
+  exactly like a txt2img one).
+
+  ADDITIVE, not a replacement for the txt2img production path — this loop
+  only touches panels via the NEW mangakaGeneratePanelFromVideo NSID; the
+  existing generate-panel/*-loop/*-quality/coscientist graphs and any other
+  operator loop are untouched.
+
+  Talks to a running mangaka CLJ graph server (RUNBOOK.md: `cd clj &&
+  PORT=8000 kbb -M:dev:run`) over its /xrpc/* HTTP surface, using JSON
+  (Accept + Content-Type: application/json — the server's data-resp serves
+  JSON on request, EDN by default; JSON keeps this script parse-free with
+  plain js/fetch + JSON.parse, same choice animeka's own nbb operator
+  scripts make against their own backends). No wrangler/D1 here — mangaka's
+  durable store sits behind the graph server's own XRPC surface
+  (mangaka.store, kotoba-datomic in prod / in-memory in dev), unlike
+  ai-gftd-animeka's Cloudflare D1 + wrangler CLI production-loop.cljs.
+
+  Phases per run:
+    1. discover — listDocuments, then per document loadDocument's
+       :lexicon :panels vs listRenders' existing indices -> missing panel
+       indices (bounded by --max-renders across the whole run, same
+       semantics as animeka's production-loop.cljs).
+    2. render   — mangakaGeneratePanelFromVideo per missing panel. A failed
+       /skipped seedance job (no SEEDANCE_API_KEY, backend error) still
+       returns a result (the graph never throws — mangaka.video degrades to
+       a stub); this loop records that honestly instead of masking it.
+    3. assemble — for every touched document whose renders now cover every
+       panel index, mangakaGeneratePage (skipped with --no-assemble).
+    4. ledger   — docs/production-loop-video-ledger.edn gets ONE appended
+       EDN line (append-only, mirrors ai-gftd-animeka's
+       docs/production-loop-ledger.edn convention — never hand-edit this
+       file after the fact).
+
+  Usage:
+    kbb --backend sci scripts/production-loop-video.cljk [--max-renders 3] [--doc-id <id>]
+        [--no-assemble] [--dry-run]"
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            [clojure.string :as str]
+            [nbb.core :as nbb]))
+
+;; ── args ────────────────────────────────────────────────────────────────────
+
+(def args
+  (loop [a *command-line-args* m {:max-renders 3 :assemble true :dry-run false}]
+    (if (empty? a)
+      m
+      (let [[k v & more] a]
+        (case k
+          "--max-renders" (recur more (assoc m :max-renders (js/parseInt v)))
+          "--doc-id" (recur more (assoc m :doc-id v))
+          "--no-assemble" (recur (rest a) (assoc m :assemble false))
+          "--dry-run" (recur (rest a) (assoc m :dry-run true))
+          (recur (rest a) m))))))
+
+(def repo-root (path/resolve (or (.-MANGAKA_ROOT js/process.env) ".")))
+(def server (or (.-MANGAKA_SERVER_URL js/process.env) "http://localhost:8000"))
+
+;; ── XRPC (JSON) ─────────────────────────────────────────────────────────────
+
+(defn xrpc!
+  "POST {server}/xrpc/{nsid} with a JSON body, JSON response. Throws on a
+  non-2xx or malformed reply -- callers decide whether that's fatal for the
+  run or just this one target."
+  [nsid body]
+  (-> (js/fetch (str server "/xrpc/" nsid)
+                #js {:method "POST"
+                     :headers #js {"content-type" "application/json" "accept" "application/json"}
+                     :body (js/JSON.stringify (clj->js body))
+                     :signal (js/AbortSignal.timeout 600000)})
+      (.then (fn [r]
+               (-> (.json r)
+                   (.then (fn [j]
+                            (let [m (js->clj j :keywordize-keys true)]
+                              (if (.-ok r) m (throw (ex-info (str nsid " failed: " (:error m r)) {:nsid nsid :status (.-status r) :body m})))))))))))
+
+;; ── discover ────────────────────────────────────────────────────────────────
+
+(defn missing-panel-indices
+  "lexicon panels vs existing renders -> sorted vector of un-rendered indices."
+  [lexicon renders]
+  (let [have (set (map :index renders))]
+    (->> (:panels lexicon)
+         (map :index)
+         (remove have)
+         sort
+         vec)))
+
+(defn discover!
+  "-> [{:doc-id :index} ...] bounded to `budget` targets, oldest document
+  first (listDocuments' own sort), lowest panel index first within a doc."
+  [budget only-doc-id]
+  (-> (xrpc! "ai.gftd.mangaka.listDocuments" {})
+      (.then (fn [{:keys [documents]}]
+               (let [documents (cond->> documents only-doc-id (filter #(= only-doc-id (:id %))))]
+                 (reduce (fn [p {:keys [id]}]
+                           (.then p (fn [acc]
+                                      (if (>= (count acc) budget)
+                                        acc
+                                        (-> (js/Promise.all
+                                             #js [(xrpc! "ai.gftd.mangaka.loadDocument" {:id id})
+                                                  (xrpc! "ai.gftd.mangaka.listRenders" {:doc-id id})])
+                                            (.then (fn [[doc renders-resp]]
+                                                     (let [missing (missing-panel-indices (:lexicon doc) (:renders renders-resp))
+                                                           room (- budget (count acc))]
+                                                       (into acc (map (fn [idx] {:doc-id id :index idx}))
+                                                             (take room missing))))))))))
+                         (js/Promise.resolve [])
+                         documents))))))
+
+;; ── render + assemble ────────────────────────────────────────────────────────
+
+(defn render-panel! [{:keys [doc-id index]}]
+  (-> (xrpc! "ai.gftd.mangaka.mangakaGeneratePanelFromVideo" {:doc-id doc-id :panel-index index})
+      (.then (fn [r] {:doc-id doc-id :index index :panel-id (:panel-id r)
+                      :video-source (:video-source r) :video-error (:video-error r)
+                      :score (get-in r [:best :score])}))
+      (.catch (fn [e] {:doc-id doc-id :index index :error (.-message e)}))))
+
+(defn doc-fully-rendered? [doc-id]
+  (-> (js/Promise.all #js [(xrpc! "ai.gftd.mangaka.loadDocument" {:id doc-id})
+                           (xrpc! "ai.gftd.mangaka.listRenders" {:doc-id doc-id})])
+      (.then (fn [[doc renders-resp]]
+               (empty? (missing-panel-indices (:lexicon doc) (:renders renders-resp)))))))
+
+(defn assemble-doc! [doc-id]
+  (-> (xrpc! "ai.gftd.mangaka.mangakaGeneratePage" {:doc-id doc-id})
+      (.then (fn [r] {:doc-id doc-id :page-render-id (:page-render-id r) :image-url (:image-url r)}))
+      (.catch (fn [e] {:doc-id doc-id :error (.-message e)}))))
+
+;; ── ledger ──────────────────────────────────────────────────────────────────
+
+(defn ledger! [entry]
+  (let [dir (path/join repo-root "docs")]
+    (when-not (fs/existsSync dir) (fs/mkdirSync dir))
+    (fs/appendFileSync (path/join dir "production-loop-video-ledger.edn")
+                       (str (pr-str entry) "\n"))))
+
+;; ── main ────────────────────────────────────────────────────────────────────
+
+(defn- serial-reduce
+  "Runs `(step acc item)` (each returning a Promise of the next acc) over
+  `items` one at a time, in order -- the async analog of `reduce`, used
+  throughout instead of Promise.all so seedance jobs don't all fire at once
+  against the fleet."
+  [step init items]
+  (reduce (fn [p item] (.then p (fn [acc] (step acc item))))
+          (js/Promise.resolve init)
+          items))
+
+(defn render-all! [targets]
+  (serial-reduce (fn [acc t]
+                    (.then (render-panel! t)
+                           (fn [r]
+                             (println "  rendered" (:doc-id t) (:index t) (pr-str r))
+                             (conj acc r))))
+                 [] targets))
+
+(defn assemble-all! [doc-ids]
+  (serial-reduce (fn [acc doc-id]
+                    (.then (doc-fully-rendered? doc-id)
+                           (fn [ready?]
+                             (if-not ready?
+                               (js/Promise.resolve acc)
+                               (.then (assemble-doc! doc-id)
+                                      (fn [r] (println "  assembled" (pr-str r)) (conj acc r)))))))
+                 [] doc-ids))
+
+(defn run! []
+  (let [t0 (js/Date.now)]
+    (println "production-loop-video: server" server "max-renders" (:max-renders args)
+             (when (:doc-id args) (str "doc-id=" (:doc-id args)))
+             (when (:dry-run args) "(dry-run)"))
+    (-> (discover! (:max-renders args) (:doc-id args))
+        (.then (fn [targets]
+                 (println "targets:" (pr-str targets))
+                 (if (:dry-run args)
+                   {:targets targets :rendered [] :assembled []}
+                   (-> (render-all! targets)
+                       (.then (fn [rendered]
+                                (if-not (:assemble args)
+                                  {:targets targets :rendered rendered :assembled []}
+                                  (.then (assemble-all! (distinct (map :doc-id targets)))
+                                         (fn [assembled]
+                                           {:targets targets :rendered rendered :assembled assembled})))))))))
+        (.then (fn [{:keys [targets rendered assembled]}]
+                 (let [entry {:t (.toISOString (js/Date.)) :server server
+                              :max-renders (:max-renders args) :doc-id (:doc-id args)
+                              :targets (count targets) :rendered rendered :assembled assembled
+                              :dry-run (:dry-run args) :ms (- (js/Date.now) t0)}]
+                   (when-not (:dry-run args) (ledger! entry))
+                   (println "run:" (pr-str entry)))))
+        (.catch (fn [e] (println "LOOP-ERROR" (.-message e)) (js/process.exit 1))))))
+
+(when (= nbb/*file* (nbb/invoked-file))
+  (run!))

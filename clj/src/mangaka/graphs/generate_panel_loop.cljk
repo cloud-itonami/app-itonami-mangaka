@@ -1,0 +1,127 @@
+(ns mangaka.graphs.generate-panel-loop
+  "mangakaGeneratePanelLoop — ReAct-style co-scientist quality loop over the
+  existing plan→render→score primitives (generate-panel + vision-score),
+  reintroduced as a CLJ graph per RUNBOOK.md §3 (the loop existed only in the
+  retired Python runtime before this).
+
+  Cycle per attempt: Act (render the current spec) → Observe (vision-critique
+  the render) → Reason (the router below: good enough, or out of budget →
+  stop; otherwise fold the critique's :fix-hint into the next attempt's
+  prompt and bump the seed) → repeat. Converges on the first attempt to clear
+  :score-threshold, or the best-scoring attempt seen once :max-attempts is
+  exhausted (nil scores — offline/mock — count as no signal, never crash the
+  router; the graph still completes and returns the last attempt).
+
+  Input: same fields as generate-panel (free-form :prompt/:tags/:negative/
+  :seed/:width/:height/:model, or doc-aware :doc-id/:panel-index) plus
+  :max-attempts (default 3) and :score-threshold (default 80).
+
+  Every attempt is kept in :attempts (full audit trail — which prompt/seed
+  produced which score/critique), not just the winner, so a caller can see
+  *why* the loop converged where it did."
+  (:require [mangaka.blob :as blob]
+            [mangaka.comfy :as comfy]
+            [mangaka.graphs.generate-panel :as panel]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]
+            [langgraph.graph :as g]))
+
+(def ^:private default-max-attempts 3)
+(def ^:private default-score-threshold 80)
+
+(def ^:private critique-prompt
+  "You are a manga art-quality reviewer running a generate-critique-refine
+  loop. Reply with ONLY a JSON object:
+  {\"score\": <0-100 integer>, \"notes\": \"<one-line critique>\",
+   \"fix_hint\": \"<short imperative phrase to append to the next prompt,
+   e.g. 'sharper linework, less clutter in background'>\"}. No prose.")
+
+(defn- offload
+  "Same offload-to-blob-store shape as mangaka.graphs.gen — kept local so this
+  graph's node fns don't reach into that namespace's private helper."
+  [blobs render]
+  (if (and blobs (:image-b64 render))
+    (let [k (blob/put! blobs (:image-b64 render) (:mime render))]
+      (assoc render :image-key k :image-url (str "/blob/" k)))
+    render))
+
+(defn- attempt-image [blobs {:keys [image-key image-b64]}]
+  (or (when (and blobs image-key) (:b64 (blob/fetch blobs image-key))) image-b64))
+
+(defn- score-attempt [blobs spec render]
+  (let [img (attempt-image blobs render)
+        verdict (llm/vision-json critique-prompt img)]
+    (merge {:spec spec :seed (:seed spec) :score nil :notes "no vision model (offline/mock)"
+            :image-key (:image-key render) :image-url (:image-url render) :source (:source render)
+            :image-b64 (:image-b64 render) :mime (:mime render)}
+           verdict)))
+
+(defn- best-of [attempts]
+  (apply max-key #(or (:score %) -1) attempts))
+
+(defn- revise-spec
+  "Folds the last attempt's critique into the next render spec: appends
+  :fix-hint to the positive prompt (if the model offered one) and bumps the
+  seed so a re-render isn't just a repeat of the same sample."
+  [{:keys [spec seed notes fix-hint fix_hint]}]
+  (let [hint (or fix-hint fix_hint)]
+    (-> spec
+        (update :prompt #(if (seq hint) (str % ", " hint) %))
+        (assoc :seed (inc (or seed 0)))
+        (vary-meta assoc ::from-critique notes))))
+
+(defn- done? [{:keys [max-attempts score-threshold]} attempts]
+  (let [last (peek attempts)]
+    (or (>= (count attempts) max-attempts)
+        (and (:score last) (>= (:score last) score-threshold)))))
+
+(defn make [store blobs]
+  (-> (g/state-graph {:channels {:input {} :spec {} :render {} :attempts {:reducer into :default []}
+                                  :result {}}})
+      (g/add-node :plan   (fn [{:keys [input]}] {:spec (panel/plan* store input)}))
+      (g/add-node :render (fn [{:keys [spec]}]
+                            {:render (offload blobs (comfy/render-panel (comfy/fresh-scratch) spec))}))
+      (g/add-node :score  (fn [{:keys [spec render]}]
+                            {:attempts [(score-attempt blobs spec render)]}))
+      (g/add-node :revise (fn [{:keys [attempts]}] {:spec (revise-spec (peek attempts))}))
+      (g/add-node :finish (fn [{:keys [input attempts]}]
+                            (let [best (best-of attempts)
+                                  idx (or (:panel-index input) (:index input))
+                                  pid (or (:panel-id input)
+                                          (when (:doc-id input) (str "panel-" (:doc-id input) "-" idx))
+                                          (str "panel-" (hash [(:prompt (:spec best)) (:seed best)])))]
+                              (store/save-panel! store {:id pid :doc-id (:doc-id input) :index idx
+                                                        :prompt (:prompt (:spec best)) :seed (:seed best)
+                                                        :score (:score best)
+                                                        :image-key (:image-key best)
+                                                        :image-b64 (when-not (:image-key best) (attempt-image blobs best))
+                                                        :image-mime (or (:mime best) "image/png")})
+                              {:result {:panel-id pid :doc-id (:doc-id input) :index idx
+                                        :best best :attempts attempts
+                                        :attempt-count (count attempts)
+                                        :converged? (boolean (and (:score best)
+                                                                   (>= (:score best)
+                                                                       (or (:score-threshold input) default-score-threshold))))}})))
+      (g/set-entry-point :plan)
+      (g/add-edge :plan :render)
+      (g/add-edge :render :score)
+      (g/add-conditional-edges :score
+                                (fn [{:keys [input attempts]}]
+                                  (if (done? {:max-attempts (or (:max-attempts input) default-max-attempts)
+                                              :score-threshold (or (:score-threshold input) default-score-threshold)}
+                                             attempts)
+                                    :finish
+                                    :revise))
+                                {:finish :finish :revise :revise})
+      (g/add-edge :revise :render)
+      (g/set-finish-point :finish)
+      (g/compile-graph)))
+
+(defn handler
+  "Input validation (free-form needs :prompt, doc-aware needs :doc-id +
+  :panel-index) happens inside generate-panel's `plan*` at :plan-node time —
+  same :bad-input ex-info shape as generate-panel, so callers don't need to
+  special-case this graph."
+  [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

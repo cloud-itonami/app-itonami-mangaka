@@ -1,0 +1,36 @@
+;; mangaka EDGE — CF-Worker-only ClojureScript builds (phase 4 of the animeka template).
+{:deps   {:aliases [:cljs]}
+ :builds {:worker
+          {:target     :esm
+           :output-dir "../appview/ai-gftd-wasm-mangaka-mng4k4x1/js"
+           :modules    {:mangaka
+                        {:exports {characterToTxEdn   mangaka.worker-api/character->tx-edn
+                                   workToTxEdn        mangaka.worker-api/work->tx-edn
+                                   environmentToTxEdn mangaka.worker-api/environment->tx-edn
+                                   chapterToTxEdn     mangaka.worker-api/chapter->tx-edn
+                                   pageToTxEdn        mangaka.worker-api/page->tx-edn
+                                   panelToTxEdn       mangaka.worker-api/panel->tx-edn
+                                   characterToD1      mangaka.worker-api/character->d1
+                                   workToD1           mangaka.worker-api/work->d1
+                                   environmentToD1    mangaka.worker-api/environment->d1
+                                   chapterToD1        mangaka.worker-api/chapter->d1
+                                   pageToD1           mangaka.worker-api/page->d1
+                                   panelToD1          mangaka.worker-api/panel->d1
+                                   qListCharacters    mangaka.worker-api/q-list-characters
+                                   qListWorks         mangaka.worker-api/q-list-works
+                                   qListEnvironments  mangaka.worker-api/q-list-environments
+                                   qChaptersForWork   mangaka.worker-api/q-chapters-for-work
+                                   qPagesForChapter   mangaka.worker-api/q-pages-for-chapter
+                                   qPanelsForPage     mangaka.worker-api/q-panels-for-page
+                                   lookupRef          mangaka.worker-api/lookup-ref
+                                   entityPullEdn     mangaka.worker-api/entity-pull-edn
+                                   shapePullRows     mangaka.worker-api/shape-pull-rows
+                                   pulledEntity      mangaka.worker-api/pulled-entity
+                                   paginate          mangaka.worker-api/paginate
+                                   genRkey           mangaka.worker-api/gen-rkey
+                                   slug              mangaka.worker-api/slug
+                                   vertexId          mangaka.worker-api/vertex-id}}}
+           :compiler-options {:output-feature-set :es2020 :infer-externs :auto}}
+          :node-test
+          {:target :node-test :output-to "target/node-tests.js"
+           :ns-regexp "core-builders-test$" :autorun true}}}

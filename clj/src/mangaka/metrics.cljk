@@ -1,0 +1,200 @@
+(ns mangaka.metrics
+  "Pure scoring/metric ports from the pruned Python tree (../lg, removed 2026-07-07).
+
+   - engagement_metric.py  → wilson-lower-bound / engagement-weighted /
+                             reaction-fitness / reaction-trustworthy? /
+                             merge-recordlog-rows (ADR-2606181200 reaction fitness)
+   - v11_tensor_score.py   → page-tensor-score / panel-importance-from-manifest
+
+   The Python network fetchers (yoro AppView / recordlog D1) were host I/O and
+   are intentionally not ported — callers fetch rows themselves and feed the
+   pure folds here. Golden fixtures generated from the Python originals live in
+   test/mangaka/py_port_test.clj."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── shared ──────────────────────────────────────────────────────────────────
+
+(defn round-to
+  "Python-compatible round(x, p): round-half-even at p decimal places."
+  [x p]
+  (let [f  (Math/pow 10 p)
+        y  (* (double x) f)
+        fl (Math/floor y)
+        d  (- y fl)
+        r  (cond (< d 0.5) fl
+                 (> d 0.5) (inc fl)
+                 :else     (if (zero? (mod fl 2.0)) fl (inc fl)))]
+    (/ r f)))
+
+;; ── engagement (reaction fitness) ───────────────────────────────────────────
+
+(def w-like 1.0)
+(def w-repost 2.0)   ; a repost propagates the work → weigh highest
+(def w-reply 1.5)
+(def min-impressions 30) ; below this the rate is too noisy to trust
+
+(defn wilson-lower-bound
+  "Lower bound of the Wilson score interval for a proportion, in [0,1].
+   Penalises small samples: 1/1 → ~0.21, 100/100 → ~0.96."
+  ([successes trials] (wilson-lower-bound successes trials 1.96))
+  ([successes trials z]
+   (if (<= trials 0)
+     0.0
+     (let [phat   (max 0.0 (min 1.0 (/ (double successes) trials)))
+           z2     (* z z)
+           denom  (+ 1.0 (/ z2 trials))
+           center (+ phat (/ z2 (* 2.0 trials)))
+           margin (* z (Math/sqrt (/ (+ (* phat (- 1.0 phat)) (/ z2 (* 4.0 trials))) trials)))]
+       (max 0.0 (/ (- center margin) denom))))))
+
+(defn engagement-weighted
+  [{:keys [likes reposts replies] :or {likes 0 reposts 0 replies 0}}]
+  (+ (* w-like likes) (* w-repost reposts) (* w-reply replies)))
+
+(defn- influence-norm [influence]
+  (let [v (cond (number? influence) (double influence)
+                (string? influence) (or (parse-double influence) ##NaN)
+                :else ##NaN)]
+    (if #?(:clj (Double/isNaN v) :cljs (js/isNaN v))
+      1.0
+      (max 0.5 (min 2.0 v)))))
+
+(defn reaction-fitness
+  "Reaction fitness 0-100, or nil when there is no usable signal yet.
+   - :impressions known (>0): Wilson lower bound of weighted-engagement rate.
+   - :impressions unknown but some engagement: log-shrunk saturating count.
+   - nothing at all: nil (caller keeps the synthetic score)."
+  [{:keys [impressions influence] :or {influence 1.0} :as m}]
+  (let [eng  (engagement-weighted m)
+        base (cond
+               (and impressions (pos? impressions))
+               (wilson-lower-bound (min eng (double impressions)) (double impressions))
+
+               (pos? eng)
+               (- 1.0 (/ 1.0 (+ 1.0 (Math/log1p eng))))
+
+               :else nil)]
+    (when base
+      (round-to (min 100.0 (* 100.0 base (influence-norm influence))) 1))))
+
+(defn reaction-trustworthy?
+  "Gate before the online signal may OVERRIDE the synthetic score."
+  ([impressions] (reaction-trustworthy? impressions 0.0))
+  ([impressions engagement] (reaction-trustworthy? impressions engagement min-impressions))
+  ([impressions engagement min-imp]
+   (if (some? impressions)
+     (>= impressions min-imp)
+     (>= engagement min-imp))))
+
+(def ^:private like-collection "app.bsky.feed.like")
+(def ^:private repost-collection "app.bsky.feed.repost")
+
+(defn- ->n [v]
+  (max 0 (long (cond (number? v) v
+                     (string? v) (or (parse-long (str/trim v)) 0)
+                     :else 0))))
+
+(defn merge-recordlog-rows
+  "Pure fold of recordlog GROUP-BY rows into {uri {:likes :reposts :replies :views}}.
+   `reaction-rows` are like/repost rows ({\"p\" \"collection\" \"n\"}); `reply-rows`
+   are reply-post rows ({\"p\" \"n\"}). :views is nil (no impression tracking)."
+  [uris reaction-rows reply-rows]
+  (let [init (into {} (map (fn [u] [u {:likes 0 :reposts 0 :replies 0 :views nil}]) uris))
+        with-reactions
+        (reduce (fn [acc row]
+                  (let [p (get row "p")]
+                    (if-not (contains? acc p)
+                      acc
+                      (let [n (->n (get row "n"))
+                            c (get row "collection")]
+                        (cond (= c like-collection)   (update-in acc [p :likes] + n)
+                              (= c repost-collection) (update-in acc [p :reposts] + n)
+                              :else acc)))))
+                init (or reaction-rows []))]
+    (reduce (fn [acc row]
+              (let [p (get row "p")]
+                (if (contains? acc p)
+                  (update-in acc [p :replies] + (->n (get row "n")))
+                  acc)))
+            with-reactions (or reply-rows []))))
+
+;; ── v11 D — tensor network composite scoring ────────────────────────────────
+
+(def style-axes
+  "Axes that should be CONSISTENT (low variance) across the page."
+  #{"line_clarity" "tonal_balance" "atmospheric_background"
+    "character_anatomy" "manga_authenticity"})
+
+(def dynamism-axes
+  "Axes that should VARY across the page (different intensities)."
+  #{"panel_dynamism" "sfx_text" "composition_pose" "character_expression"})
+
+(defn page-tensor-score
+  "Tensor-network composite score from per-panel score maps
+   (each {\"scores\" {axis 0-10}}). Opts: :alpha :beta :gamma :delta
+   :panel-importance (2026-05-27 B2 calibration defaults)."
+  ([panel-scores] (page-tensor-score panel-scores {}))
+  ([panel-scores {:keys [alpha beta gamma delta panel-importance]
+                  :or   {alpha 1.0 beta 0.15 gamma 0.2 delta 0.1}}]
+   (let [axes (sort (into #{} (mapcat #(keys (get % "scores" {}))) panel-scores))]
+     (if (or (empty? axes) (empty? panel-scores))
+       {:total 0 :error "no scores"}
+       (let [matrix   (mapv (fn [ps]
+                              (mapv (fn [a] (max 0.0 (min 10.0 (double (get-in ps ["scores" a] 0)))))
+                                    axes))
+                            panel-scores)
+             n-panels (count matrix)
+             n-axes   (count axes)
+             weights  (if (or (nil? panel-importance) (not= (count panel-importance) n-panels))
+                        (vec (repeat n-panels 1.0))
+                        (mapv #(max 0.1 (double %)) panel-importance))
+             wsum     (let [s (reduce + weights)] (if (zero? s) 1.0 s))
+             axis-means (mapv (fn [i]
+                                (/ (reduce + (map-indexed (fn [p row] (* (weights p) (nth row i))) matrix))
+                                   wsum))
+                              (range n-axes))
+             overall-mean (/ (reduce + axis-means) n-axes)
+             axis-vars (mapv (fn [i]
+                               (let [m (nth axis-means i)]
+                                 (/ (reduce + (map-indexed
+                                               (fn [p row] (* (weights p)
+                                                              (let [d (- (nth row i) m)] (* d d))))
+                                               matrix))
+                                    wsum)))
+                             (range n-axes))
+             style-terms (keep (fn [[a v]] (when (contains? style-axes a) v)) (map vector axes axis-vars))
+             style-var   (/ (reduce + 0.0 style-terms) (max 1 (count style-terms)))
+             dyn-terms   (keep (fn [[a v]] (when (contains? dynamism-axes a) v)) (map vector axes axis-vars))
+             dyn-var     (/ (reduce + 0.0 dyn-terms) (max 1 (count dyn-terms)))
+             anchor      (- (apply max axis-means) overall-mean)
+             raw         (+ (* alpha overall-mean)
+                            (- (* beta style-var))
+                            (* gamma (min dyn-var 4.0))
+                            (* delta anchor))
+             total       (max 0.0 (min 100.0 (* raw 10)))]
+         {:total             (round-to total 1)
+          :mean              (round-to overall-mean 2)
+          :style-variance    (round-to style-var 3)
+          :dynamism-variance (round-to dyn-var 3)
+          :anchor-strength   (round-to anchor 3)
+          :n-panels          n-panels
+          :n-axes            n-axes
+          :weighted          (some? panel-importance)})))))
+
+(defn panel-importance-from-manifest
+  "Per-panel importance weights from the manifest emphasis field.
+   impact/punchline 1.0, beat 0.85, transition 0.75, establish 0.7, other 0.6;
+   insert shots without a focal character × 0.6."
+  [panels]
+  (mapv (fn [p]
+          (let [emph  (str/lower (or (get-in p ["panelLayout" "gh:emphasis"]) ""))
+                shot  (str/lower (or (get p "shot") ""))
+                focal (get p "focusedCharacters")
+                w     (cond (contains? #{"impact" "punchline"} emph) 1.0
+                            (= emph "beat")       0.85
+                            (= emph "transition") 0.75
+                            (= emph "establish")  0.7
+                            :else                 0.6)
+                w     (if (and (str/includes? shot "insert") (empty? focal)) (* w 0.6) w)]
+            (round-to w 2)))
+        panels))

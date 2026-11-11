@@ -1,0 +1,125 @@
+;; scenario-first seedance workflow (nbb) — シナリオ → 1本の multi-shot 動画 →
+;; 全編 dense サンプリング → ビート窓ごとのコマ候補 manifest。
+;;
+;; 従来 (image-first): パネル画像を先に決め、1パネル=1クリップを生成して
+;; その中から1フレーム選ぶ。
+;; 本 workflow (scenario-first): シーン脚本 (scenario EDN) を丸ごと seedance
+;; に渡して連続したマルチショット映像を1本 "撮影" し、その footage から
+;; 各ビートのコマを後から抜く — 監督が回した映像から漫画のコマを起こす向き。
+;;
+;; エンジン切り替え (superproject ADR-2607252400): scenario EDN の
+;; :scene/engine が正本。"seedance-2.0" (既定・hosted) は本ツール、
+;; self-hosted (ltx-2.3 / wan2.2-ti2v-5b / hunyuanvideo-1.5) は
+;; tools/scenario_comfy.clj (JVM, gad fleet)。出力契約 (manifest.edn +
+;; t<秒>.png) は両者同一で composer はエンジン非依存。
+;;
+;; usage: FAL_KEY=... kbb --backend sci scenario_seedance.cljk <scenario.edn> <refs-dir> <out-dir>
+;;   1. scenario EDN → multi-shot cinematic prompt (@ImageN character refs)
+;;   2. fal.ai bytedance/seedance-2.0/fast/reference-to-video (queue API)
+;;   3. poll → download mp4
+;;   4. ffprobe duration → ffmpeg dense frame sampling (every ~0.35s)
+;;   5. manifest.edn: beat → time window → candidate frames
+(ns scenario-seedance
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            ["child_process" :as cp]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def fal-app "bytedance/seedance-2.0")
+(def fal-model (str fal-app "/fast/reference-to-video"))
+
+(defn sh [cmd & [opts]]
+  (cp/execSync cmd (clj->js (merge {:encoding "utf8" :maxBuffer (* 64 1024 1024)} opts))))
+
+(defn data-uri [file]
+  (str "data:image/png;base64," (.toString (fs/readFileSync file) "base64")))
+
+(defn build-prompt [{:scene/keys [style beats]}]
+  (str style ". A multi-shot sequence with hard cuts between shots, "
+       (count beats) " shots in strict order, equal screen time per shot:\n"
+       (str/join "\n"
+                 (map-indexed
+                  (fn [i {:keys [shot location action]}]
+                    (str "Shot " (inc i) " (" shot "): " location ". " action "."))
+                  beats))))
+
+(defn -main [scenario-path refs-dir out-dir]
+  (let [fal-key (or (.-FAL_KEY js/process.env)
+                    (throw (js/Error. "FAL_KEY not set")))
+        scenario (edn/read-string (fs/readFileSync scenario-path "utf8"))
+        beats (:scene/beats scenario)
+        prompt (build-prompt scenario)
+        image-urls (mapv #(data-uri (path/join refs-dir (:ref %)))
+                         (:scene/cast scenario))
+        _ (fs/mkdirSync out-dir #js {:recursive true})
+        req-file (path/join out-dir "request.json")
+        _ (fs/writeFileSync req-file
+                            (js/JSON.stringify
+                             (clj->js {:prompt prompt
+                                       :image_urls image-urls
+                                       :resolution "480p"
+                                       :duration 10
+                                       ;; コマ抜きに音声は不要 — 生成audioが
+                                       ;; content filter に引っかかり出力ごと
+                                       ;; 差し止められた実例 (partner_validation_failed)
+                                       :generate_audio false})))
+        _ (println "=== prompt ===\n" prompt "\n")
+        auth (str "Authorization: Key " fal-key)
+        submit (js/JSON.parse
+                (sh (str "curl -sS -X POST https://queue.fal.run/" fal-model
+                         " -H '" auth "' -H 'Content-Type: application/json'"
+                         " --data @" req-file)))
+        rid (.-request_id submit)]
+    (when-not rid
+      (println "submit failed:" (js/JSON.stringify submit))
+      (js/process.exit 1))
+    (println "request_id:" rid)
+    ;; poll
+    (loop [n 0]
+      (let [st (js/JSON.parse
+                (sh (str "curl -sS https://queue.fal.run/" fal-app
+                         "/requests/" rid "/status -H '" auth "'")))]
+        (println "  poll" n (.-status st))
+        (cond
+          (= "COMPLETED" (.-status st)) :done
+          (> n 120) (do (println "timeout") (js/process.exit 1))
+          :else (do (sh "sleep 5") (recur (inc n))))))
+    (let [resp (js/JSON.parse
+                (sh (str "curl -sS https://queue.fal.run/" fal-app
+                         "/requests/" rid " -H '" auth "'")))
+          video-url (some-> resp .-video .-url)
+          mp4 (path/join out-dir "scene.mp4")]
+      (when-not video-url
+        (println "no video url:" (subs (js/JSON.stringify resp) 0 800))
+        (js/process.exit 1))
+      (sh (str "curl -sS -o " mp4 " '" video-url "'"))
+      (let [dur (js/parseFloat
+                 (sh (str "ffprobe -v error -show_entries format=duration"
+                          " -of default=noprint_wrappers=1:nokey=1 " mp4)))
+            step 0.35
+            times (vec (take-while #(< % (- dur 0.05))
+                                   (iterate #(+ % step) 0.1)))]
+        (println "duration:" dur "s — sampling" (count times) "frames")
+        (doseq [t times]
+          (sh (str "ffmpeg -v error -ss " (.toFixed t 2) " -i " mp4
+                   " -frames:v 1 -y " (path/join out-dir (str "t" (.toFixed t 2) ".png")))))
+        ;; beat windows: equal division of the clip, in beat order
+        (let [n (count beats)
+              window (/ dur n)
+              manifest
+              {:scene/id (:scene/id scenario)
+               :video "scene.mp4" :duration dur
+               :beats (vec (map-indexed
+                            (fn [i b]
+                              (let [w0 (* i window) w1 (* (inc i) window)]
+                                {:beat/id (:beat/id b)
+                                 :window [w0 w1]
+                                 :frames (vec (for [t times
+                                                    :when (and (>= t w0) (< t w1))]
+                                                (str "t" (.toFixed t 2) ".png")))}))
+                            beats))}]
+          (fs/writeFileSync (path/join out-dir "manifest.edn") (pr-str manifest))
+          (println "wrote" (path/join out-dir "manifest.edn")))))))
+
+(apply -main *command-line-args*)

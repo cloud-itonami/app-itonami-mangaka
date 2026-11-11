@@ -1,0 +1,55 @@
+(ns mangaka.graphs.enrich-characters
+  "enrich_characters — derive structured character metadata with the LLM
+  (the Python enrich_characters graph). Exercises the langchain.model
+  path for structured output, distinct from chat.
+
+  A two-node graph (enrich → persist): the LLM is asked for a JSON object
+  describing the character; the parsed map is stored under
+  :character/enrichment. Offline (no ANTHROPIC_API_KEY) the mock model's
+  reply does not parse, so `llm/complete-json` returns nil and we persist
+  a stub — the graph always completes. Requires :name."
+  (:require [langgraph.graph :as g]
+            [kotoba.lang.text :as str]
+            [mangaka.domain :as domain]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(def ^:private system
+  "You are a manga character designer. Given a character, reply with ONLY a
+  JSON object: {\"appearanceTags\":[…], \"personality\":\"…\", \"role\":\"…\",
+  \"palette\":[…], \"archetype\":\"…\"}. `archetype` MUST be one of:
+  strategist | hot-blooded | cold-menace | energetic | gentle | stoic | mob —
+  it drives the character's manga expression (吹き出し・文字の薄さ/大きさ・背景トーン,
+  ai.gftd.mangaka.analyzeExpression). No prose, no code fences.")
+
+(defn- enrich-node [{:keys [input]}]
+  (let [{:keys [name description tags]} input
+        user (str "Character: " name
+                  (when description (str "\nDescription: " description))
+                  (when (seq tags) (str "\nTags: " (str/join ", " tags))))
+        derived (llm/complete-json system user)]
+    ;; track applied-ness explicitly (derived = nil offline/mock) rather than
+    ;; sniffing for a key, so a real LLM reply can't be misclassified.
+    {:applied (some? derived)
+     :enrichment (or derived {:note "no structured enrichment (offline/mock)"})}))
+
+(defn make [store]
+  (-> (g/state-graph {:channels {:input {} :enrichment {} :applied {} :result {}}})
+      (g/add-node :enrich enrich-node)
+      (g/add-node :persist
+                  (fn [{:keys [input enrichment applied]}]
+                    (let [cid (or (:id input) (str "char-" (domain/slug (:name input))))]
+                      (store/save-character! store {:id cid :name (:name input)
+                                                    :enrichment (pr-str enrichment)})
+                      {:result {:character-id cid :name (:name input)
+                                :enrichment enrichment
+                                :llm-applied (boolean applied)}})))
+      (g/set-entry-point :enrich)
+      (g/add-edge :enrich :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(defn handler [compiled]
+  (fn [input _thread-id]
+    (domain/require-input! input [:name])
+    (:result (g/invoke compiled {:input input}))))

@@ -1,0 +1,31 @@
+(ns mangaka.graphs.generate-scene
+  "mangaka_generate_scene — generate a background / environment image. A
+  plan→render→persist generation graph (see mangaka.graphs.gen) persisting
+  a :scene/* entity; requires a :prompt."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.graphs.gen :as gen]
+            [mangaka.store :as store]))
+
+(defn- plan [{:keys [prompt tags negative seed width height model]}]
+  (let [full (->> [prompt (when (seq tags) (str/join ", " tags))]
+                  (remove nil?) (str/join ", "))]
+    {:prompt full
+     :negative (or negative "lowres, people, characters, worst quality")
+     :seed (or seed 0) :width (or width 1216) :height (or height 832) :model model}))
+
+(defn- persist [store input spec render]
+  (let [sid (or (:scene-id input) (str "scene-" (hash [(:prompt spec) (:seed spec)])))]
+    (store/save-scene! store {:id sid :name (:name input)
+                              :prompt (:prompt spec) :seed (:seed spec) :model (:model spec)
+                              :image-key (:image-key render)
+                              :image-b64 (when-not (:image-key render) (:image-b64 render))
+                              :image-mime (:mime render)})
+    {:scene-id sid :name (:name input) :image-b64 (:image-b64 render)
+     :image-key (:image-key render) :image-url (:image-url render)
+     :mime (:mime render) :source (:source render) :seed (:seed spec) :run-id (:run-id render)}))
+
+(def ^:private opts {:require [:prompt]})
+
+(defn make [store blobs] (gen/build store blobs {:plan plan :persist persist}))
+(defn handler [compiled] (gen/handler compiled opts))
+(defn stream-handler [compiled] (gen/stream-handler compiled opts))

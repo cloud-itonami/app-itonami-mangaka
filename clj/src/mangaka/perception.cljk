@@ -1,0 +1,65 @@
+(ns mangaka.perception
+  "知覚レイヤ — kotoba-lang/kami-mangaka-qa への委譲 facade
+  (ADR-2607165100; 初版のインライン実装は ADR-2607164200 addendum 3)。
+
+  prompt / parser / 幾何の**正本は共有 lib** (`kami.mangaka.qa.*`) に移った。
+  ここは mangaka.llm の vision-json を lib の `vision-fn` capability として
+  束ねるだけの薄い facade — 既存 call sites (graphs/detect_faces.cljc、品質
+  ループの augment-axes、テスト) の API・挙動は不変。
+
+  実測知見 (2026-07-16, fleet gemma4) は lib 側 docstring に集約:
+  カウント VQA は正確 / box grounding は弱い / コマ境界検出は動く —
+  :facePresence 軸の既定検出器は count-faces。"
+  (:require [kami.mangaka.qa.geometry :as geo]
+            [kami.mangaka.qa.perception :as qa]
+            [mangaka.llm :as llm]))
+
+;; prompts (re-export — 正本は lib)
+(def face-prompt qa/face-boxes-prompt)
+(def face-count-prompt qa/face-count-prompt)
+(def panel-prompt qa/panel-boxes-prompt)
+
+;; --- VLM 検出 (vision-fn 既定 = llm/vision-json) ---------------------------
+
+(defn detect-faces
+  "顔ボックス [{:cx :cy :w :h}] | nil。⚠ backend の grounding 力依存 —
+  数だけ要るなら count-faces (実測で動く既定経路)。"
+  ([image-b64] (detect-faces image-b64 nil))
+  ([image-b64 vision-fn]
+   (qa/detect-faces (or vision-fn llm/vision-json) image-b64)))
+
+(defn count-faces
+  "画像内の漫画キャラ顔の数 (long) | nil。:facePresence 軸の既定検出器。"
+  ([image-b64] (count-faces image-b64 nil))
+  ([image-b64 vision-fn]
+   (qa/count-faces (or vision-fn llm/vision-json) image-b64)))
+
+(defn detect-panels
+  "パネルボックス [{:x :y :w :h}] | nil。"
+  ([image-b64] (detect-panels image-b64 nil))
+  ([image-b64 vision-fn]
+   (qa/detect-panels (or vision-fn llm/vision-json) image-b64)))
+
+;; --- 幾何 (純関数、lib 直委譲) ----------------------------------------------
+
+(def face->rect geo/face->rect)
+(def overlap-area geo/overlap-area)
+(def bubble-clearance geo/bubble-clearance)
+(def face-presence-axis geo/face-presence-axis)
+
+;; --- 品質ループ統合 -----------------------------------------------------------
+
+(defn augment-axes
+  "critique の axes map に知覚軸を焼き足す (品質ループの Reflect 段用)。
+  spec の :focal-count が正で顔検出が動けば :facePresence を追加。検出不能
+  (nil) は何も足さない — offline で rubric が痩せるだけで壊れない。
+  `detect-fn` は (fn [image-b64] → count | faces | nil)、既定は count-faces。"
+  [axes spec image-b64 detect-fn]
+  (let [expected (:focal-count spec)]
+    (if-let [presence (when (pos? (or expected 0))
+                        (face-presence-axis expected
+                                            (if detect-fn
+                                              (detect-fn image-b64)
+                                              (count-faces image-b64))))]
+      (assoc (or axes {}) :facePresence presence)
+      axes)))

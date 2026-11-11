@@ -1,0 +1,81 @@
+(ns gen-page
+  "Write `dist/index.html` — the studio's host page.
+
+  The page itself comes from `kami.mangaka.genko-theme/->page-html`, the same
+  function kami-genko's own published page calls. All this script decides is the
+  one thing that differs: **which catalog the page declares**.
+
+  Run: npm run page   (after `npm run build`, which fills dist/js)"
+  (:require ["node:fs" :as fs]
+            ["node:process" :as process]
+            [kami.mangaka.genko-theme :as theme]))
+
+(def catalog
+  "Where the published works are listed.
+
+  Absolute, on the reader's origin, and not a same-origin path: the studio is
+  mounted at app.itonami.cloud/mangaka/ while the works and their page images
+  live on mangaka.itonami.cloud. Both `/api/` and `/img/` there send
+  `access-control-allow-origin: *` (checked 2026-08-06), so the browser can
+  read them directly and no proxy is in the path to go stale.
+
+  It matters that this is absolute rather than proxied: the reader returns page
+  `src` values like `/img/<key>`, absolute on ITS origin, and
+  `genko-work/with-base` resolves them against this. Left relative they would
+  resolve against app.itonami.cloud and 404 into a placeholder frame with
+  nothing on screen to say why."
+  (or (some-> js/process .-env .-MANGAKA_CATALOG not-empty)
+      "https://mangaka.itonami.cloud/api"))
+
+(def dds-css
+  "The vendored DADS stylesheet. nbb has no resource loader, so it is read as a
+  file — but the path is taken from the CLASSPATH rather than guessed from a
+  list of relative locations.
+
+  Guessing is what the other nbb consumers in this workspace do, and it breaks
+  the moment the build runs anywhere but the directory the guesses were written
+  for — a temp worktree outside the superproject, or a CI checkout. The
+  classpath already names exactly where the resolved dep landed (a git cache
+  under ~/.gitlibs), so `npm run page` passes it in and this looks there. The
+  `DDS_ROOT` override stays for the case where someone is pointing at a working
+  copy instead of the pin."
+  ;; Two shapes, because the two sources differ by one segment: a classpath
+  ;; entry already IS a resource root (`…/<sha>/resources`), while DDS_ROOT
+  ;; points at the repo. Trying only the repo shape found nothing on a
+  ;; classpath that contained the file — measured.
+  (let [cands (concat (when-let [r (some-> js/process .-env .-DDS_ROOT)]
+                        [(str r "/resources/jp_go_dds/dds.css")])
+                      (map #(str % "/jp_go_dds/dds.css")
+                           (some-> js/process .-env .-CLJ_CP (.split ":"))))
+        path (or (first (filter fs/existsSync cands))
+                 (throw (js/Error.
+                         (str "jp-go-digital-design-system の dds.css が classpath に無い。"
+                              " CLJ_CP=\"$(kbb -Spath)\" を渡すか、DDS_ROOT で場所を指すこと。"))))]
+    (str (fs/readFileSync path "utf8"))))
+
+(def out-path "dist/index.html")
+
+(def image-api
+  "生成先。カタログと同じく**宣言**であって探索ではない —— 無い面では一度も
+  聞きに行かないので、『繋がっていない』と『落ちている』を取り違えない。
+
+  ここも proxy を挟まない。レンダーは実測 60〜100 秒の同期 GPU 作業で、
+  Cloudflare は非ストリーミングの Worker subrequest を 100 秒で切って HTML 524 を
+  返す —— 挟むと遅い成功が直せない失敗になる。gate は認証を要求しないので、
+  ブラウザから直接叩いて漏れるものも無い(詳細は murakumo.generation.image)。"
+  (or (some-> js/process .-env .-MANGAKA_IMAGE_API not-empty)
+      "https://api.murakumo.cloud/v1/images/generations"))
+
+(defn -main [& args]
+  (let [html (theme/->page-html {:dds-css dds-css :catalog catalog :image-api image-api})
+        check? (some #{"--check"} args)
+        current (when (fs/existsSync out-path) (str (fs/readFileSync out-path "utf8")))]
+    (cond
+      (and check? (= current html)) (println (str out-path " up to date"))
+      check? (do (println (str "STALE: " out-path " differs from its generator."))
+                 (process/exit 1))
+      :else (do (fs/mkdirSync "dist" #js {:recursive true})
+                (fs/writeFileSync out-path html)
+                (println "wrote" out-path (count html) "bytes\n  catalog  " catalog "\n  image-api" image-api)))))
+
+(apply -main (drop 2 (js->clj (.-argv process))))

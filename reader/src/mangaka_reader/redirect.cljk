@@ -1,0 +1,11 @@
+(ns mangaka-reader.redirect
+  "mangaka.gftd.ai → aozora.app/studio (ADR-2607071100 wave3 retirement).
+  The manga editor lives in the aozora.app SPA now; nothing else is served
+  on this host. Deployed as the separate Worker `mangaka-gftd-redirect`
+  (redirect/wrangler.jsonc)."
+  )
+
+(defn fetch-handler [_req _env _ctx]
+  (js/Response.redirect "https://aozora.app/studio" 301))
+
+(def handler #js {:fetch fetch-handler})

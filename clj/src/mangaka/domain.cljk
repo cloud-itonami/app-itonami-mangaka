@@ -1,0 +1,385 @@
+(ns mangaka.domain
+  "Storyboard domain — EDN + Datomic native. Ported from the Python
+  `storyboard_db.cljc` / `export_lexicon`, but the storyboard is stored as a
+  decomposed datom graph (not an opaque JSON/EDN blob), so it is queryable
+  with Datalog the way the Python `StoryboardDB.find` was:
+
+    :doc/*     the document entity (:doc/id unique) — also carries the
+               page-level attrs (:page/number/:page/title/:page/layout/…).
+    :panel/*   storyboard panels (component refs under :page/panels);
+               :panel/focal is cardinality-many → \"which panels feature
+               character X\" is a Datalog query.
+    :bubble/* :sfx/*  component refs under a panel.
+    :stb/doc   a back-pointer (doc id) on every storyboard entity, so a
+               re-save can retract the whole prior graph.
+
+  (Rendered artifacts — :panel/id panels from generate_panel, :character/*,
+  :scene/*, :page-render/* — are separate entities, below.)
+
+  The page map keeps the Python keyword convention verbatim (:page/*,
+  :panel/*, :bubble/*, :sfx/*, :character/*) so EDN authored for the Python
+  app loads unchanged. JSON / the AT-Proto lexicon are *derived views*
+  (see `export-lexicon`), not the stored representation."
+  (:require [kotoba.lang.text :as str]))
+
+;; ───────────────────────── schema ─────────────────────────
+
+(def schema
+  "DataScript-style schema (constraint attrs only — undeclared attrs are
+  cardinality-one scalars). Merged into the store conn with the checkpoint
+  + comfy-exec schemas by the store layer."
+  {;; storyboard document = the page entity
+   :doc/id          {:db/unique :db.unique/identity}
+   :stb/doc         {}            ; back-pointer (doc id) on every stb entity
+   :page/panels     {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :panel/focal     {:db/cardinality :db.cardinality/many}  ; → queryable by character
+   :panel/bubbles   {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :panel/sfx       {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   ;; komawari layering (ADR-2607051530): a panel isn't one flat image — it's
+   ;; an ordered stack of :background/:midground/:character/:effect/:inset
+   ;; layers, each independently positioned (so a :character layer can bleed
+   ;; past its panel's own rect on purpose — the Togashi frame-break device).
+   :panel/layers    {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   ;; (:page/base-tags, :panel/tags etc. are stored as single vector values —
+   ;;  order-preserving, cardinality-one — since they are lists, not query keys.)
+
+   ;; rendered panel (generate_panel output) — distinct from storyboard panels
+   :panel/id        {:db/unique :db.unique/identity}
+   :panel/doc-id    {}            ; owning document id (string; not a ref —
+                                  ; a panel may be rendered before its doc exists)
+   :panel/prompt    {}
+   :panel/seed      {}
+   :panel/model     {}
+   :panel/image-b64 {}            ; inline base64 (fallback when no blob store)
+   :panel/image-key {}            ; content-addressed blob key (preferred — see mangaka.blob)
+   :panel/image-mime {}
+   :panel/score     {}            ; vision-QA score (0-100), queryable
+   :panel/critique  {}            ; pr-str EDN of the vision critique map
+   :panel/faces     {}            ; pr-str EDN of VLM-detected face boxes [{:cx :cy :w :h}]
+                                  ; (detectFaces graph; 下流の吹き出し顔回避が再検出なしで使う)
+   :panel/jump-qa   {}            ; pr-str EDN of the Jump-benchmark judgement (jumpBenchmarkQa)
+   :panel/status    {}
+
+   ;; generated character (generate_character output) — a reusable cast member
+   :character/id        {:db/unique :db.unique/identity}
+   :character/name      {}
+   :character/prompt    {}
+   :character/seed      {}
+   :character/model     {}
+   :character/image-b64  {}
+   :character/image-key  {}        ; content-addressed blob key (preferred)
+   :character/image-mime {}
+   :character/enrichment {}        ; pr-str EDN of LLM-derived metadata map
+   :character/status    {}
+
+   ;; generated scene (generate_scene output) — a background / environment
+   :scene/id        {:db/unique :db.unique/identity}
+   :scene/name      {}
+   :scene/prompt    {}
+   :scene/seed      {}
+   :scene/model     {}
+   :scene/image-b64  {}
+   :scene/image-key  {}        ; content-addressed blob key (preferred)
+   :scene/image-mime {}
+   :scene/enrichment {}        ; pr-str EDN of LLM-derived scene metadata
+   :scene/status    {}
+
+   ;; rendered page (generate_page output) — a composed page image for a doc
+   :page-render/id        {:db/unique :db.unique/identity}
+   :page-render/doc-id    {}
+   :page-render/prompt    {}
+   :page-render/seed      {}
+   :page-render/model     {}
+   :page-render/image-b64  {}
+   :page-render/image-key  {}      ; content-addressed blob key (preferred)
+   :page-render/image-mime {}
+   :page-render/jump-qa   {}      ; pr-str EDN of the Jump-benchmark judgement (jumpBenchmarkQa)
+   :page-render/status    {}
+
+   ;; own-model lifecycle (train_character_lora output; ADR-2607164200) —
+   ;; one entity per model in mangaka.models/registry whose training has been
+   ;; staged/dispatched. The weight binary itself NEVER lands here (DataLad +
+   ;; B2 only); :model/lora-cid is the pointer that generation passes on as
+   ;; :character-lora-cid (ADR-2607155500 Phase 1's Higgsfield character-id
+   ;; equivalent).
+   :model/id        {:db/unique :db.unique/identity}
+   :model/kind      {}            ; "character-lora" (only kind trained so far)
+   :model/character {}            ; cast member this LoRA pins, e.g. "shiro"
+   :model/base      {}            ; base model id, e.g. "animagine-xl-4.0"
+   :model/dataset   {}            ; pr-str EDN of the dataset manifest used
+   :model/job       {}            ; pr-str EDN of the dispatched :gen.job envelope
+   :model/lora-cid  {}            ; kotoba CID of the trained .safetensors (when :trained)
+   :model/status    {}})          ; "staged" | "queued" | "trained"
+
+;; ───────────────────────── input validation ─────────────────────────
+
+(defn require-input!
+  "Throws ex-info {:type :bad-input} (→ HTTP 400) unless every key in `ks`
+  is present and non-blank in the input map `m`."
+  [m ks]
+  (let [blank? (fn [v] (or (nil? v) (and (string? v) (str/blank? v))))
+        missing (filterv #(blank? (get m %)) ks)]
+    (when (seq missing)
+      (throw (ex-info (str "missing required input: " (str/join ", " (map name missing)))
+                      {:type :bad-input :missing missing})))
+    m))
+
+(defn blob-url
+  "The fetch URL for a content-addressed image key (nil → nil). Single source
+  for the /blob/ route convention."
+  [k]
+  (when k (str "/blob/" k)))
+
+(defn with-image-url
+  "Adds an :image-url to a loaded entity map that carries any :*/image-key, so
+  clients get a directly-fetchable URL (returns the map unchanged with no key)."
+  [m]
+  (if-let [k (some m [:panel/image-key :character/image-key :scene/image-key :page-render/image-key])]
+    (assoc m :image-url (blob-url k))
+    m))
+
+(defn page-render-id
+  "The canonical :page-render/id for a document: \"page-<doc-id>\". One doc has
+  at most one composed page render; used by generate_page (persist) and the
+  page-render read endpoints/tools."
+  [doc-id]
+  (str "page-" doc-id))
+
+(defn panel-rect
+  "A valid normalized [x y w h] (0–1) for panel `i`: the panel's :panel/rect
+  when it's a vector of 4 numbers, else a stacked default. Shared by the KAMI
+  bridge and the SVG preview so panel layout is defined in one place and a
+  malformed/missing rect never crashes a renderer."
+  [panel i]
+  (let [r (:panel/rect panel)]
+    (if (and (sequential? r) (= 4 (count r)) (every? number? r))
+      (vec r)
+      [0.04 (min 0.95 (+ 0.02 (* i 0.24))) 0.92 0.22])))
+
+(defn valid-panel!
+  "Validates a single panel's collection-typed fields, throwing
+  {:type :bad-input}. These matter because decomposition coerces them blindly:
+  a string :panel/focal would `(vec \"Nei\")` → [\\N \\e \\i] (silent datom
+  corruption that breaks character queries), and string bubbles/sfx would crash
+  `select-keys` (500). Reject at the boundary instead."
+  [p]
+  (when-let [focal (:panel/focal p)]
+    (when-not (and (sequential? focal) (every? #(or (string? %) (keyword? %)) focal))
+      (throw (ex-info ":panel/focal must be a sequence of character refs"
+                      {:type :bad-input :got focal}))))
+  (doseq [k [:panel/bubbles :panel/sfx :panel/layers]]
+    (when-let [xs (k p)]
+      (when-not (and (sequential? xs) (every? map? xs))
+        (throw (ex-info (str k " must be a sequence of maps") {:type :bad-input :got (type xs)})))))
+  (when-let [rect (:panel/rect p)]
+    (when-not (and (sequential? rect) (= 4 (count rect)) (every? number? rect))
+      (throw (ex-info ":panel/rect must be [x y w h] of 4 numbers" {:type :bad-input :got rect}))))
+  (doseq [l (:panel/layers p)]
+    ;; a layer's :rect is intentionally NOT bounds-checked here (unlike
+    ;; :panel/rect) — a :character/:inset layer legally runs outside [0,1]
+    ;; when it carries :layer/bleed (the Togashi frame-break device);
+    ;; komawari/validate-layout is where geometric legality is judged
+    (when-let [rect (:layer/rect l)]
+      (when-not (and (sequential? rect) (= 4 (count rect)) (every? number? rect))
+        (throw (ex-info ":layer/rect must be [x y w h] of 4 numbers" {:type :bad-input :got rect})))))
+  (when-let [scene (:panel/scene p)]
+    (when-not (string? scene)
+      (throw (ex-info ":panel/scene must be a scene-id string" {:type :bad-input :got scene})))))
+
+(defn valid-page!
+  "Validates a storyboard `page` at the write boundary, throwing
+  {:type :bad-input} (→ HTTP 400) on a structurally bad page — so malformed
+  input is rejected cleanly instead of crashing decomposition/render with a
+  500 (or silently corrupting the datom store). nil is allowed (an empty doc).
+  Checks: page is a map; :page/panels is a sequence of maps; each panel's
+  :panel/focal / :panel/bubbles / :panel/sfx / :panel/layers / :panel/rect
+  are well-typed."
+  [page]
+  (when (some? page)
+    (when-not (map? page)
+      (throw (ex-info "page must be a map" {:type :bad-input})))
+    (when-let [panels (:page/panels page)]
+      (when-not (sequential? panels)
+        (throw (ex-info ":page/panels must be a sequence" {:type :bad-input :got (type panels)})))
+      (when-not (every? map? panels)
+        (throw (ex-info "every panel must be a map" {:type :bad-input})))
+      (doseq [p panels] (valid-panel! p))))
+  page)
+
+;; ───────────────────── decompose: page map → datoms ─────────────────────
+
+(defn- prune [m] (into {} (remove (comp nil? val) m)))
+
+(def ^:private bubble-keys
+  [:bubble/text :bubble/shape :bubble/anchor :bubble/font
+   :bubble/font-size :bubble/rotation :bubble/writing-mode
+   ;; manga-EXPRESSION enrichment (analyzeExpression / kami.mangaka.expression):
+   ;; 文字の薄さ(:weight) / 大きさ(:scale) / セリフ種別(:register)。
+   :bubble/weight :bubble/scale :bubble/register])
+(def ^:private sfx-keys
+  [:sfx/text :sfx/pos :sfx/rot :sfx/scale :sfx/style :sfx/font])
+(def ^:private layer-keys
+  ;; :layer/kind — :background|:midground|:character|:effect|:inset|:text
+  ;; :layer/ref  — a :character/:scene id this layer renders (optional)
+  ;; :layer/rect — normalized [x y w h], like :panel/rect but layer-local —
+  ;;               a :character/:inset layer may legally run outside [0,1]
+  ;;               (a Togashi frame-break) when :layer/bleed is true
+  [:layer/kind :layer/ref :layer/rect :layer/z :layer/bleed :layer/opacity
+   :layer/tone :layer/tags])
+(def ^:private panel-scalar-keys
+  [:panel/rect :panel/shot :panel/tone :panel/tags :panel/polygon :panel/tilt
+   :panel/bleed :panel/z :panel/ink-style :panel/screen-overlay
+   :panel/scene])  ; optional scene-id ref → the panel's background environment
+(def ^:private page-keys
+  [:page/number :page/title :page/layout :page/base-tags :page/negative-tags])
+
+(defn- ->index
+  "Coerce a panel index to an integer (JSON may send it as a string like \"0\").
+  A non-numeric value falls back to the panel's position `fallback`, so indices
+  stay homogeneous integers — the reconstruction sort never sees mixed
+  String/Long types (which would throw), and lint/reorder keep working."
+  [v fallback]
+  (cond (integer? v) v
+        (number? v)  (long v)
+        (string? v)  (or (parse-long v) fallback)
+        :else        fallback))
+
+(defn- bubble->tx [doc-id i b]
+  (prune (assoc (select-keys b bubble-keys) :bubble/index i :stb/doc doc-id)))
+
+(defn- sfx->tx [doc-id i s]
+  (prune (assoc (select-keys s sfx-keys) :sfx/index i :stb/doc doc-id)))
+
+(defn- layer->tx [doc-id i l]
+  (prune (assoc (select-keys l layer-keys) :layer/index i :stb/doc doc-id)))
+
+(defn- panel->tx [doc-id i p]
+  (prune (merge (select-keys p panel-scalar-keys)
+                {:panel/index (->index (get p :panel/index i) i) :stb/doc doc-id}
+                (when (seq (:panel/focal p))   {:panel/focal (vec (:panel/focal p))})
+                (when (seq (:panel/bubbles p)) {:panel/bubbles (vec (map-indexed #(bubble->tx doc-id %1 %2) (:panel/bubbles p)))})
+                (when (seq (:panel/sfx p))     {:panel/sfx (vec (map-indexed #(sfx->tx doc-id %1 %2) (:panel/sfx p)))})
+                (when (seq (:panel/layers p))  {:panel/layers (vec (map-indexed #(layer->tx doc-id %1 %2) (:panel/layers p)))}))))
+
+(defn doc->tx
+  "Decomposes a document into a nested entity tx (one connected graph).
+  `page` is the :page/* storyboard map; panels/bubbles/sfx become component
+  entities so the whole page is addressable as datoms."
+  [{:keys [id kind page] :or {kind "storyboard"}}]
+  [(prune (merge {:doc/id id :doc/kind kind :stb/doc id}
+                 (select-keys page page-keys)
+                 (when (seq (:page/panels page))
+                   {:page/panels (vec (map-indexed #(panel->tx id %1 %2) (:page/panels page)))})))])
+
+;; ───────────────────── reconstruct: pulled datoms → page map ────────────
+
+(def doc-pull
+  "Pull pattern for a full document graph: '* per level grabs scalars; the
+  nested maps expand the component refs."
+  ['* {:page/panels ['* {:panel/bubbles '[*]} {:panel/sfx '[*]} {:panel/layers '[*]}]}])
+
+(defn- strip [m & extra] (apply dissoc m :db/id :stb/doc extra))
+
+(defn- pulled->panel [p]
+  (cond-> (strip p)
+    ;; :panel/focal is cardinality-many (→ character-queryable); pull returns
+    ;; it in hash-set order, so normalize to sorted — focal is an unordered
+    ;; set of characters, and sorting makes the round-trip deterministic.
+    (:panel/focal p)   (update :panel/focal (comp vec sort))
+    (:panel/bubbles p) (assoc :panel/bubbles
+                              (mapv #(strip % :bubble/index) (sort-by :bubble/index (:panel/bubbles p))))
+    (:panel/sfx p)     (assoc :panel/sfx
+                              (mapv #(strip % :sfx/index) (sort-by :sfx/index (:panel/sfx p))))
+    (:panel/layers p)  (assoc :panel/layers
+                              (mapv #(strip % :layer/index) (sort-by :layer/index (:panel/layers p))))))
+
+(defn pulled->page
+  "Rebuilds the clean :page/* map from a `doc-pull` result (drops :db/id /
+  :stb/doc / synthetic indices; orders panels by :panel/index). A page
+  always carries a (possibly empty) :page/panels vector."
+  [doc]
+  (assoc (select-keys doc page-keys)
+         :page/panels (mapv pulled->panel (sort-by :panel/index (:page/panels doc)))))
+
+;; ───────────────────────── lexicon export ─────────────────────────
+;; Port of storyboard_db.export_lexicon — the AT-Proto wire shape the
+;; Studio canvas renders. Operates on a plain page map (already parsed),
+;; with bubble/sfx sub-entities resolved from an id→entity index.
+
+(defn focal-name
+  "\":character/Nei\" → \"Nei\" (the bare character name for prompts/wire)."
+  [ref] (-> (str ref) (str/replace ":character/" "")))
+
+(defn character-ref
+  "\"Nei\" → \":character/Nei\" (a focal ref string); an already-qualified ref
+  (starts with \":\") passes through. The inverse of `focal-name`. Use to
+  normalize a bare character name to the stored focal-ref convention."
+  [c]
+  (let [s (str c)]
+    (if (str/starts-with? s ":") s (str ":character/" s))))
+
+(defn slug
+  "Lowercase, hyphenate non-alphanumeric runs, trim leading/trailing hyphens —
+  the canonical id derivation for generated entities (e.g. \"Nei Shirase\" →
+  \"nei-shirase\", used as char-<slug> / doc-<slug>)."
+  [s]
+  (-> (str s) str/lower (str/replace #"[^a-z0-9]+" "-") (str/replace #"(^-|-$)" "")))
+
+(defn export-lexicon
+  "page → ai.gftd.mangaka.storyboard wire map. `resolve` maps a sub-entity
+  id (bubble/sfx/character ref) to its attribute map; pass `identity` when
+  the page already inlines sub-entities."
+  ([page] (export-lexicon page (constantly nil)))
+  ([page resolve]
+   (let [panels
+         (for [pid (get page :page/panels [])]
+           (let [p (or (resolve pid) pid)
+                 bubbles (for [bid (get p :panel/bubbles [])
+                               :let [b (or (resolve bid) bid)]]
+                           (cond-> {:text (get b :bubble/text)
+                                    :shape (get b :bubble/shape)
+                                    :anchor (get b :bubble/anchor)
+                                    :font (get b :bubble/font)
+                                    :fontSize (get b :bubble/font-size)}
+                             (get b :bubble/rotation)     (assoc :rotation (get b :bubble/rotation))
+                             (get b :bubble/writing-mode) (assoc :writingMode (get b :bubble/writing-mode))))
+                 sfx (for [sid (get p :panel/sfx [])
+                           :let [s (or (resolve sid) sid)]]
+                       (cond-> {:text (get s :sfx/text)
+                                :pos (get s :sfx/pos)
+                                :rot (get s :sfx/rot)
+                                :scale (get s :sfx/scale)
+                                :style (get s :sfx/style)}
+                         (get s :sfx/font) (assoc :font (get s :sfx/font))))
+                 layers (for [lid (get p :panel/layers [])
+                              :let [l (or (resolve lid) lid)]]
+                          (cond-> {:kind (get l :layer/kind) :rect (get l :layer/rect)}
+                            (get l :layer/ref)     (assoc :ref (get l :layer/ref))
+                            (get l :layer/z)       (assoc :z (get l :layer/z))
+                            (get l :layer/bleed)   (assoc :bleed (get l :layer/bleed))
+                            (get l :layer/opacity) (assoc :opacity (get l :layer/opacity))
+                            (get l :layer/tone)    (assoc :tone (get l :layer/tone))
+                            (seq (get l :layer/tags [])) (assoc :tags (vec (get l :layer/tags)))))]
+             (cond-> {:index (get p :panel/index)
+                      :rect (get p :panel/rect)
+                      :shot (get p :panel/shot)
+                      :focal (mapv focal-name (get p :panel/focal []))
+                      :tone (get p :panel/tone)
+                      :tags (vec (get p :panel/tags []))
+                      :bubbles (vec bubbles)
+                      :sfx (vec sfx)}
+               (get p :panel/polygon)      (assoc :polygon (get p :panel/polygon))
+               (get p :panel/tilt)         (assoc :tilt (get p :panel/tilt))
+               (get p :panel/bleed)        (assoc :bleed (get p :panel/bleed))
+               (get p :panel/z)            (assoc :z (get p :panel/z))
+               (get p :panel/ink-style)    (assoc :inkStyle (get p :panel/ink-style))
+               (get p :panel/screen-overlay) (assoc :screenOverlay (get p :panel/screen-overlay))
+               (get p :panel/scene)        (assoc :scene (get p :panel/scene))
+               (seq (get p :panel/layers)) (assoc :layers (vec layers)))))]
+     {:$type "ai.gftd.mangaka.storyboard"
+      :pageNumber (get page :page/number)
+      :pageTitle (get page :page/title "")
+      :layout (get page :page/layout "")
+      :baseTags (vec (get page :page/base-tags []))
+      :negativeTags (vec (get page :page/negative-tags []))
+      :panels (vec panels)})))

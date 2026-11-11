@@ -1,0 +1,109 @@
+(ns mangaka.recipe
+  "Recipe style fingerprint + ledger helpers, ported from the pruned Python
+   tree (../lg/lg_mangaka/{recipe_fingerprint,recipe_ledger}.py, removed
+   2026-07-07; ADR-2606181200).
+
+   fingerprint is a deterministic hash over the style levers only (style_tags,
+   negative, cfg, sampler) — extra_prompt (subject/composition) and seed are
+   deliberately excluded so the same look fingerprints identically across
+   panels. Byte-compatible with the Python original (json.dumps sort_keys=True
+   ensure_ascii=False over the normalised levers, sha256, first 16 hex chars),
+   so fingerprints already recorded in data/recipe-ledger.jsonl keep joining.
+
+   Recipes are JSON-shaped maps (string keys)."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.metrics :as metrics]
+            #?@(:cljs [[goog.crypt :as gcrypt]
+                       [goog.crypt.Sha256]]))
+  #?(:clj (:import [java.security MessageDigest])))
+
+;; The style levers the co-scientist evolves (sorted, as json.dumps sort_keys).
+(def ^:private style-keys ["cfg" "negative" "sampler" "style_tags"])
+
+(defn- norm-cfg [v]
+  (let [d (cond (number? v) (double v)
+                (string? v) (parse-double v)
+                :else nil)]
+    (if d (metrics/round-to d 1) 0.0)))
+
+(defn- norm-tags
+  "Lowercase, split comma tokens, trim, drop empties, sort, re-join — so
+   \"a, b\" and \"b,a\" fingerprint the same."
+  [v]
+  (->> (str/split (str/lower (str v)) #",")
+       (map str/trim)
+       (remove empty?)
+       sort
+       (str/join ",")))
+
+(defn- norm [k v]
+  (cond (nil? v)    ""
+        (= k "cfg") (norm-cfg v)
+        :else       (norm-tags v)))
+
+(defn- json-escape [s]
+  (str/join (map (fn [c]
+                   (let [i #?(:clj (int c) :cljs (.charCodeAt c 0))]
+                     (cond (= c \") "\\\""
+                           (= c \\) "\\\\"
+                           (= c \backspace) "\\b"
+                           (= c \formfeed)  "\\f"
+                           (= c \newline)   "\\n"
+                           (= c \return)    "\\r"
+                           (= c \tab)       "\\t"
+                           (< i 0x20) #?(:clj (format "\\u%04x" i)
+                                         :cljs (str "\\u" (.padStart (.toString i 16) 4 "0")))
+                           :else c)))
+                 s)))
+
+(defn- json-val
+  "Serialise a normalised lever value exactly like Python json.dumps:
+   1-decimal floats render as e.g. 7.0 / 6.8; strings are escaped, non-ASCII raw."
+  [v]
+  (if (number? v)
+    #?(:clj (format "%.1f" (double v)) :cljs (.toFixed v 1))
+    (str "\"" (json-escape v) "\"")))
+
+(defn canonical-blob
+  "The exact JSON string that is hashed (exposed for tests/debugging)."
+  [recipe]
+  (str "{"
+       (str/join ", " (map (fn [k] (str "\"" k "\": " (json-val (norm k (get recipe k)))))
+                           style-keys))
+       "}"))
+
+(defn- sha256-hex [s]
+  #?(:clj (let [d (.digest (MessageDigest/getInstance "SHA-256")
+                           (.getBytes ^String s "UTF-8"))]
+            (str/join (map #(format "%02x" %) d)))
+     :cljs (let [h (goog.crypt.Sha256.)]
+             (.update h (gcrypt/stringToUtf8ByteArray s))
+             (gcrypt/byteArrayToHex (.digest h)))))
+
+(defn fingerprint
+  "Deterministic 16-hex-char style fingerprint of a render recipe."
+  [recipe]
+  (subs (sha256-hex (canonical-blob recipe)) 0 16))
+
+;; ── ledger (pure parts of recipe_ledger.py; file I/O is the caller's) ──────
+
+(defn ledger-row
+  "One attribution row for the recipe → published-post ledger. `ts` is
+   caller-supplied (ISO) — never reads the clock, stays deterministic."
+  [recipe {:keys [work-rkey post-uri ts extra]}]
+  (merge {"fingerprint" (fingerprint recipe)
+          "recipe"      recipe
+          "work_rkey"   work-rkey
+          "post_uri"    post-uri
+          "ts"          ts}
+         extra))
+
+(defn post-uris-for
+  "Every published post URI produced by recipes of this style fingerprint,
+   over already-parsed ledger entries (JSON-shaped maps)."
+  [entries fp]
+  (into [] (keep (fn [e]
+                   (let [uri (get e "post_uri")]
+                     (when (and (= fp (get e "fingerprint")) (seq uri))
+                       uri))))
+        entries))

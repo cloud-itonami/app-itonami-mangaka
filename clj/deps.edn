@@ -1,0 +1,180 @@
+{:paths ["src" "resources"]
+
+ ;; mangaka.gftd.ai — Clojure(Script) refactor of the Python/LangGraph app.
+ ;; Core domain + graphs are portable .cljc (JVM now, kotoba WASM/SCI later);
+ ;; server.clj + store/kotoba.clj are JVM-only.
+ ;;
+ ;; The four in-repo portable libs, all kotoba-lang (the com-junkawasaki/*
+ ;; originals are mid-migration out per repos.edn's :orgs taxonomy note).
+ ;; Git pins kept for deployability; the :dev alias overrides to the
+ ;; workspace checkouts so local development needs no network.
+ :deps
+ {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.text"}
+       io.github.kotoba-lang/langgraph
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.langgraph"}
+  io.github.kotoba-lang/comfyui
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.comfyui"}
+  io.github.kotoba-lang/langchain
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.langchain"}
+
+  ;; Shared blob/checkpoint app-scaffolding (blob/checkpoint only —
+  ;; comfy/llm host-fn wiring moved to comfyui.gateway / langchain.jvm
+  ;; above, their natural homes next to the pure engines they wire), also
+  ;; used by ai-gftd-animeka. See
+  ;; 90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md and
+  ;; 90-docs/adr/2607011900-genapp-clj-mangaka-animeka-commons.md.
+  io.github.kotoba-lang/langgraph-store
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.langgraphStore"}
+
+  ;; KAMI engine SDK — scene/render-IR / ECS (kami.scene / kami.ecs /
+  ;; kami.render) live in kami-engine packages/kami-engine-sdk since the JUN-649
+  ;; split; kami.ipc (with kami.fsm / kami.gpu) stayed in kotoba
+  ;; lib/kotoba.kamiEngineSdk. The second coordinate uses the same name
+  ;; packages/kami-engine-sdk declares for it, so one copy is resolved.
+  io.github.kotoba-lang/kami-engine-sdk
+        {:git/url "https://github.com/kotoba-lang/kami-engine.git"
+         :git/sha "c50637c1df5b69643eb847a3d0de2648c99cfb9f"
+         :deps/root "packages/kami-engine-sdk"}
+  io.github.kotoba-lang/kotoba.kamiEngineSdk
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.kamiEngineSdk"}
+
+  ;; manga-EXPRESSION patterns (HUNTER×HUNTER 由来) — standalone SSoT (addendum 12)
+  io.github.kotoba-lang/kami-mangaka-expression
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.kamiMangakaExpression"}
+
+  ;; manga QA/perception — 軸レジストリ・VLM prompt+parser・幾何 QA の正本
+  ;; (ADR-2607165100。mangaka.perception は本 lib への委譲 facade)
+  io.github.kotoba-lang/kami-mangaka-qa
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.kamiMangakaQa"}
+
+  ;; komawari (コマ割り) golden-ratio panel-geometry engine — canonical home is
+  ;; now kami.mangaka.komawari in kotoba lib/kotoba.kamiMangakaPage (ADR-2607141700;
+  ;; moved there from kotoba-lang/kami-mangaka-page, JUN-649):
+  ;; this repo's own mangaka.layout.komawari is a thin re-export of it, not an
+  ;; independent implementation, so ai-gftd-mangaka and app-aozora share one copy.
+  io.github.kotoba-lang/kami-mangaka-page
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.kamiMangakaPage"}
+  ;; kami.mangaka.genko-project (Genko editable-document export). kotoba-lang/
+  ;; kami-genko moved to cloud-itonami/app-itonami-genko; the lib is its repo
+  ;; root (deps.edn at the top level, no :deps/root).
+  io.github.kotoba-lang/kami-genko
+        {:git/url "https://github.com/cloud-itonami/app-itonami-genko.git"
+         :git/sha "c45037fbe9428a5fde315c9438d0b24d2b78a8f5"}
+
+  ;; cloud-murakumo — the real GPU-fleet image-gen path (native ComfyUI
+  ;; /prompt + /history + /view against gad/asher over Tailscale,
+  ;; RUNBOOK.md). mangaka.comfy's own render-via-gateway assumes an
+  ;; OpenAI-images-compatible endpoint that doesn't exist on the raw fleet
+  ;; nodes; render-via-murakumo below goes through cloud-murakumo.engine +
+  ;; .executor instead, same org so local/root only (no release pin yet;
+  ;; the /history polling fix this needs is gftdcojp/cloud-murakumo#18).
+  gftdcojp/cloud-murakumo {:local/root "../../../network-awai/cloud-murakumo"}
+
+  ;; Pure ffmpeg argv/timestamp planning (video<->stills), shared with
+  ;; ai-gftd-dougaka's dougaka.pipeline — mangaka.video's frame-sampling
+  ;; step (seedance clip -> panel candidates) reuses douga.ffmpeg's
+  ;; sample-timestamps/extract-frame-cmd rather than hand-rolling ffmpeg
+  ;; argv a second time in this repo. Now kotoba lib/kotoba.douga (JUN-649).
+  io.github.kotoba-lang/douga
+        {:git/url "https://github.com/kotoba-lang/kotoba.git"
+         :git/sha "64ba9e2e6459e7244ca52945b7b010489d07a008"
+         :deps/root "lib/kotoba.douga"}
+
+  ;; JVM server + HTTP client + JSON
+  http-kit/http-kit            {:mvn/version "2.8.0"}
+  metosin/reitit-ring          {:mvn/version "0.7.2"}
+  ring/ring-core               {:mvn/version "1.12.2"}
+  ;; shared murakumo generation client (ADR-2607299960). mangaka reaches the
+  ;; fleet's self-hosted :video models through the public generation API —
+  ;; the only route with a working credential today. The in-process
+  ;; cloud-murakumo executor below still handles the hosted :seedance path
+  ;; when it is asked for explicitly.
+  io.github.kotoba-lang/murakumo-generation
+  {:git/sha "ce6e673ac7317befdcef767d1e9da3754bc28ba4"}
+
+  metosin/jsonista             {:mvn/version "0.3.11"}
+  org.clojure/clojure          {:mvn/version "1.12.0"}}
+
+ :aliases
+ {;; Workspace development — use the local lib checkouts (no git fetch).
+  :dev
+  {:override-deps
+   {io.github.kotoba-lang/langgraph
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.langgraph"}
+    io.github.kotoba-lang/comfyui
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.comfyui"}
+    io.github.kotoba-lang/langchain
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.langchain"}
+    io.github.kotoba-lang/langgraph-store
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.langgraphStore"}
+    io.github.kotoba-lang/kami-engine-sdk
+        {:local/root "../../../kotoba-lang/kami-engine/packages/kami-engine-sdk"}
+    io.github.kotoba-lang/kotoba.kamiEngineSdk
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.kamiEngineSdk"}
+    io.github.kotoba-lang/kami-mangaka-expression
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.kamiMangakaExpression"}
+    io.github.kotoba-lang/kami-mangaka-qa
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.kamiMangakaQa"}
+    io.github.kotoba-lang/kami-mangaka-page
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.kamiMangakaPage"}
+    io.github.kotoba-lang/kami-genko {:local/root "../../../cloud-itonami/app-itonami-genko"}
+    io.github.kotoba-lang/douga
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.douga"}
+    io.github.kotoba-lang/shitsuke
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.shitsuke"}
+    io.github.kotoba-lang/canvaskit
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.canvaskit"}
+    io.github.kotoba-lang/kotobase-client
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.kotobaseClient"}
+    io.github.kotoba-lang/ed25519 {:local/root "../../../kotoba-lang/org-ietf-ed25519"}
+    gftdcojp/cloud-murakumo {:local/root "../../../network-awai/cloud-murakumo"}
+
+    ;; Two libs are reached by BOTH a git coord (via kami-genko) and a
+    ;; :local/root coord (via cloud-murakumo, which declares them that way in
+    ;; its default :deps). tools.deps cannot order a git rev against a local
+    ;; root, so the classpath fails to build before a single test runs:
+    ;;   Unable to compare versions for io.github.kotoba-lang/<lib>
+    ;; Pinning both to the workspace checkout is what this alias is already for
+    ;; ("override to the workspace checkouts so local development needs no
+    ;; network") -- the alias was just incomplete. Without these two entries
+    ;; `kbb -M:dev:test` cannot run at all.
+    io.github.kotoba-lang/jp-go-digital-design-system
+        {:local/root "../../../kotoba-lang/kotoba/lib/kotoba.jpGoDigitalDesignSystem"}
+    io.github.kotoba-lang/aiueos {:local/root "../../../kotoba-lang/aiueos"}}}
+
+  :run
+  {:main-opts ["-m" "mangaka.server"]}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
+   :main-opts ["-m" "cognitect.test-runner"]
+   :exec-fn cognitect.test-runner.api/test}
+
+  ;; ClojureScript (Studio UI) toolchain.
+  :cljs
+  {:extra-deps {thheller/shadow-cljs {:mvn/version "2.28.20"}
+                reagent/reagent      {:mvn/version "1.2.0"}}}}}

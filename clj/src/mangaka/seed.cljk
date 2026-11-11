@@ -1,0 +1,33 @@
+(ns mangaka.seed
+  "Demo seed for a fresh (in-memory) store — a representative GhostHacker
+  arc0-1 storyboard page referencing the imported cast (Yuto/Nei/Ren/Akira)
+  and bundled bubble styles. Loaded at server start! (alongside the
+  GhostHacker character/scene import) so the Studio canvas, kamiRenderFrame
+  and documentsByCharacter all have content on boot — no manual step.")
+
+(def sample-page
+  "A 4-panel page. Rects are [x y w h] in normalized page coords (top-left
+  origin). Focal characters use the :character/<Name> ref convention, so
+  documentsByCharacter finds this page; panels render via the KAMI bridge."
+  {:page/number 1
+   :page/title "Ghost Hacker — Arc0-1 p1"
+   :page/layout "4-panel"
+   :page/base-tags ["monochrome" "screentone" "manga"]
+   :page/negative-tags ["color" "lowres"]
+   :page/panels
+   [{:panel/index 0 :panel/shot "wide establishing" :panel/rect [0.04 0.03 0.92 0.30]
+     :panel/tone "night" :panel/focal [":character/Yuto"] :panel/scene "scene-yuto-bedroom"
+     :panel/bubbles [{:bubble/text "…おれ、買っただけ、なのに、" :bubble/shape "speech_oval"}]}
+    {:panel/index 1 :panel/shot "close" :panel/rect [0.04 0.36 0.45 0.28]
+     :panel/focal [":character/Nei"] :panel/scene "scene-neis-room"
+     :panel/bubbles [{:bubble/text "起動した…" :bubble/shape "speech_oval"}]}
+    {:panel/index 2 :panel/shot "two-shot" :panel/rect [0.52 0.36 0.44 0.28]
+     :panel/focal [":character/Nei" ":character/Ren"] :panel/scene "scene-rens-room"
+     :panel/bubbles [{:bubble/text "気づいてる？" :bubble/shape "whisper_dashed"}]}
+    {:panel/index 3 :panel/shot "splash" :panel/rect [0.04 0.67 0.92 0.30]
+     :panel/focal [":character/Akira"] :panel/scene "scene-classroom"
+     :panel/sfx [{:sfx/text "ドォン" :sfx/pos [0.5 0.5] :sfx/scale 2.0 :sfx/style "impact"}]}]})
+
+(def sample-document
+  {:id "gh-arc0-1-p1" :kind "storyboard"
+   :title "Ghost Hacker — Arc0-1 p1" :page sample-page})

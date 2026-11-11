@@ -1,0 +1,227 @@
+[{:db/id -1
+  :clj.resources.komawari-styles/version 2
+  :clj.resources.komawari-styles/context "https://mangaka.gftd.ai/komawari-styles/v1"
+  :clj.resources.komawari-styles/source "v1 (ADR-2607051530): two artists observed doing OPPOSITE things with panel
+  geometry to create the same effect (visual dynamism at a dramatic beat):
+
+  TORIYAMA (鳥山明, Dragon Ball) — 漫画分析動画のスクリーンショット2枚
+  （@Arcana-Art / Game Manga channel, ドラゴンボール×美術40「ベジータザー」回、
+  2026-07-05 提供）: a punch/impact panel's own BORDER bends to continue the
+  attack's diagonal, and the page's panel proportions follow a 1.618:1
+  (φ) grid rather than an even split. Dynamism lives IN THE FRAME.
+
+  TOGASHI (冨樫義博, Hunter×Hunter 王位継承戦編) — 2ページ（ナイベイ/トネアスタ/
+  リズルラ/ガトー/スラッカ登場回、2026-07-05 提供; the same source
+  kami-mangaka-expression-clj's :observations already cites as
+  :election-guards / :slakka-interrupt): panels stay RECTILINEAR even
+  through a tense political confrontation — no diagonal shearing anywhere
+  in either page. Dynamism instead lives in (a) a small reactive panel
+  (スラッカ's raised-hand interrupt, top of page 2) drawn OVERLAPPING the
+  larger panel beneath it — panel-in-panel, not edge-to-edge tiling;
+  (b) a dominant character's head/silhouette cropped tight against the
+  panel's own top edge (ガトー, page 1 row 3-4) to read as looming/imposing
+  without changing the panel's rectangle; (c) extreme render-density
+  contrast between adjacent panels — a nearly blank silhouette crowd shot
+  next to a densely radiating-line 'aura' panel a few panels later;
+  (d) heavy nameplate use to introduce a large ensemble cast fast (3 named
+  characters in a single panel-row, page 1 row 2); (e) speech-register
+  CONTRAST staged deliberately within one exchange — a jagged/bold shout
+  bubble ('バカがッ‼') sits directly beside a calm oval regular-weight
+  rebuttal in the same beat, rather than the whole scene sharing one
+  register.
+
+  v2 (ADR-2607172200) adds three artists grounded in PUBLISHED material
+  rather than provided reference pages — each claim is GRADED: (primary) =
+  the artist's own book/video/interview, (secondary) = named craft
+  analysis, (consensus) = widely repeated but not author-stated. Where a
+  geometry parameter is our own design value bounding an observation (not
+  a sourced constant), it says so.
+
+  ARAKI (荒木飛呂彦, JoJo) — (primary)『荒木飛呂彦の漫画術』(集英社新書
+  2015): ページを最後までめくらせることがコマ構成の統治原理で、デビュー作
+  『武装ポーカー』は全コマに意図があり削れるコマが無い
+  (shinsho.shueisha.co.jp/kikan/0780-f/, huyukiitoichi.hatenadiary.jp
+  2015-04-18); ネーム段階ではコマは 'barely delineated' な beat 分割で
+  リズム優先、幾何は後 (English ed. pp.186-187 の富豪村ネーム,
+  nijomu.com review); ポーズはベルニーニ由来 (~p.140)。(consensus) 斜めの
+  ガター・コマ同士の重なり・人物の枠越えは JoJo の代名詞だが著者自身の
+  理論化は未発見 (mangasukifan.com/komawari-230; 他作家が影響を公言:
+  fandomwire.com Hell's Paradise 賀来氏)。⚠『漫画術』の『美の黄金比』は
+  顔の比率の話で、コマの φ 加重の典拠にはならない — engine の φ 加重は
+  Toriyama 分析由来の共有機構であり荒木に帰属させない。45°/15° の tilt
+  cap は観測される急峻さを束ねる本カタログの設計値。
+
+  URASAWA (浦沢直樹, MONSTER/20世紀少年/PLUTO) — (primary) 浦沢チャンネル
+  「【基本のキ】読みやすい&リズムの良い漫画の作り」(youtube PvBw8mz3Qnc,
+  realsound.jp/book/2023/06/post-1354108.html): 見開きで最初に目が入る
+  右上コマに要情報を置く・コマ数を絞るとテンポが出る; (primary) 小津安二郎
+  公式サイトインタビュー (ozuyasujiro.jp/article/009): 定点カメラ・構図の
+  反復(『頭や肩の位置、全く変わらない』『一度も同じ顔なんてしてない』)を
+  YAWARA!/MASTERキートン/PLUTO に意識的に適用(『SFを小津監督の画角で描くのは
+  面白い』); (primary) 顔→手の insert-cut→ページをめくると全身、という
+  緊張の組み立て (浦沢直樹インタビュー・4,
+  ameblo.jp/garijin/entry-12138679306.html); (secondary) 水平バンド構造・
+  ページ中央で上下分割可能・断ち切りは外側の辺のみでノド側に無し
+  (benzilla.com/?p=6014)。(inferred)『コマを傾けない』は author-stated
+  rule としては未確認 — 定点/バンド構造からの推定として tilt off。
+  subdued √φ table はバンドの静けさを再現する本カタログの設計値。
+
+  INOUE (井上雄彦, SLAM DUNK/バガボンド) — (secondary, ページ番号付き)
+  山王戦終盤 vol.31 pp.91-138 はほぼ無音(オノマトペは p.120 ドックン と
+  p.134 パスッ のみ)、p.154 ハイタッチ見開きで解放
+  (yamada10-07.hateblo.jp/entry/20081012/1225230110; viz.com blog vol.31
+  も沈黙演出を確認); (secondary) 大ゴマは『超描き込み』か『余白』の両極、
+  アクションでコマ境界と線遠近法を破る、対角線のエネルギーはガターでなく
+  コマ内部のアクション軸/スピード線に宿る (canmom.tumblr.com
+  post/745534636974882816)。(consensus) 人物の枠越えは井上の代名詞だが
+  author-stated ではない。沈黙・見開き解放は authoring-side デバイスとして
+  :rhythm に記録し、幾何側は『矩形ガター + character bleed + 極端な
+  サイズコントラスト(既定 φ table)』とする。"
+  :clj.resources.komawari-styles/vocab "{:style #{:toriyama :togashi :araki :urasawa :inoue},
+ :layer-kind #{:inset :background :midground :effect :character :text},
+ :dynamism #{:density-contrast :tight-crop :force-line-shear :panel-in-panel
+             :character-bleed :whitespace},
+ :rhythm #{:page-turn-hook :fixed-camera-repetition :insert-cut-reveal
+           :silent-beat :spread-release :repetition-micro-difference}}"
+  :clj.resources.komawari-styles/styles "{:toriyama {:tilt-enabled? true, :max-impact-tilt-deg 31.717, :max-tension-tilt-deg 10.0,
+            :frame-break? false, :proportion :phi-weighted, :dynamism [:force-line-shear],
+            :gutter 0.012,
+            :expression-crossref {:note \"Bubble/text side is out of scope for this style; pair with
+           kami.mangaka.expression archetypes that read as controlled/
+           composed rather than chaotic — :stoic/:strategist/:gentle for
+           calm beats, :hot-blooded/:energetic ONLY at the shared
+           :beat/intensity :impact row (register :shout), so the panel
+           shear and the shout register peak together, not independently.\",
+                                  :suggested-archetypes [:stoic :strategist :gentle :hot-blooded]}}
+ :togashi {:max-tension-tilt-deg 0.0, :inset {:scale 0.5, :overlap 0.15}, :tilt-enabled? false,
+           :max-impact-tilt-deg 0.0, :dynamism [:panel-in-panel :tight-crop :density-contrast],
+           :expression-crossref {:note \"Bubble/text side already exists — literally the same source
+           material — in kami-mangaka-expression-clj's :archetypes/
+           :registers. Expect HEAVY nameplate density (large ensemble cast,
+           :register :nameplate on first appearance for each), :chatter
+           (mob murmur, weight :faint, bubble :cloud) alongside
+           deliberately CONTRASTING :shout (bubble :spike/:jagged, weight
+           :heavy) and :speech/:monologue (bubble :oval, weight :regular)
+           in the SAME beat — the register contrast is itself the drama,
+           not a uniform scene-wide register the way :toriyama tends to
+           hold one register per beat.\",
+                                 :suggested-archetypes [:hot-blooded :cold-menace :mob :strategist]},
+           :frame-break? true, :proportion :phi-weighted, :gutter 0.012}
+ :araki {:tilt-enabled? true, :max-impact-tilt-deg 45.0, :max-tension-tilt-deg 15.0,
+         :frame-break? true, :character-bleed? true, :inset {:scale 0.5, :overlap 0.15},
+         :proportion :phi-weighted, :gutter 0.012,
+         :dynamism [:force-line-shear :panel-in-panel :character-bleed],
+         :rhythm [:page-turn-hook],
+         :grounding {:page-turn-hook :primary, :every-panel-load-bearing :primary,
+                     :diagonal-gutters :consensus, :panel-overlap :consensus,
+                     :character-bleed :consensus, :tilt-caps :design-value,
+                     :phi-weighting :engine-shared-not-araki},
+         :expression-crossref {:note \"JoJo の書き文字/擬音はデザイン要素として枠と絡むが、
+           bubble/register 語彙は kami.mangaka.expression の管轄。ページ末
+           (左下)の beat には :shout/:heavy を置いて page-turn-hook と
+           register のピークを揃えるのが自然。\",
+                               :suggested-archetypes [:hot-blooded :cold-menace :energetic]}}
+ :urasawa {:tilt-enabled? false, :max-impact-tilt-deg 0.0, :max-tension-tilt-deg 0.0,
+           :frame-break? false, :character-bleed? false,
+           :proportion :subdued-sqrt-phi, :gutter 0.012,
+           :dynamism [:density-contrast],
+           :rhythm [:fixed-camera-repetition :insert-cut-reveal :page-turn-hook
+                    :repetition-micro-difference],
+           :grounding {:top-right-key-panel :primary, :few-panels-for-tempo :primary,
+                       :fixed-camera-repetition :primary, :insert-cut-reveal :primary,
+                       :horizontal-bands :secondary, :outer-edge-only-bleed :secondary,
+                       :no-tilt :inferred, :subdued-weights :design-value},
+           :expression-crossref {:note \"抑制されたバンドグリッドの中では register も抑制が既定 —
+           :speech/:monologue (:oval/:regular) 主体、:shout は解放ビート
+           だけに取っておく。反復コマ(fixed-camera)では吹き出し位置も
+           固定して微差だけを動かすのが浦沢の反復文法に合う。\",
+                                 :suggested-archetypes [:stoic :strategist :gentle]}}
+ :inoue {:tilt-enabled? false, :max-impact-tilt-deg 0.0, :max-tension-tilt-deg 0.0,
+         :frame-break? false, :character-bleed? true,
+         :proportion :phi-weighted, :gutter 0.012,
+         :dynamism [:character-bleed :whitespace :density-contrast],
+         :rhythm [:silent-beat :spread-release],
+         :grounding {:silent-sequence :secondary-with-page-numbers,
+                     :splash-two-extremes :secondary, :in-panel-diagonals :secondary,
+                     :character-bleed :consensus, :no-gutter-tilt :secondary},
+         :expression-crossref {:note \"無音シークエンスでは dialogue/sfx を意図的にゼロにする —
+           expression 側は『何も置かない』が正しい出力になりうる(捏造して
+           埋めない)。解放ビート(spread-release)では :shout/:heavy を解禁。\",
+                               :suggested-archetypes [:stoic :hot-blooded]}}}"
+  :clj.resources.komawari-styles/layering "{:default-stack [:background :midground :character :effect :text],
+ :toriyama {:typical-layers 2, :character-may-bleed-panel? false,
+            :note \"Fewer, flatter layers. The frame carries the energy (see
+          :dynamism above), so the layer stack doesn't need to.\"},
+ :togashi {:typical-layers \"3-4\", :character-may-bleed-panel? true,
+           :note \"More layers, and the CONTRAST between adjacent layers' density is
+          itself expressive (a looming figure rendered plainly against a
+          chaotic hatched aura layer, or a clean character against an
+          almost-blank silhouette background).\"},
+ :araki {:typical-layers \"3-4\", :character-may-bleed-panel? true,
+         :note \"枠・人物・書き文字が同時に絡む最大主義。ポーズ(character layer)が
+          枠を越え、擬音がデザイン要素として effect layer で枠に重なる。\"},
+ :urasawa {:typical-layers 2, :character-may-bleed-panel? false,
+           :note \"映画的定点。断ち切り(bleed)は外側の辺のみ・ノド側に無し
+          (secondary: benzilla.com)。レイヤーは静かに、反復の微差で語る。\"},
+ :inoue {:typical-layers \"2-3\", :character-may-bleed-panel? true,
+         :note \"大ゴマは『超描き込み』か『余白』の両極(canmom)。人物が枠を
+          越えるが、枠線自体は矩形のまま — エネルギーはコマ内部の
+          アクション軸とスピード線に宿る。\"}}"
+  :clj.resources.komawari-styles/observations "[{:panel \"toriyama-punch-diagonal\", :style :toriyama,
+  :note \"殴打コマの枠線そのものが攻撃の対角線を継承(force-line)。1.618:1
+           のφグリッドで構成される、というコマ割り解説動画のオーバーレイ
+           表記(『コマの角度も』『きれいな構成』『1.618:1』)を根拠にする。\"}
+ {:panel \"togashi-election-guards\", :style :togashi, :who [\"ナイベイ\" \"トネアスタ\" \"リズルラ\" \"ガトー\"],
+  :note \"3名の名札(nameplate)を1コマ帯に並べて大人数キャストを速攻導入。
+           ガトーの激昂アップは頭部が上コマ枠にほぼ接する寄り(tight-crop)で
+           威圧感を出す。背景は薄い群衆シルエット→密な放射集中線、と数コマ
+           の間に描き込み密度が急変する(density-contrast)。\"}
+ {:panel \"togashi-slakka-interrupt\", :style :togashi, :who [\"スラッカ\"],
+  :note \"挙手による割り込み『ちょっといいか?』の小コマが、下にある集団の
+           大ゴマの境界を越えて重なって描かれる — panel-in-panel。komawari
+           側では :beat/inset として実装(タグ \\\"frame-break\\\"、governorは
+           この重なりを容認)。\"}
+ {:panel \"togashi-standoff-register-contrast\", :style :togashi,
+  :note \"『バカがッ‼』(トゲ/太字、shout)の直後に、同じやりとりの中で
+           冷静な説得口調の吹き出し(楕円/regular)が並ぶ — 対比そのものが
+           緊張を作る。komawari側の対応物はない(bubble/register の話は
+           kami.mangaka.expressionの管轄); ここでは『同じbeatの中で
+           register対比を許容する』という設計指針としてだけ記録する。\"}
+ {:panel \"araki-buso-poker-page-turn\", :style :araki, :work \"武装ポーカー(1980)\",
+  :note \"(primary)『漫画術』: デビュー作の全コマに意図があり、『とにかく
+           最後まで編集者にページをめくらせたい』が構成原理。komawari 側の
+           対応物は『左ページ最終コマに強 beat を置く』という authoring
+           指針(:rhythm :page-turn-hook)で、幾何パラメータではない。\"}
+ {:panel \"araki-rohan-name-rhythm\", :style :araki, :work \"岸辺露伴は動かない〜富豪村〜\",
+  :note \"(primary)『漫画術』実践編のネーム再録: コマは 'barely delineated'
+           な beat 分割でリズムが先、幾何が後。エンジンの rows-of-beats
+           入力(幾何はエンジンが後から与える)と同型の作業順。\"}
+ {:panel \"araki-diagonal-gutters\", :style :araki, :work \"JoJo 第1〜3部 戦闘ページ\",
+  :note \"(consensus) 斜めガター・コマ重なり・人物の枠越えの併用。著者自身の
+           理論化は未発見のため、45°/15° の cap は観測を束ねる設計値と明記。
+           φ 加重は Toriyama 分析由来の engine 共有機構で荒木に帰属させない
+           (『漫画術』の黄金比は顔の比率の話)。\"}
+ {:panel \"urasawa-ozu-fixed-camera\", :style :urasawa, :work \"YAWARA!/MASTERキートン/PLUTO\",
+  :note \"(primary) ozuyasujiro.jp インタビュー: 小津の定点・望遠の構図安定
+           (『頭や肩の位置、全く変わらない』)を意識的に適用、PLUTO は『SFを
+           小津監督の画角で描く』実験。反復コマは同一構図の微差
+           (『一度も同じ顔なんてしてない』)。tilt off / 矩形バンドの根拠。\"}
+ {:panel \"urasawa-insert-cut-reveal\", :style :urasawa, :work \"MONSTER(告白シーン)\",
+  :note \"(primary) インタビュー・4: 顔→手のアップ(insert-cut)→ページを
+           めくって全身・涙、という緊張の組み立て。プロは『無意識に』ネーム
+           段階でやると本人談。komawari 幾何ではなく :rhythm デバイス。\"}
+ {:panel \"urasawa-band-grid\", :style :urasawa,
+  :note \"(secondary) benzilla.com: ページ中央で上下分割可能な水平バンド構造、
+           断ち切りは外側の辺のみでノド側に無し。(primary) 浦沢チャンネル:
+           見開き右上に要情報・コマ数は絞る。subdued √φ table は
+           このバンドの静けさを再現する本カタログの設計値。\"}
+ {:panel \"inoue-sanno-silence\", :style :inoue, :work \"SLAM DUNK vol.31 pp.91-154\",
+  :note \"(secondary, ページ番号付き) p.91『終わりだ!!』〜p.138 までほぼ無音
+           (オノマトペは p.120 ドックン / p.134 パスッ のみ)、p.154 の
+           ハイタッチ見開きで解放。expression 側は『置かない』が正解になる
+           :rhythm :silent-beat / :spread-release の典拠。\"}
+ {:panel \"inoue-splash-two-extremes\", :style :inoue,
+  :note \"(secondary) canmom: 大ゴマは『フリーズした瞬間の超描き込み』か
+           『純粋な余白』の両極。対角線のエネルギーはガターではなくコマ内部
+           のアクション軸/スピード線に宿る(枠は矩形のまま)。人物の枠越え
+           (character-bleed)はアクションで発生 — :beat/breakout の典拠。\"}]"}]

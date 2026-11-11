@@ -1,0 +1,18 @@
+(ns mangaka.graphs.preview
+  "previewSvg — render a stored storyboard to an SVG string (a GPU-free derived
+  view; complements kamiRenderFrame). Requires :doc-id."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]
+            [mangaka.preview :as preview]))
+
+(defn make [store]
+  (util/single-node
+   :preview-svg
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [doc (or (store/load-document store (:doc-id input))
+                   (throw (ex-info (str "document not found: " (:doc-id input)) {:type :bad-input})))]
+       {:doc-id (:doc-id input) :svg (preview/page->svg (:page doc))}))))
+
+(def handler util/result-handler)

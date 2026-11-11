@@ -1,0 +1,64 @@
+(ns mangaka.graphs.assets
+  "Read surface for generated assets — listCharacters / listScenes /
+  loadCharacter / loadScene. The generation graphs create :character/* and
+  :scene/* entities; these complete their CRUD so clients can browse and
+  fetch them (the Python app only had document read endpoints).
+
+  Single-node graphs (mangaka.graphs.util) over the store's existing
+  list/load fns; load* requires :id."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]))
+
+(defn make-list-characters [store]
+  (util/single-node :list-characters
+   (fn [{:keys [input]}] (util/paginate (store/list-characters store) input :characters))))
+
+(defn make-list-scenes [store]
+  (util/single-node :list-scenes
+   (fn [{:keys [input]}] (util/paginate (store/list-scenes store) input :scenes))))
+
+(defn make-load-character [store]
+  (util/single-node :load-character
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (some-> (store/load-character store (:id input)) domain/with-image-url))))
+
+(defn make-load-scene [store]
+  (util/single-node :load-scene
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (some-> (store/load-scene store (:id input)) domain/with-image-url))))
+
+(defn make-delete-character [store]
+  (util/single-node :delete-character
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (store/delete-character! store (:id input)))))
+
+(defn make-delete-scene [store]
+  (util/single-node :delete-scene
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:id])
+     (store/delete-scene! store (:id input)))))
+
+(defn make-page-render
+  "loadPageRender — the composed page render for a document (the output of
+  mangakaGeneratePage), keyed `page-<doc-id>`. Returns the render with an
+  :image-url, or nil if the page hasn't been rendered yet. Requires :doc-id —
+  the page-render counterpart of listRenders (which lists panel renders)."
+  [store]
+  (util/single-node :page-render
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (some-> (store/load-page-render store (domain/page-render-id (:doc-id input)))
+             domain/with-image-url))))
+
+(defn make-list-renders [store]
+  (util/single-node :list-renders
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     {:doc-id (:doc-id input)
+      :renders (store/renders-for-document store (:doc-id input))})))
+
+(def handler util/result-handler)

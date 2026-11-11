@@ -1,0 +1,21 @@
+(ns mangaka.graphs.kami-frame
+  "kamiRenderFrame — render a stored storyboard document through the KAMI clj
+  engine: load the document and return its KAMI render-IR frame (the same IR
+  any KAMI scene produces; hand to ipc/pack → the Rust/wgpu GPU arm). This is
+  the storyboard→genko rendering, unified on kami-engine-sdk-clj. Requires
+  :doc-id."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]
+            [mangaka.kami :as kami]))
+
+(defn make [store]
+  (util/single-node
+   :kami-frame
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [doc (or (store/load-document store (:doc-id input))
+                   (throw (ex-info (str "document not found: " (:doc-id input)) {:type :bad-input})))]
+       (kami/storyboard->frame (:page doc))))))
+
+(def handler util/result-handler)

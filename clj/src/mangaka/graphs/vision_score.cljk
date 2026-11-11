@@ -1,0 +1,58 @@
+(ns mangaka.graphs.vision-score
+  "visionScorePanel — vision QA over a rendered panel (the Python
+  mangaka_vision_score_page). Sends the panel image to the critique model
+  and parses a structured {score, notes} verdict, then stores it on the
+  panel as queryable datoms (:panel/score / :panel/critique).
+
+  Input: {:panel-id …} (scores a stored rendered panel) or {:image-b64 …}
+  (scores an ad-hoc image). Offline (no ANTHROPIC_API_KEY) the mock reply
+  doesn't parse, so the critique is a stub and :llm-applied is false.
+  Two-node graph (score → persist); not a generation graph."
+  (:require [langgraph.graph :as g]
+            [mangaka.blob :as blob]
+            [mangaka.domain :as domain]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(def ^:private prompt
+  "You are a manga art-quality reviewer. Reply with ONLY a JSON object:
+  {\"score\": <0-100 integer>, \"notes\": \"<one-line critique>\"}. No prose.")
+
+(defn- panel-image
+  "Resolve a panel's base64 image: a stored blob key (via `blobs`) or the
+  inline :panel/image-b64 fallback."
+  [blobs panel]
+  (or (when-let [k (and blobs (:panel/image-key panel))] (:b64 (blob/fetch blobs k)))
+      (:panel/image-b64 panel)))
+
+(defn make [store blobs]
+  (-> (g/state-graph {:channels {:input {} :critique {} :applied {} :result {}}})
+      (g/add-node :score
+                  (fn [{:keys [input]}]
+                    (let [img (or (:image-b64 input)
+                                  (some->> (:panel-id input) (store/load-panel store) (panel-image blobs)))]
+                      (when (and (:panel-id input) (nil? img))
+                        (throw (ex-info (str "panel not found: " (:panel-id input)) {:type :bad-input})))
+                      (let [verdict (llm/vision-json prompt img)]
+                        {:applied (some? verdict)
+                         :critique (or verdict {:notes "no vision model (offline/mock)"})}))))
+      (g/add-node :persist
+                  (fn [{:keys [input critique applied]}]
+                    (when-let [pid (:panel-id input)]
+                      (store/save-panel! store {:id pid
+                                                :score (:score critique)
+                                                :critique (pr-str critique)}))
+                    {:result {:panel-id (:panel-id input)
+                              :score (:score critique)
+                              :critique critique
+                              :llm-applied (boolean applied)}}))
+      (g/set-entry-point :score)
+      (g/add-edge :score :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(defn handler [compiled]
+  (fn [input _thread-id]
+    (when (and (nil? (:panel-id input)) (nil? (:image-b64 input)))
+      (domain/require-input! input [:panel-id]))  ; → :bad-input "panel-id"
+    (:result (g/invoke compiled {:input input}))))

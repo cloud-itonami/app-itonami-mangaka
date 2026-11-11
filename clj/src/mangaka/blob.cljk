@@ -1,0 +1,13 @@
+(ns mangaka.blob
+  "Content-addressed blob store for generated images — facade over
+  `langgraph-store.blob` (extracted; mangaka.blob and animeka.blob were
+  byte-identical copies — see 90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md
+  and 90-docs/adr/2607011900-genapp-clj-mangaka-animeka-commons.md). Kept as
+  a facade so existing `mangaka.blob/...` call sites (this app's
+  `server.cljc`/`runtime.cljc`) don't change."
+  (:require [langgraph-store.blob :as g]))
+
+(defn put! [b b64 mime] (g/put! b b64 mime))
+(defn fetch [b k] (g/fetch b k))
+#?(:clj (def mem-blobs g/mem-blobs))
+#?(:clj (def fs-blobs g/fs-blobs))

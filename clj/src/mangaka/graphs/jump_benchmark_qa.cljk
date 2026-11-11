@@ -1,0 +1,114 @@
+(ns mangaka.graphs.jump-benchmark-qa
+  "jumpBenchmarkQa — Jump 誌基準の VLM 審査ループ (ADR-2607165100 addendum 1)。
+
+  backlog :qa に残っていた退役 Python の score_jump_benchmark を CLJ 化した
+  もの。軸の正本は kami.mangaka.qa.axes/:jump (8 軸、0-10)。v10 実サンプル
+  (mangaka-data/.../v10/v10-p00-score.json、gemma3:4b n_samples=5) と同じく
+  **n サンプル平均**で 1 回の審査ブレを均す。
+
+  v10 の total/tier-label の重み付き合成は移植しない (重み定義は退役 runtime
+  と共に失われた — ADR-2607165100 の捏造しない方針)。本グラフの :total は
+  mean10×10 (= 素直な軸平均の 0-100 換算) で、v10 保存値とは別物として
+  :method に明記する。
+
+  Input: {:panel-id \"panel-…\"} または {:doc-id \"…\"} (その doc の
+  page-render を審査)、:samples (default 3)。
+  出力は :panel/jump-qa (または :page-render/jump-qa) datom (pr-str) にも
+  焼き込む。offline は :applied false / :method \"no-vision-offline\" —
+  スコアを捏造しない。"
+  (:require [kotoba.lang.text :as str]
+            [kami.mangaka.qa.axes :as qa-axes]
+            [kami.mangaka.qa.score :as qa-score]
+            [mangaka.blob :as blob]
+            [mangaka.graphs.util :as util]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(def ^:private default-samples 3)
+
+(defn- bad! [msg] (throw (ex-info msg {:type :bad-input})))
+
+(def jump-prompt
+  (str "You are a Weekly Shonen Jump editorial reviewer. Rate this manga"
+       " page/panel on each axis from 0 to 10. Reply with ONLY a JSON object"
+       " {\"axes\": {"
+       (str/join ", " (map #(str "\"" (qa-axes/->v10-key %) "\": <0-10>")
+                           (qa-axes/axis-names :jump)))
+       "}, \"verdict\": \"<one-sentence editorial verdict>\","
+       " \"issues\": [\"<short issue>\", …]}. No prose outside the JSON."))
+
+(defn- parse-sample
+  "1 サンプルの verdict map → {:axes {<kebab> <0-10>} :verdict :issues} | nil。"
+  [out]
+  (let [axes (:axes out)]
+    (when (map? axes)
+      {:axes (into {}
+                   (keep (fn [a]
+                           (let [v (get axes (keyword (qa-axes/->v10-key a)))]
+                             (when (and (number? v) (<= 0 v 10)) [a v]))))
+                   (qa-axes/axis-names :jump))
+       :verdict (:verdict out)
+       :issues (when (sequential? (:issues out)) (vec (:issues out)))})))
+
+(defn- average-axes [samples]
+  (let [ks (qa-axes/axis-names :jump)]
+    (into {}
+          (keep (fn [k]
+                  (let [vs (keep #(get-in % [:axes k]) samples)]
+                    (when (seq vs)
+                      [k (/ (Math/round (* 10.0 (/ (reduce + 0.0 vs) (count vs)))) 10.0)]))))
+          ks)))
+
+(defn judge-image
+  "n サンプル審査 → {:axes 平均 :total :verdict :issues :n-samples :applied}。
+  public: coscientist の kaizen サイクル (:judge? — meta 後の再審査) が再利用
+  する (ADR-2607165100 addendum 2)。"
+  [vision-fn image-b64 n]
+  (let [samples (into []
+                      (keep (fn [_] (parse-sample (vision-fn jump-prompt image-b64))))
+                      (range n))
+        axes (average-axes samples)
+        total (some-> (qa-score/mean10 axes) (* 10) double)]
+    (if (seq samples)
+      {:applied true :n-samples (count samples)
+       :axes axes
+       :total (some-> total (#(/ (Math/round (* 10.0 %)) 10.0)))
+       :verdict (some :verdict samples)
+       :issues (vec (distinct (mapcat :issues samples)))
+       :method "vlm-mean10x10 (v10 重み合成は非移植 — ADR-2607165100)"}
+      {:applied false :n-samples 0 :axes nil :total nil
+       :method "no-vision-offline"})))
+
+(defn- image-of [store blobs {:keys [panel-id doc-id]}]
+  (if panel-id
+    (let [p (store/load-panel store panel-id)]
+      (or (when (and blobs (:panel/image-key p)) (:b64 (blob/fetch blobs (:panel/image-key p))))
+          (:panel/image-b64 p)))
+    (let [r (store/load-page-render store (str "page-" doc-id))]
+      (or (when (and blobs (:page-render/image-key r)) (:b64 (blob/fetch blobs (:page-render/image-key r))))
+          (:page-render/image-b64 r)))))
+
+(defn make
+  "opts (optional): {:vision-fn (fn [prompt image-b64] → map|nil)} — テスト
+  注入用、既定は llm/vision-json (fleet gemma4)。"
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [vision-fn]}]
+   (let [vision-fn (or vision-fn llm/vision-json)]
+     (util/single-node :jump-benchmark-qa
+       (fn [{:keys [input]}]
+         (let [pid (or (:panel-id input) (:panel_id input))
+               doc-id (or (:doc-id input) (:doc_id input))
+               _ (when (and (nil? pid) (nil? doc-id))
+                   (bad! "provide :panel-id or :doc-id"))
+               n (or (:samples input) default-samples)
+               img (or (image-of store blobs {:panel-id pid :doc-id doc-id})
+                       (bad! (str "no image for " (or pid (str "page-" doc-id)))))
+               result (judge-image vision-fn img n)]
+           (when (:applied result)
+             (if pid
+               (store/save-panel! store {:id pid :jump-qa (pr-str result)})
+               (store/save-page-render! store {:id (str "page-" doc-id)
+                                               :jump-qa (pr-str result)})))
+           (merge {:status "ok" :panelId pid :docId doc-id} result)))))))
+
+(def handler util/result-handler)

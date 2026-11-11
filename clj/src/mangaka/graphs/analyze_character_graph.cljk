@@ -1,0 +1,15 @@
+(ns mangaka.graphs.analyze-character-graph
+  "analyzeCharacterGraph — surface the cast's relationship graph (the Python
+  analyze_character_graph). Each character's :character/enrichment carries a
+  {:relationships {<other> <rel>}} map (populated by importGhosthacker); this
+  reads the whole cast and returns {:nodes [{:id :name}] :edges [{:from :to
+  :rel}]} — a story/cast tool view. No input."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.store :as store]))
+
+(defn make [store]
+  (util/single-node
+   :analyze-character-graph
+   (fn [_] (store/character-graph store))))
+
+(def handler util/result-handler)

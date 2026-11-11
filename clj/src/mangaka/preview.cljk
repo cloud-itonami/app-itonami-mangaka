@@ -1,0 +1,93 @@
+(ns mangaka.preview
+  "Server-side SVG preview of a storyboard page — a derived view (not the
+  SSoT), for thumbnails, non-cljs clients, embeds, and LLM-vision input. It
+  complements the KAMI render-IR (GPU path) as a pure, GPU-free rendering:
+  page map → SVG string. Robust to missing/malformed :panel/rect."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.domain :as domain]))
+
+(def ^:private W 700)
+(def ^:private H 990)
+
+(defn- esc [s]
+  (-> (str s) (str/replace "&" "&amp;") (str/replace "<" "&lt;") (str/replace ">" "&gt;")))
+
+(defn- truncate [s n] (if (> (count s) n) (str (subs s 0 n) "…") s))
+
+(defn- polygon-points
+  ":panel/polygon (normalized [[x y]…] page-space points) → the SVG `points`
+  attribute value in pixel space."
+  [polygon]
+  (->> polygon (map (fn [[x y]] (str (* x W) "," (* y H)))) (str/join " ")))
+
+(defn- kind-str [kind] (cond (keyword? kind) (name kind) (string? kind) kind :else ""))
+
+(def ^:private layer-fill
+  {"background" "#dce8f0" "midground" "#e8e4d8" "character" "#f5ddb8"
+   "effect" "#e3d6f0" "inset" "#ffd8c2" "text" "#ffffff"})
+
+(defn- layer-svg
+  "One :panel/layers entry → a translucent colored rect at :layer/rect (page-
+  space, may legally run outside its panel's own rect — a Togashi frame-break
+  layer, :layer/bleed true, drawn with a red dashed stroke so the overflow is
+  visible instead of silently clipped)."
+  [layer]
+  (when-let [[lx ly lw lh] (:layer/rect layer)]
+    (let [fill (get layer-fill (kind-str (:layer/kind layer)) "#ececec")
+          bleed? (true? (:layer/bleed layer))]
+      (str "<rect x='" (* lx W) "' y='" (* ly H) "' width='" (* lw W) "' height='" (* lh H)
+           "' fill='" fill "' fill-opacity='0.6' stroke='" (if bleed? "#c0392b" "#9a9a90")
+           "' stroke-width='" (if bleed? 2 1)
+           "' stroke-dasharray='" (if bleed? "6 3" "0") "'/>"))))
+
+(defn- panel-svg [i panel]
+  (let [[x y w h] (domain/panel-rect panel i)
+        polygon (:panel/polygon panel)
+        ;; label anchor: the polygon's own top-left corner when sheared, so
+        ;; text stays inside a diagonal panel instead of the unsheared rect
+        px (if polygon (* (ffirst polygon) W) (* x W))
+        py (* y H) pw (* w W) ph (* h H)
+        focal (->> (:panel/focal panel) (map #(str/replace (str %) ":character/" "")) (str/join ", "))
+        bubbles (keep :bubble/text (:panel/bubbles panel))]
+    (str "<g>"
+         ;; a komawari force-line row (see mangaka.layout.komawari) sheared the
+         ;; panel into a parallelogram — draw the polygon so the diagonal
+         ;; gutter is visible, instead of the axis-aligned rect it came from
+         (if polygon
+           (str "<polygon points='" (polygon-points polygon) "' fill='white' stroke='black' stroke-width='2'/>")
+           (str "<rect x='" px "' y='" py "' width='" pw "' height='" ph
+                "' fill='white' stroke='black' stroke-width='2'/>"))
+         ;; komawari layering (ADR-2607051530): background/character/effect/
+         ;; inset layers stacked by :layer/z — drawn over the panel's own
+         ;; white base so a bleeding (frame-break) layer visibly spills past
+         ;; this panel's own border instead of being silently clipped
+         (str/join (map layer-svg (sort-by #(or (:layer/z %) 0) (:panel/layers panel))))
+         "<text x='" (+ px 6) "' y='" (+ py 16) "' font-size='11' fill='#555'>#"
+         (or (:panel/index panel) i) (when (:panel/shot panel) (str " " (esc (:panel/shot panel)))) "</text>"
+         ;; :visual — the raw art-direction line (ghosthacker manga_script.edn's
+         ;; convention; not a :panel/* schema key), shown as a director's note so
+         ;; the thumbnail reads as a real name (layout draft), not just a dialogue
+         ;; box — this preview never gets sent to comfy, so it's cosmetic only
+         (when-let [v (:visual panel)]
+           (str "<text x='" (+ px 6) "' y='" (+ py 29) "' font-size='9' font-style='italic' fill='#999'>"
+                (esc (truncate v 60)) "</text>"))
+         (when (seq focal)
+           (str "<text x='" (+ px 6) "' y='" (+ py 42) "' font-size='10' fill='#888'>" (esc focal) "</text>"))
+         ;; the panel's background scene (if linked) — a content hint, like focal
+         (when-let [scene (:panel/scene panel)]
+           (str "<text x='" (+ px 6) "' y='" (+ py 54) "' font-size='9' fill='#aaa'>@" (esc scene) "</text>"))
+         (str/join (map-indexed (fn [bi t]
+                                  (str "<text x='" (+ px 12) "' y='" (+ py 66 (* bi 16))
+                                       "' font-size='12' fill='#111'>" (esc t) "</text>"))
+                                bubbles))
+         "</g>")))
+
+(defn page->svg
+  "page map → an SVG string (manga-page aspect). Pure and GPU-free."
+  [page]
+  (str "<svg xmlns='http://www.w3.org/2000/svg' width='" W "' height='" H
+       "' viewBox='0 0 " W " " H "'>"
+       "<rect width='100%' height='100%' fill='#f3f1ea'/>"
+       "<text x='12' y='20' font-size='14' fill='#333'>" (esc (:page/title page "storyboard")) "</text>"
+       (str/join (map-indexed panel-svg (:page/panels page)))
+       "</svg>"))

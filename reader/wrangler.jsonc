@@ -1,0 +1,44 @@
+{
+  "name": "mangaka-reader",
+  "main": "dist/worker.js",
+  "compatibility_date": "2025-03-17",
+  "workers_dev": true,
+  // Read-only public manga reader. Domain rows in D1 (ai-gftd-mangaka),
+  // page images in R2 (ai-gftd-cdn) at blobs/mng4k4x1.gftd.ai/<key>.
+  // Standalone worker — does NOT touch the live KAMI canvas editor worker.
+  // cljc/cljs rewrite (ADR-2607070500 follow-up): pure render in
+  // src/mangaka_reader/render.cljc (作品一覧 = kotoba-lang/manga-viewer SSR,
+  // reader page = DATA-driven parity assets), thin workerd host in
+  // src/mangaka_reader/worker.cljs. Build: npm run build (shadow-cljs
+  // release worker → dist/worker.js).
+  // Studio integration API (ADR-2607071100 ③): GET /api/works, GET/POST
+  // /api/work/:rkey — POST needs the MANGAKA_ADMIN_TOKEN secret
+  // (`wrangler secret put MANGAKA_ADMIN_TOKEN`; local copy in the macOS
+  // Keychain, service "mangaka-admin-token").
+  "d1_databases": [
+    { "binding": "MANGAKA_DB", "database_name": "ai-gftd-mangaka", "database_id": "534176d4-980b-44d9-ad09-0e3e0ff327d9" }
+  ],
+  "r2_buckets": [
+    { "binding": "CDN", "bucket_name": "ai-gftd-cdn" }
+  ],
+  // Serves the public reader at manga.gftd.ai (route reassigned from the
+  // empty placeholder worker magatama-mg5k2n7x, 2026-06-16).
+  // itonami.cloud 配下に出すが、**静的サイト面ではなく service 面**に出す。
+  //
+  // cloud-itonami の静的サイト面（network-awai/cloud-itonami の sites.edn、
+  // ADR-2607301300）は Pages が配る静的ファイルの面。この reader は D1 の作品行と
+  // R2 の頁画像から描くので、そこに入れると公開時点の作品一覧で凍る。
+  //
+  // ゾーンにはもう 1 つの面が既にある: hooks. / app. / mcp.itonami.cloud はいずれも
+  // Worker の custom domain で、sites.edn には出てこない。動的サービスはそちらが正。
+  //
+  // 2026-08-05 に一度これを付けて撤去したのは「宣言された面を迂回したから」で、
+  // 静的アプリ（genko/daw/nle）は sites.edn へ移した。**動的サービスに対しては
+  // custom domain が迂回ではなく本来の経路**なので、ここは戻す。
+  //
+  // gftd.ai の route は既存リンクのために残す。
+  "routes": [
+    { "pattern": "mangaka.itonami.cloud", "custom_domain": true },
+    { "pattern": "manga.gftd.ai/*", "zone_name": "gftd.ai" }
+  ]
+}

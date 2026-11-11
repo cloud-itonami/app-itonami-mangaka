@@ -1,0 +1,23 @@
+{
+  // mangaka.gftd.ai retirement redirect (ADR-2607071100, wave3).
+  //
+  // The old editor Worker (magatama-mng4k4x1) no longer exists on the account
+  // and cannot be restored (service binding to the wave2-deleted
+  // ai-gftd-pds-2603241700 + retired dispatcher/pod backends), which left the
+  // host 522ing on a dead origin. The editor's new home is the aozora.app SPA
+  // /studio; this tiny Worker 301s the old URL there — same pattern as
+  // yoro.gftd.ai/* → yoro-gftd-redirect.
+  //
+  // Source: ../reader/src/mangaka_reader/redirect.cljk (cljs, built by the
+  // reader shadow project: cd ../reader && amu compile --target wasm32-browser redirect).
+  // mangaka.gftd.ai/_d1 → ai-gftd-d1-writer stays as a separate,
+  // more-specific route (path routes win over this wildcard); its pod-side
+  // callers are dead and it is handled by the dispatcher per-app cleanup
+  // (ADR-2607062130).
+  "name": "mangaka-gftd-redirect",
+  "main": "dist/redirect.js",
+  "compatibility_date": "2025-03-17",
+  "routes": [
+    { "pattern": "mangaka.gftd.ai/*", "zone_name": "gftd.ai" }
+  ]
+}

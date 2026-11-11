@@ -1,0 +1,47 @@
+(ns mangaka.critique
+  "The 8-axis manga-panel rubric (composeScene3d, ADR-2607164200) and its
+  aggregate-score/best-of selection, shared by every generate-candidates+
+  pick-a-winner graph (mangaka.graphs.generate-panel-quality's comfy
+  multi-seed fan-out, mangaka.graphs.generate-panel-video's seedance
+  frame-sampling fan-out, and mangaka.graphs.coscientist-panel). Extracted
+  from generate-panel-quality so a second candidate-fan-out graph doesn't
+  redefine the same rubric prompt / scoring math a second time."
+  (:require [mangaka.llm :as llm]))
+
+(def rubric-axes
+  "composeScene3d の 8 軸 (lg/scripts/demo_outputs/08_aggregated.json)。"
+  [:composition :silhouette :characterRecognizability :framing
+   :mangaShotGrammar :lightingDrama :actionClarity :emotionAlignment])
+
+(def critique-prompt
+  "8 軸ルーブリックの critique prompt -- every candidate-fan-out graph in this
+  repo uses the same judge, so results are comparable across pipelines
+  (txt2img seeds vs. seedance-clip frame samples)."
+  (str "You are a manga art-quality reviewer inside a generate-critique-refine"
+       " loop. Rate the image on each axis from 0.0 to 1.0 and reply with ONLY"
+       " a JSON object:\n"
+       "{\"axes\": {\"composition\": <0-1>, \"silhouette\": <0-1>,"
+       " \"characterRecognizability\": <0-1>, \"framing\": <0-1>,"
+       " \"mangaShotGrammar\": <0-1>, \"lightingDrama\": <0-1>,"
+       " \"actionClarity\": <0-1>, \"emotionAlignment\": <0-1>},"
+       " \"notes\": \"<one-line critique>\","
+       " \"fix_hint\": \"<short imperative phrase to append to the next"
+       " prompt>\"}. No prose."))
+
+(defn aggregate-score
+  "Mean of the numeric rubric axes, scaled to the :panel/score range (0-100,
+  rounded). nil when no numeric axis came back (offline / unparseable)."
+  [axes]
+  (let [vals (filter number? (vals (or axes {})))]
+    (when (seq vals)
+      (int (+ 0.5 (* 100 (/ (reduce + 0.0 vals) (count vals))))))))
+
+(defn best-of [candidates]
+  (when (seq candidates) (apply max-key #(or (:score %) -1) candidates)))
+
+(defn default-critique-fn
+  "The live vision judge (llm/vision-json against the shared rubric prompt) --
+  degrades to nil offline, same as every other critique-fn default in this
+  repo."
+  [_spec img]
+  (llm/vision-json critique-prompt img))

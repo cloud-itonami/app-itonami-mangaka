@@ -1,0 +1,423 @@
+(ns mangaka.graphs.coscientist-panel
+  "mangakaCoscientistPanel — co-scientist 高品質生成ループ (ADR-2607164200
+  addendum; パターン原典は ADR-2606141500 keiei-arbor、直系の実装前例は
+  isekai.ux.coscientist (network-isekai ADR-0007) と
+  90-docs/design-quality/coscientist.cljc)。
+
+  generate-panel-quality (単一系統の refine ループ) の上位互換で、系統を
+  「集団」に広げる:
+
+    generate — 仮説人口: base spec に対する N 個のプロンプト方向性
+               (composition / shot grammar / lighting)。LLM 経路
+               (llm/complete-json で提案させる) が使えれば使い、offline は
+               決定論的な漫画ショット文法ライブラリに degrade する
+               (isekai の :heuristic mode と同型)。
+    render  — 各仮説を実レンダリング (ノード内 fan-out — langgraph-clj に
+               Send は無い)。
+    reflect — 各レンダーを 8 軸ルーブリック (generate-panel-quality と同じ
+               composeScene3d 由来の axes) で vision critique。
+    rank    — round-robin Elo (K=32, base 1200 — design-quality /
+               isekai と同じ規約)。bout の判定は **測定された critique
+               スコア** — LLM 討論をランキングの根拠にしない
+               (design-quality の \"ranking is reproducible, never an LLM
+               debate\" 原則)。offline の nil スコアは no signal として
+               数値スコアに常に負ける。
+    evolve  — elite 生存 + 変異 (勝者の :fix-hint をプロンプトへ畳み込み、
+               seed を人口ぶん前進) + 交叉 (親 2 体の方向性フラグメントの
+               合成)。次世代人口で render へ back-edge。
+    meta    — 世代budget消尽 or 閾値到達で、全世代の系譜 (:generations
+               監査証跡) を meta-review し、最良パネルを永続化 + iteration
+               doc (md 文字列) を返す。
+
+  Input: generate-panel と同じ基本フィールドに加えて :population (default 3)、
+  :elite (default 2)、:max-generations (default 2)、:score-threshold
+  (default 80)、:character (optional — trained LoRA passthrough)。"
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [mangaka.blob :as blob]
+            [mangaka.comfy :as comfy]
+            [mangaka.graphs.generate-panel :as panel]
+            [mangaka.graphs.generate-panel-quality :as quality]
+            [mangaka.graphs.jump-benchmark-qa :as jump-qa]
+            [mangaka.llm :as llm]
+            [mangaka.models :as models]
+            [mangaka.perception :as perception]
+            [mangaka.store :as store]
+            [langgraph.graph :as g]))
+
+(def ^:private default-population 3)
+(def ^:private default-elite 2)
+(def ^:private default-max-generations 2)
+(def ^:private default-score-threshold 80)
+(def ^:private default-max-directives 4)
+(def ^:private elo-k 32.0)
+(def ^:private elo-base 1200.0)
+
+;; --- kaizen: jumpBenchmarkQa の審査結果を Generate の種にする ----------------
+;; (ADR-2607165100 addendum 2 — 審査→改善→再審査の完全サイクル)
+
+(defn issue->directive
+  "審査 issue (自由文) → プロンプトに畳み込める改善指令。決定論 — よくある
+  英語の欠陥表現を命令形に反転し、それ以外は fix: 前置でそのまま渡す
+  (LLM generate 経路は文をそのまま理解できる; 反転は offline/ SDXL prompt
+  向けの最善努力)。"
+  [issue]
+  (let [i (str/trim (str issue))
+        low (str/lower i)
+        strip #(str/trim (subs i (count %)))]
+    (cond
+      (str/blank? i) nil
+      (str/starts-with? low "lack of ")        (str "strong " (strip "lack of "))
+      (str/starts-with? low "weak ")           (str "strong " (strip "weak "))
+      (str/starts-with? low "static ")         (str "dynamic " (strip "static "))
+      (str/starts-with? low "underdeveloped ") (str "detailed " (strip "underdeveloped "))
+      (str/starts-with? low "unbalanced ")     (str "balanced " (strip "unbalanced "))
+      (str/starts-with? low "missing ")        (str "add " (strip "missing "))
+      :else (str "fix: " i))))
+
+(defn- kaizen-issues
+  "input の :issues (明示)、または :kaizen-from-panel の :panel/jump-qa datom
+  (jumpBenchmarkQa の永続化結果) から審査 issues を解決する。"
+  [store input]
+  (or (seq (:issues input))
+      (when-let [pid (:kaizen-from-panel input)]
+        (some-> (store/load-panel store pid) :panel/jump-qa
+                edn/read-string :issues seq))))
+
+;; --- Generate: 仮説人口 ------------------------------------------------------
+
+(def direction-library
+  "決定論的な漫画ショット文法の方向性 (offline/heuristic 経路)。LLM 経路が
+  無くてもループ全体が end-to-end で回るための、grounded な既定仮説。"
+  ["extreme close-up, dutch angle, heavy speedlines"
+   "wide establishing shot, rule of thirds, deep perspective"
+   "low angle, dramatic rim lighting, high-contrast ink"
+   "over-the-shoulder framing, shallow depth, screentone shading"
+   "diagonal action composition, motion blur, impact frame"
+   "silhouette against light source, negative space emphasis"])
+
+(def ^:private generate-prompt
+  (str "You are a manga cinematography co-scientist. Given a panel prompt,"
+       " propose distinct visual directions (composition / shot grammar /"
+       " lighting) that could each make a stronger panel. Reply with ONLY a"
+       " JSON object {\"directions\": [\"<short comma-separated phrase>\", …]}."
+       " No prose."))
+
+(defn- llm-directions
+  "LLM 提案の方向性リスト、失敗/offline は nil (heuristic に degrade)。"
+  [prompt n]
+  (let [out (llm/complete-json generate-prompt
+                               (str "Panel prompt: " prompt "\nPropose " n " directions."))
+        ds (:directions out)]
+    (when (and (sequential? ds) (seq ds))
+      (vec (take n (filter #(and (string? %) (seq %)) ds))))))
+
+(defn- hypothesis [spec direction i gen]
+  {:id (str "g" gen "-h" (inc i))
+   :generation gen
+   :direction direction
+   :spec (-> spec
+             (update :prompt #(if (seq direction) (str % ", " direction) %))
+             (assoc :seed (+ (or (:seed spec) 0) i)))})
+
+(defn- initial-population [generate-fn spec n]
+  (let [dirs (or (generate-fn (:prompt spec) n)
+                 (vec (take n direction-library)))]
+    (vec (map-indexed (fn [i d] (hypothesis spec d i 1)) dirs))))
+
+;; --- Reflect ------------------------------------------------------------------
+
+(defn- reflect-one
+  "Act の結果 (render) を観測して仮説に critique を焼き込む。rubric verdict の
+  axes に知覚軸 (:facePresence — VLM 顔検出 vs 期待 focal 数) を焼き足す。
+  offline は nil verdict / nil 検出 → :score nil (no signal)、決してループを
+  壊さない。"
+  [blobs critique-fn detect-fn {:keys [spec render] :as hyp}]
+  (let [img (or (when (and blobs (:image-key render))
+                  (:b64 (blob/fetch blobs (:image-key render))))
+                (:image-b64 render))
+        verdict (critique-fn spec img)
+        axes (perception/augment-axes (:axes verdict) spec img detect-fn)]
+    (merge hyp
+           {:score nil :axes nil :notes "no vision model (offline/mock)"}
+           verdict
+           {:axes axes
+            :score (or (quality/aggregate-score axes) (:score verdict))
+            :fix-hint (or (:fix-hint verdict) (:fix_hint verdict))
+            :image-key (:image-key render) :image-url (:image-url render)
+            :source (:source render)
+            :image-b64 (:image-b64 render) :mime (:mime render)})))
+
+;; --- Rank: 測定スコアが judge の round-robin Elo -------------------------------
+
+(defn- expected [ra rb] (/ 1.0 (+ 1.0 (Math/pow 10.0 (/ (- rb ra) 400.0)))))
+
+(defn- bout
+  "数値スコアが大きい方が勝ち。nil は no signal — 数値に常に負ける。両方 nil
+  は低い seed (先に提案された仮説) が勝つ: 完全に決定論的で、LLM 討論は
+  ランキングに関与しない。"
+  [a b]
+  (let [sa (:score a) sb (:score b)]
+    (cond
+      (and sa sb (> sa sb)) :a
+      (and sa sb (< sa sb)) :b
+      (and sa (nil? sb)) :a
+      (and sb (nil? sa)) :b
+      (and sa sb) :a                                        ; 同点 → 先着
+      :else (if (<= (or (:seed (:spec a)) 0) (or (:seed (:spec b)) 0)) :a :b))))
+
+(defn rank
+  "Round-robin Elo (K=32, base 1200)。:elo を焼き込み、rating 降順で返す。"
+  [members]
+  (let [ids (mapv :id members)
+        by-id (into {} (map (juxt :id identity) members))
+        ratings (reduce
+                 (fn [rt [i j]]
+                   (let [a (by-id i) b (by-id j)
+                         ra (rt i) rb (rt j)
+                         w (bout a b)
+                         sa (if (= w :a) 1.0 0.0) sb (- 1.0 sa)]
+                     (-> rt
+                         (update i + (* elo-k (- sa (expected ra rb))))
+                         (update j + (* elo-k (- sb (expected rb ra)))))))
+                 (zipmap ids (repeat elo-base))
+                 (for [i ids j ids :when (neg? (compare i j))] [i j]))]
+    (->> members
+         (map (fn [m] (assoc m :elo (Math/round ^double (ratings (:id m))))))
+         (sort-by (juxt (comp - :elo) #(- (or (:score %) -1))))
+         vec)))
+
+;; --- Evolve: elite 生存 + 変異 + 交叉 ------------------------------------------
+
+(defn- cross-directions
+  "交叉: 親 A の方向性フラグメント前半 + 親 B の後半 (\", \" 区切り)。"
+  [da db]
+  (let [fa (str/split (or da "") #",\s*")
+        fb (str/split (or db "") #",\s*")
+        ka (max 1 (quot (count fa) 2))]
+    (str/join ", " (distinct (concat (take ka fa) (drop (quot (count fb) 2) fb))))))
+
+(defn- mutate-spec [spec fix-hint step]
+  (-> spec
+      (update :prompt #(if (seq fix-hint) (str % ", " fix-hint) %))
+      (update :seed #(+ (or % 0) step))))
+
+(defn evolve
+  "次世代人口: elite k 体はそのまま生存 (再レンダリングはしない — 実測済みの
+  勝者を捨てない)、残り枠は (1) 首位の変異 (fix-hint 畳み込み + seed 前進)、
+  (2) 上位 2 体の交叉、(3) 以降は library の未使用方向性、で埋める。"
+  [ranked spec n elite gen]
+  (let [survivors (vec (take elite ranked))
+        [p1 p2] ranked
+        used (set (map :direction ranked))
+        fresh (remove used direction-library)
+        children
+        (->> (concat
+              [(when p1
+                 (-> (hypothesis (mutate-spec spec (:fix-hint p1) n)
+                                 (:direction p1) 0 gen)
+                     (assoc :parents [(:id p1)] :op :mutate)))
+               (when (and p1 p2)
+                 (-> (hypothesis spec (cross-directions (:direction p1) (:direction p2)) 1 gen)
+                     (update-in [:spec :seed] + n)
+                     (assoc :parents [(:id p1) (:id p2)] :op :crossover)))]
+              (map-indexed (fn [i d]
+                             (-> (hypothesis spec d (+ 2 i) gen)
+                                 (update-in [:spec :seed] + n)
+                                 (assoc :op :fresh)))
+                           fresh))
+             (remove nil?)
+             (take (max 0 (- n elite)))
+             vec)]
+    {:survivors survivors :children children}))
+
+;; --- Meta ----------------------------------------------------------------------
+
+(defn- best-of [members]
+  (when (seq members) (apply max-key #(or (:score %) -1) members)))
+
+(defn- iteration-doc
+  [{:keys [prompt]} generations best converged?]
+  (str "# mangaka Co-Scientist run — " (count generations) " generation(s)\n\n"
+       "> Seed prompt: " prompt "\n>\n"
+       "> Judge: 8-axis rubric critique (measured fitness; ranking is Elo round-robin"
+       " K=32, deterministic — never an LLM debate). Offline renders/critiques degrade"
+       " to stub/no-signal.\n\n"
+       (str/join "\n"
+                 (map-indexed
+                  (fn [i {:keys [ranked]}]
+                    (str "## Generation " (inc i) "\n\n"
+                         "| # | id | op | Elo | score | direction |\n|---|---|---|---|---|---|\n"
+                         (str/join "\n"
+                                   (map-indexed
+                                    (fn [j m]
+                                      (str "| " (inc j) " | `" (:id m) "` | "
+                                           (name (or (:op m) :seed)) " | " (:elo m) " | "
+                                           (or (:score m) "–") " | " (:direction m) " |"))
+                                    ranked))))
+                  generations))
+       "\n\n## Outcome\n\n"
+       (if converged?
+         (str "Converged: `" (:id best) "` (score " (:score best) ") cleared the threshold.")
+         (str "Budget exhausted: best seen is `" (:id best) "` (score "
+              (or (:score best) "no signal") ")."))
+       "\n"))
+
+;; --- Graph ----------------------------------------------------------------------
+
+(defn- with-lora
+  "generate-panel-quality と同じ trained-LoRA passthrough (学習済み =
+  store の :model/lora-cid がある時だけ)。"
+  [store input spec]
+  (if-let [slot (models/character-lora (:character input))]
+    (let [cid (:model/lora-cid (store/load-model store (:model/id slot)))]
+      (if (seq (str cid))
+        (assoc spec :lora {:id (:model/id slot) :cid cid})
+        spec))
+    spec))
+
+(defn- offload [blobs render]
+  (if (and blobs (:image-b64 render))
+    (let [k (blob/put! blobs (:image-b64 render) (:mime render))]
+      (assoc render :image-key k :image-url (str "/blob/" k)))
+    render))
+
+(defn make
+  "opts (optional):
+   {:critique-fn (fn [spec image-b64] → verdict|nil)   ; Reflect の judge
+    :generate-fn (fn [prompt n] → [directions]|nil)}   ; Generate の提案者
+  どちらも注入可能 (決定論テスト用)。既定は critique = llm/vision-json
+  (offline → nil)、generate = llm/complete-json 提案 → nil なら
+  direction-library。"
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [critique-fn generate-fn detect-fn judge-fn]}]
+   (let [critique-fn (or critique-fn
+                         (fn [_spec img] (llm/vision-json quality/critique-prompt img)))
+         generate-fn (or generate-fn llm-directions)
+         judge-fn (or judge-fn
+                      (fn [img] (jump-qa/judge-image llm/vision-json img 1)))]
+     (-> (g/state-graph {:channels {:input {} :spec {} :kaizen {} :population {}
+                                    :generations {:reducer into :default []}
+                                    :result {}}})
+         (g/add-node :generate
+                     (fn [{:keys [input]}]
+                       (let [base (with-lora store input (panel/plan* store input))
+                             issues (vec (take (or (:max-directives input)
+                                                   default-max-directives)
+                                               (kaizen-issues store input)))
+                             directives (vec (keep issue->directive issues))
+                             ;; 審査で指摘された弱点の改善指令を base spec に
+                             ;; 畳み込む — 全候補が是正を共有し、方向性
+                             ;; (composition/lighting) は従来どおり多様化する。
+                             ;; LLM generate 経路は augmented prompt を見るので
+                             ;; 提案も弱点是正を織り込む。
+                             spec (if (seq directives)
+                                    (update base :prompt
+                                            #(str % ", " (str/join ", " directives)))
+                                    base)
+                             n (max 1 (or (:population input) default-population))]
+                         {:spec spec
+                          :kaizen (when (seq issues)
+                                    {:issues issues :directives directives
+                                     :source (if (seq (:issues input))
+                                               :input :panel/jump-qa)})
+                          :population (initial-population generate-fn spec n)})))
+         (g/add-node :render
+                     (fn [{:keys [population]}]
+                       {:population
+                        (mapv (fn [h]
+                                (if (:render h)               ; elite 生存者は再レンダリングしない
+                                  h
+                                  (assoc h :render
+                                         (offload blobs (comfy/render-panel
+                                                         (comfy/fresh-scratch) (:spec h))))))
+                              population)}))
+         (g/add-node :reflect
+                     (fn [{:keys [population]}]
+                       {:population
+                        (mapv (fn [h] (if (:score h) h (reflect-one blobs critique-fn detect-fn h)))
+                              population)}))
+         (g/add-node :rank
+                     (fn [{:keys [population]}]
+                       (let [ranked (rank population)]
+                         {:population ranked
+                          :generations [{:ranked ranked :best (best-of ranked)}]})))
+         (g/add-node :evolve
+                     (fn [{:keys [input spec population generations]}]
+                       (let [n (max 1 (or (:population input) default-population))
+                             ;; evolve する以上は最低 1 体は繁殖させる — elite が
+                             ;; 人口を埋め尽くすと世代が同一メンバーの再ランクに
+                             ;; 退化する (population 2 × elite 2 の実測罠)
+                             elite (min (or (:elite input) default-elite) (max 0 (dec n)))
+                             {:keys [survivors children]}
+                             (evolve population spec n elite (inc (count generations)))]
+                         {:population (into survivors children)})))
+         (g/add-node :meta
+                     (fn [{:keys [input spec kaizen generations]}]
+                       (let [all (mapcat :ranked generations)
+                             best (best-of all)
+                             threshold (or (:score-threshold input) default-score-threshold)
+                             converged? (boolean (and (:score best)
+                                                      (>= (:score best) threshold)))
+                             idx (or (:panel-index input) (:index input))
+                             pid (or (:panel-id input)
+                                     (when (:doc-id input) (str "panel-" (:doc-id input) "-" idx))
+                                     (str "panel-" (hash [(:prompt (:spec best)) (:seed (:spec best))])))
+                             ;; kaizen サイクルを閉じる: 最良個体を jump QA で
+                             ;; 再審査し、その issues が次イテレーションの
+                             ;; :kaizen-from-panel 種になる (opt-in — 審査は
+                             ;; VLM n 回ぶんのコスト)
+                             judgement (when (:judge? input)
+                                         (let [img (or (when (and blobs (:image-key best))
+                                                         (:b64 (blob/fetch blobs (:image-key best))))
+                                                       (:image-b64 best))]
+                                           (when img (judge-fn img))))]
+                         (store/save-panel! store
+                                            {:id pid :doc-id (:doc-id input) :index idx
+                                             :prompt (:prompt (:spec best))
+                                             :seed (:seed (:spec best))
+                                             :model (:model (:spec best))
+                                             :score (:score best)
+                                             :critique (pr-str {:axes (:axes best)
+                                                                :notes (:notes best)
+                                                                :direction (:direction best)
+                                                                :generations (count generations)})
+                                             :jump-qa (when (:applied judgement) (pr-str judgement))
+                                             :image-key (:image-key best)
+                                             :image-b64 (when-not (:image-key best) (:image-b64 best))
+                                             :image-mime (or (:mime best) "image/png")})
+                         {:result (cond-> {:panel-id pid :doc-id (:doc-id input) :index idx
+                                           :best best
+                                           :generations (vec generations)
+                                           :generation-count (count generations)
+                                           :lora (:lora spec)
+                                           :converged? converged?
+                                           :doc (iteration-doc {:prompt (:prompt spec)}
+                                                               generations best converged?)}
+                                    kaizen (assoc :kaizen kaizen)
+                                    judgement (assoc :jump-qa judgement))})))
+         (g/set-entry-point :generate)
+         (g/add-edge :generate :render)
+         (g/add-edge :render :reflect)
+         (g/add-edge :reflect :rank)
+         (g/add-conditional-edges :rank
+                                  (fn [{:keys [input generations]}]
+                                    (let [best (:best (peek generations))
+                                          threshold (or (:score-threshold input)
+                                                        default-score-threshold)
+                                          budget (or (:max-generations input)
+                                                     default-max-generations)]
+                                      (if (or (>= (count generations) budget)
+                                              (and (:score best) (>= (:score best) threshold)))
+                                        :meta
+                                        :evolve)))
+                                  {:meta :meta :evolve :evolve})
+         (g/add-edge :evolve :render)
+         (g/set-finish-point :meta)
+         (g/compile-graph {:recursion-limit 40})))))
+
+(defn handler
+  "Input validation は generate-panel の plan* (:bad-input ex-info) に委譲。"
+  [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

@@ -1,0 +1,135 @@
+(ns mangaka.comfy
+  "ComfyUI panel rendering via comfyui-clj — facade over `comfyui.gateway`
+  (extracted; mangaka.comfy and animeka.comfy were near-duplicate copies
+  differing only in the sampler node-type name, default image dims, env-var
+  names, and whether an API key is required — see
+  90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md and
+  90-docs/adr/2607011900-genapp-clj-mangaka-animeka-commons.md). Kept as a
+  facade so existing `mangaka.comfy/...` call sites (`graphs/gen.cljc`,
+  `graphs/comfy_run.cljc`, `comfy_test.cljc`) don't change.
+
+  With no COMFYUI_URL/COMFYUI_API_KEY it returns a placeholder SVG, so the
+  pipeline runs end-to-end without a GPU.
+
+  MURAKUMO_COMFY_URL (or COMFY_URL) is a second, preferred transport:
+  cloud-murakumo's engine+executor talk ComfyUI's *native* /prompt +
+  /history + /view protocol directly (RUNBOOK.md's gad/asher fleet over
+  Tailscale) — the OpenAI-images-compatible gateway above assumes an
+  endpoint that doesn't exist on those raw ComfyUI nodes. See
+  render-via-murakumo."
+  (:require [comfyui.gateway :as g]
+            #?(:clj [cloud-murakumo.engine :as murakumo])
+            #?(:clj [cloud-murakumo.executor :as murakumo-exec])
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj [kotoba.lang.text :as str])))
+
+(def default-ckpt #?(:clj (or (System/getenv "COMFY_DEFAULT_CKPT") "animagine-xl-4.0.safetensors")
+                     :cljs "animagine-xl-4.0.safetensors"))
+
+(def ^:private placeholder {:width 320 :height 464 :label "mangaka panel (stub)"})
+
+(def ^:private cfg
+  {:node-type "MangakaKSampler" :default-ckpt default-ckpt
+   :default-width 832 :default-height 1216})
+
+(defn render-via-gateway
+  "Renders `spec` via the OpenAI-images-compatible ComfyUI gateway. `gw-cfg`
+  supplies {:base :api-key :http-post}; `http-post` is (url, opts) →
+  {:status :body :error} — injected so the success-parse and error-fallback
+  branches are testable without a live gateway. Any failure (no config,
+  transport error, non-2xx) degrades to a placeholder; never throws."
+  [gw-cfg spec]
+  (g/render-via-gateway (assoc gw-cfg :require-api-key? true :placeholder placeholder) spec))
+
+#?(:clj
+   (defn- murakumo-backend-url []
+     (or (System/getenv "MURAKUMO_COMFY_URL") (System/getenv "COMFY_URL"))))
+
+#?(:clj
+   (defn- strip-ckpt-ext [model] (some-> model (str/replace #"\.safetensors$" ""))))
+
+#?(:clj
+   (defn- murakumo-attempt [backend-url {:keys [prompt negative model width height seed]}]
+     (let [job {:gen.job/engine :comfy
+                :gen.job/model (or (strip-ckpt-ext model) "animagine-xl-4.0")
+                :gen.job/input {:prompt prompt :refs []
+                                :params (cond-> {:width (or width 832) :height (or height 1216)}
+                                          (seq negative) (assoc :negative negative)
+                                          seed (assoc :seed seed))}}
+           inv (-> (murakumo/invocation job) (assoc-in [:backend :url] backend-url))
+           {:keys [outputs]} (murakumo-exec/execute inv)
+           bytes (.readAllBytes (io/input-stream (io/file (first outputs))))]
+       {:image-b64 (.encodeToString (java.util.Base64/getEncoder) bytes)
+        :mime "image/png" :source "murakumo" :seed (or seed 0)})))
+
+#?(:clj
+   (defn render-via-murakumo
+     "Renders `spec` via cloud-murakumo.engine + .executor — native ComfyUI
+     /prompt against `backend-url`, polling /history and downloading /view
+     (cloud-murakumo.executor's await-comfy-output, gftdcojp/cloud-murakumo#18).
+     Retries once on failure — the gad fleet node has been observed to
+     occasionally report a job `:completed true` with an empty output set
+     (a ComfyUI-side node-cache glitch); a fresh /prompt submission on retry
+     has reliably cleared it. Same never-throws
+     contract as render-via-gateway: exhausting retries degrades to
+     `fallback` rather than propagating, so a misconfigured/unreachable
+     fleet node doesn't take the whole render graph down."
+     [backend-url spec fallback]
+     (try
+       (murakumo-attempt backend-url spec)
+       (catch Exception _e1
+         (try
+           (murakumo-attempt backend-url spec)
+           (catch Exception _e2 (fallback)))))))
+
+(defn- fallback-gateway-render [spec]
+  (g/gateway-render-from-env
+   {:url-vars ["COMFYUI_URL"] :key-vars ["COMFYUI_API_KEY"]
+    :require-api-key? true :placeholder placeholder}
+   spec))
+
+(defn- gateway-render
+  "Calls cloud-murakumo (native ComfyUI fleet) if MURAKUMO_COMFY_URL/COMFY_URL
+  is set, else the OpenAI-images-compatible gateway with env config + the
+  real http-kit transport."
+  [spec]
+  #?(:clj (if-let [url (murakumo-backend-url)]
+            (render-via-murakumo url spec #(fallback-gateway-render spec))
+            (fallback-gateway-render spec))
+     :cljs (fallback-gateway-render spec)))
+
+(def ksampler-node (g/ksampler-node (assoc cfg :gateway-render gateway-render)))
+(def save-node g/save-node)
+(defn registry [] (g/registry ksampler-node))
+
+(defn panel-workflow
+  "API-format workflow (EDN) for one txt2img panel. Mirrors the
+  CLIPTextEncode→KSampler→SaveImage shape ComfyUI uses, collapsed to the
+  gateway-backed sampler. Coerces each scalar to its declared type (nil OR
+  wrong-typed → default), so malformed client params (`:seed \"abc\"`, a
+  non-string `:model`, …) can't make workflow validation fail with a 500 —
+  they fall back to sane defaults."
+  [spec]
+  (g/workflow cfg spec))
+
+(defn fresh-scratch
+  "A throwaway in-memory conn for one workflow run's exec cache + run
+  history. Generation / comfy_run graphs are one-shot, so each run gets its
+  own conn (GC'd afterward) — the server never accumulates per-run
+  history/cache, which would otherwise grow unbounded."
+  []
+  (g/fresh-scratch))
+
+(defn run
+  "Runs an arbitrary api-format workflow through the mangaka comfy registry.
+  `scratch-conn` (langchain.db) backs the content-addressed cache + run
+  history. Returns {:results :executed :cached :run-id}; throws on a node
+  execution error. `opts` is passed to the executor (e.g. {:targets […]})."
+  ([scratch-conn workflow] (run scratch-conn workflow {}))
+  ([scratch-conn workflow opts] (g/run (registry) scratch-conn workflow opts)))
+
+(defn render-panel
+  "Runs the panel workflow for `spec`; returns the sampler output map
+  {:image-b64 :mime :source :seed} plus {:run-id :cached}."
+  [scratch-conn spec]
+  (g/render (registry) cfg scratch-conn spec))

@@ -1,0 +1,1168 @@
+{
+  "episode": "letterfx-pattern-catalog",
+  "schema": "ai.gftd.mangaka.page (bubble/sfx/effectLine/tone/fontRole)",
+  "pages": [
+    {
+      "pageNum": 0,
+      "pageTitle": "セリフ 10形 / speech-balloon shapes (bubbles)",
+      "printGeometry": {
+        "trimSize": "b5",
+        "bleedPermille": 17,
+        "safeTop": 40,
+        "safeRight": 40,
+        "safeBottom": 40,
+        "safeLeft": 40,
+        "gutterPermille": 13
+      },
+      "_showGaze": false,
+      "_showPath": false,
+      "_showShotBox": false,
+      "panels": [
+        {
+          "order": 1,
+          "x": 508,
+          "y": 17,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "やあ",
+              "lines": [
+                "やあ"
+              ],
+              "shape": "round",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "x": 17,
+          "y": 17,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "おはよう、調子は？",
+              "lines": [
+                "おはよう、",
+                "調子は？"
+              ],
+              "shape": "oval",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "x": 508,
+          "y": 213,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "うわあッ！",
+              "lines": [
+                "うわあッ！"
+              ],
+              "shape": "spiky",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "x": 17,
+          "y": 213,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "ドケェ！！",
+              "lines": [
+                "ドケェ！！"
+              ],
+              "shape": "burst",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 5,
+          "x": 508,
+          "y": 409,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "…どうしよう",
+              "lines": [
+                "…どうしよう"
+              ],
+              "shape": "cloud",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 6,
+          "x": 17,
+          "y": 409,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "——3日前の放課後。",
+              "lines": [
+                "——3日前の",
+                "放課後。"
+              ],
+              "shape": "rect",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 7,
+          "x": 508,
+          "y": 605,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "…ねえ、聞いてる？",
+              "lines": [
+                "…ねえ、",
+                "聞いてる？"
+              ],
+              "shape": "whisper",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 8,
+          "x": 17,
+          "y": 605,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "ザ…ザ…応答セヨ",
+              "lines": [
+                "ザ…ザ…",
+                "応答セヨ"
+              ],
+              "shape": "jagged",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 9,
+          "x": 508,
+          "y": 801,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "(まずい、バレる)",
+              "lines": [
+                "(まずい、",
+                "バレる)"
+              ],
+              "shape": "thought",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 10,
+          "x": 17,
+          "y": 801,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "text": "な、なんで君が…",
+              "lines": [
+                "な、なんで",
+                "君が…"
+              ],
+              "shape": "wavy",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 660,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pageNum": 0,
+      "pageTitle": "効果音 10 / SFX onomatopoeia (sfx)",
+      "printGeometry": {
+        "trimSize": "b5",
+        "bleedPermille": 17,
+        "safeTop": 40,
+        "safeRight": 40,
+        "safeBottom": 40,
+        "safeLeft": 40,
+        "gutterPermille": 13
+      },
+      "_showGaze": false,
+      "_showPath": false,
+      "_showShotBox": false,
+      "panels": [
+        {
+          "order": 1,
+          "x": 508,
+          "y": 17,
+          "w": 475,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ドン",
+              "style": "impact",
+              "scale": 110,
+              "rotation": -8,
+              "weight": "heavy",
+              "bleed": false,
+              "posX": 500,
+              "posY": 500,
+              "scaleStart": 55,
+              "scaleEnd": 185,
+              "spread": 30,
+              "burst": "converge",
+              "easing": "bezier",
+              "bezier": [
+                150,
+                850,
+                850,
+                150
+              ]
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "focus",
+              "centerX": 500,
+              "centerY": 470,
+              "density": 70
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "x": 17,
+          "y": 17,
+          "w": 477,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ぽつ",
+              "style": "soft",
+              "scale": 85,
+              "rotation": 0,
+              "weight": "light",
+              "bleed": false,
+              "posX": 520,
+              "posY": 470
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "x": 508,
+          "y": 213,
+          "w": 475,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ピピッ",
+              "style": "electronic",
+              "scale": 95,
+              "rotation": 0,
+              "weight": "medium",
+              "bleed": false,
+              "posX": 500,
+              "posY": 470
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "x": 17,
+          "y": 213,
+          "w": 477,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ザワザワ",
+              "style": "organic",
+              "scale": 90,
+              "rotation": -6,
+              "weight": "medium",
+              "bleed": false,
+              "posX": 500,
+              "posY": 520,
+              "scaleStart": 90,
+              "scaleEnd": 150,
+              "spread": 16
+            }
+          ]
+        },
+        {
+          "order": 5,
+          "x": 508,
+          "y": 409,
+          "w": 475,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ドドド",
+              "style": "metallic",
+              "scale": 100,
+              "rotation": 16,
+              "weight": "heavy",
+              "bleed": false,
+              "posX": 480,
+              "posY": 470,
+              "scaleStart": 80,
+              "scaleEnd": 150,
+              "spread": 14,
+              "lines": [
+                "ドドド",
+                "ドドド",
+                "ドドド"
+              ],
+              "burst": "alternate"
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "flash",
+              "centerX": 480,
+              "centerY": 470,
+              "density": 55
+            }
+          ]
+        },
+        {
+          "order": 6,
+          "x": 17,
+          "y": 409,
+          "w": 477,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "シーン",
+              "style": "silence",
+              "scale": 100,
+              "rotation": 0,
+              "weight": "light",
+              "bleed": false,
+              "posX": 500,
+              "posY": 470
+            }
+          ]
+        },
+        {
+          "order": 7,
+          "x": 508,
+          "y": 605,
+          "w": 475,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ゴゴゴ",
+              "style": "rough",
+              "scale": 100,
+              "rotation": 0,
+              "weight": "heavy",
+              "bleed": false,
+              "posX": 500,
+              "posY": 520,
+              "scaleStart": 80,
+              "scaleEnd": 150,
+              "spread": 18,
+              "easing": "ease-in-out",
+              "rotJitter": 7
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "vertical",
+              "density": 45
+            }
+          ]
+        },
+        {
+          "order": 8,
+          "x": 17,
+          "y": 605,
+          "w": 477,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "ドン",
+              "style": "impact",
+              "scale": 120,
+              "rotation": -6,
+              "weight": "heavy",
+              "bleed": true,
+              "posX": 500,
+              "posY": 500,
+              "scaleStart": 55,
+              "scaleEnd": 130,
+              "spread": 14,
+              "rays": 8,
+              "rotJitter": 6
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "explosion",
+              "centerX": 500,
+              "centerY": 500,
+              "density": 72
+            }
+          ]
+        },
+        {
+          "order": 9,
+          "x": 508,
+          "y": 801,
+          "w": 475,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "バキ",
+              "style": "impact",
+              "scale": 105,
+              "rotation": 26,
+              "weight": "heavy",
+              "bleed": false,
+              "posX": 480,
+              "posY": 470,
+              "scaleStart": 60,
+              "scaleEnd": 175,
+              "spread": 12,
+              "easing": "exp-in"
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "speed",
+              "direction": 28,
+              "density": 65
+            }
+          ]
+        },
+        {
+          "order": 10,
+          "x": 17,
+          "y": 801,
+          "w": 477,
+          "h": 184,
+          "sfx": [
+            {
+              "text": "スゥ",
+              "style": "soft",
+              "scale": 90,
+              "rotation": -20,
+              "weight": "light",
+              "bleed": false,
+              "posX": 520,
+              "posY": 450,
+              "scaleStart": 120,
+              "scaleEnd": 60,
+              "spread": 8
+            }
+          ],
+          "effectLines": [
+            {
+              "kind": "speed",
+              "direction": 250,
+              "density": 50
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pageNum": 0,
+      "pageTitle": "効果線 10 / effect lines (effectLines)",
+      "printGeometry": {
+        "trimSize": "b5",
+        "bleedPermille": 17,
+        "safeTop": 40,
+        "safeRight": 40,
+        "safeBottom": 40,
+        "safeLeft": 40,
+        "gutterPermille": 13
+      },
+      "_showGaze": false,
+      "_showPath": false,
+      "_showShotBox": false,
+      "panels": [
+        {
+          "order": 1,
+          "x": 508,
+          "y": 17,
+          "w": 475,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "focus",
+              "centerX": 500,
+              "centerY": 400,
+              "density": 72,
+              "coverage": "radial"
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "x": 17,
+          "y": 17,
+          "w": 477,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "speed",
+              "direction": 0,
+              "density": 70,
+              "coverage": "band"
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "x": 508,
+          "y": 213,
+          "w": 475,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "vertical",
+              "density": 55
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "x": 17,
+          "y": 213,
+          "w": 477,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "flash",
+              "centerX": 500,
+              "centerY": 460,
+              "density": 60,
+              "coverage": "radial"
+            }
+          ]
+        },
+        {
+          "order": 5,
+          "x": 508,
+          "y": 409,
+          "w": 475,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "shock",
+              "centerX": 500,
+              "centerY": 500,
+              "density": 66
+            }
+          ]
+        },
+        {
+          "order": 6,
+          "x": 17,
+          "y": 409,
+          "w": 477,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "aura",
+              "density": 50,
+              "coverage": "edge"
+            }
+          ]
+        },
+        {
+          "order": 7,
+          "x": 508,
+          "y": 605,
+          "w": 475,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "motion-blur",
+              "direction": 28,
+              "density": 55
+            }
+          ]
+        },
+        {
+          "order": 8,
+          "x": 17,
+          "y": 605,
+          "w": 477,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "explosion",
+              "centerX": 520,
+              "centerY": 500,
+              "density": 72
+            }
+          ]
+        },
+        {
+          "order": 9,
+          "x": 508,
+          "y": 801,
+          "w": 475,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "sparkle",
+              "density": 40
+            }
+          ]
+        },
+        {
+          "order": 10,
+          "x": 17,
+          "y": 801,
+          "w": 477,
+          "h": 184,
+          "effectLines": [
+            {
+              "kind": "speed",
+              "direction": 90,
+              "density": 66,
+              "coverage": "band"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pageNum": 0,
+      "pageTitle": "トーン 10 / screentone (tones)",
+      "printGeometry": {
+        "trimSize": "b5",
+        "bleedPermille": 17,
+        "safeTop": 40,
+        "safeRight": 40,
+        "safeBottom": 40,
+        "safeLeft": 40,
+        "gutterPermille": 13
+      },
+      "_showGaze": false,
+      "_showPath": false,
+      "_showShotBox": false,
+      "panels": [
+        {
+          "order": 1,
+          "x": 508,
+          "y": 17,
+          "w": 475,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "dot-flat",
+              "density": 50,
+              "mood": "mood"
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "x": 17,
+          "y": 17,
+          "w": 477,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "dot-gradient",
+              "density": 60,
+              "mood": "depth"
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "x": 508,
+          "y": 213,
+          "w": 475,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "hatch",
+              "density": 55,
+              "angle": 45,
+              "mood": "shadow"
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "x": 17,
+          "y": 213,
+          "w": 477,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "cross-hatch",
+              "density": 62,
+              "mood": "menace"
+            }
+          ]
+        },
+        {
+          "order": 5,
+          "x": 508,
+          "y": 409,
+          "w": 475,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "gradient-linear",
+              "density": 50,
+              "angle": 90,
+              "mood": "depth"
+            }
+          ]
+        },
+        {
+          "order": 6,
+          "x": 17,
+          "y": 409,
+          "w": 477,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "solid-black",
+              "density": 100,
+              "regionX": 150,
+              "regionY": 250,
+              "regionW": 700,
+              "regionH": 640,
+              "mood": "shadow"
+            }
+          ]
+        },
+        {
+          "order": 7,
+          "x": 508,
+          "y": 605,
+          "w": 475,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "flash-white",
+              "density": 40,
+              "mood": "focus"
+            }
+          ]
+        },
+        {
+          "order": 8,
+          "x": 17,
+          "y": 605,
+          "w": 477,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "flashback",
+              "density": 45,
+              "mood": "flashback"
+            }
+          ]
+        },
+        {
+          "order": 9,
+          "x": 508,
+          "y": 801,
+          "w": 475,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "sparkle",
+              "density": 35,
+              "mood": "shoujo"
+            }
+          ]
+        },
+        {
+          "order": 10,
+          "x": 17,
+          "y": 801,
+          "w": 477,
+          "h": 184,
+          "tones": [
+            {
+              "kind": "noise",
+              "density": 60,
+              "mood": "menace"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "pageNum": 0,
+      "pageTitle": "フォント 10 / lettering font roles (font)",
+      "printGeometry": {
+        "trimSize": "b5",
+        "bleedPermille": 17,
+        "safeTop": 40,
+        "safeRight": 40,
+        "safeBottom": 40,
+        "safeLeft": 40,
+        "gutterPermille": 13
+      },
+      "_showGaze": false,
+      "_showPath": false,
+      "_showShotBox": false,
+      "panels": [
+        {
+          "order": 1,
+          "x": 508,
+          "y": 17,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "標準セリフ",
+                "アンチゴチ"
+              ],
+              "text": "標準セリフアンチゴチ",
+              "shape": "round",
+              "font": "antigochi",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "x": 17,
+          "y": 17,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "強調・ナレ",
+                "ゴシック体"
+              ],
+              "text": "強調・ナレゴシック体",
+              "shape": "round",
+              "font": "gothic",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "x": 508,
+          "y": 213,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "独白・地の文",
+                "明朝体"
+              ],
+              "text": "独白・地の文明朝体",
+              "shape": "round",
+              "font": "mincho",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "x": 17,
+          "y": 213,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "回想・荘厳",
+                "太明朝"
+              ],
+              "text": "回想・荘厳太明朝",
+              "shape": "round",
+              "font": "bold-mincho",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 5,
+          "x": 508,
+          "y": 409,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "優しい・日常",
+                "丸ゴシック"
+              ],
+              "text": "優しい・日常丸ゴシック",
+              "shape": "round",
+              "font": "maru",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 6,
+          "x": 17,
+          "y": 409,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "手紙・学校",
+                "教科書体"
+              ],
+              "text": "手紙・学校教科書体",
+              "shape": "round",
+              "font": "kyokasho",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 7,
+          "x": 508,
+          "y": 605,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "和風・力強",
+                "筆/楷書"
+              ],
+              "text": "和風・力強筆/楷書",
+              "shape": "round",
+              "font": "brush",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 8,
+          "x": 17,
+          "y": 605,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "小声・心の声",
+                "手書き風"
+              ],
+              "text": "小声・心の声手書き風",
+              "shape": "round",
+              "font": "handwritten",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 9,
+          "x": 508,
+          "y": 801,
+          "w": 475,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "電子・SMS",
+                "デジタル角"
+              ],
+              "text": "電子・SMSデジタル角",
+              "shape": "round",
+              "font": "digital",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        },
+        {
+          "order": 10,
+          "x": 17,
+          "y": 801,
+          "w": 477,
+          "h": 184,
+          "bubbles": [
+            {
+              "lines": [
+                "恐怖・不穏",
+                "ホラー震え"
+              ],
+              "text": "恐怖・不穏ホラー震え",
+              "shape": "round",
+              "font": "horror",
+              "posX": 500,
+              "posY": 430,
+              "sizeW": 740,
+              "sizeH": 560,
+              "tailX": 500,
+              "tailY": 910,
+              "writingMode": "vertical-rtl",
+              "order": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

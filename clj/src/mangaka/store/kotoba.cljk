@@ -1,0 +1,127 @@
+(ns mangaka.store.kotoba
+  "kotoba-datomic backend over XRPC — JVM-only.
+
+  Ports the client shape from the Python reference
+  `lg_yatabase/lg_yatabase/kotoba_datomic.py`:
+
+    - endpoint   KOTOBA_XRPC_URL (default in-cluster kotoba svc)
+    - graph      content-addressed CID for a label (KOTOBA_GRAPH)
+    - auth       Bearer (KOTOBA_BEARER); edge BFF is the trust boundary
+    - transact   POST {nsid}.transact  {graph, tx_edn}
+    - query      POST {nsid}.q         {graph, query_edn}
+
+  Uses the three datomic endpoints the Python reference exposes —
+  `.transact`, `.q` and `.pull` (pull returns the entity as `entity_edn`,
+  so nested component pulls like the decomposed storyboard work
+  server-side). The query/decode logic is factored into pure functions
+  (testable without a network) and the transport (`post-fn`) is injected
+  into the record, so a fake kotoba server can drive the full store in
+  tests."
+  (:require [mangaka.store :as store]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [org.httpkit.client :as http]
+            [jsonista.core :as j]))
+
+(def ^:private nsid
+  (or (System/getenv "KOTOBA_DATOMIC_NSID") "com.etzhayyim.apps.kotoba.datomic"))
+
+(defn- endpoint [] (str/replace (or (System/getenv "KOTOBA_XRPC_URL")
+                                    (System/getenv "KOTOBA_URL")
+                                    "http://kotoba.kotoba.svc.cluster.local:8080")
+                                #"/+$" ""))
+
+(defn- headers []
+  (let [tok (System/getenv "KOTOBA_BEARER")]
+    (cond-> {"content-type" "application/json"}
+      tok (assoc "authorization" (str "Bearer " tok)))))
+
+(defn http-post!
+  "Default transport: POST {endpoint}/xrpc/{nsid}.{method} with a JSON body,
+  returns the decoded JSON response (keyword keys). Throws on transport or
+  non-2xx errors."
+  [method body]
+  (let [{:keys [status body error]}
+        @(http/post (str (endpoint) "/xrpc/" nsid "." method)
+                    {:headers (headers) :body (j/write-value-as-string body)})]
+    (when error (throw (ex-info "kotoba XRPC transport error" {:method method :error error})))
+    (when-not (<= 200 status 299)
+      (throw (ex-info "kotoba XRPC error" {:method method :status status :body body})))
+    (j/read-value body j/keyword-keys-object-mapper)))
+
+;; ───────────────────────── pure helpers ─────────────────────────
+
+(defn coll-find?
+  "True when a query's :find is a collection form `[?x ...]` (→ flat coll).
+  The find spec is the element after :find (not the first of the query)."
+  [query]
+  (let [spec (second (drop-while #(not= :find %) query))]
+    (boolean (and (vector? spec) (= '... (second spec))))))
+
+(defn decode-cell
+  "Decodes one `rows_edn` cell. Mirrors the Python reference
+  `kotoba_datomic.parse_edn_value`: kotoba returns every cell as an
+  EDN-encoded string — a quoted string is unescaped to its value,
+  true/false/nil and numbers are parsed, and everything else (keywords,
+  collections) is kept as the raw string. Notably it does NOT read
+  keywords/maps into objects — that keeps EDN string payloads (e.g. a
+  serialized :doc/body) intact rather than re-parsing them."
+  [x]
+  (if-not (string? x)
+    x
+    (cond
+      (and (>= (count x) 2) (str/starts-with? x "\"") (str/ends-with? x "\""))
+      (-> (subs x 1 (dec (count x)))
+          (str/replace "\\\"" "\"")
+          (str/replace "\\\\" "\\"))
+      (= x "true")  true
+      (= x "false") false
+      (= x "nil")   nil
+      (re-matches #"[-+]?\d+" x)        (parse-long x)
+      (re-matches #"[-+]?\d+\.\d+" x)   (parse-double x)
+      :else x)))
+
+(defn shape-rows
+  "Decodes raw `.q` rows and shapes them per the query's :find form:
+  a collection find yields a flat vector; otherwise a set of tuples."
+  [query rows]
+  (let [rows (mapv (fn [row] (if (sequential? row) (mapv decode-cell row) (decode-cell row))) rows)]
+    (if (and (coll-find? query) (every? sequential? rows))
+      (vec (map first rows))
+      (set rows))))
+
+;; ───────────────────────── store ─────────────────────────
+
+(defrecord KotobaStore [graph post-fn]
+  store/Store
+  (-transact! [_ tx-data]
+    (post-fn "transact" {:graph graph :tx_edn (pr-str (vec tx-data))}))
+
+  (-q [_ query]
+    ;; kotoba `.q` replies {:rows_edn [[edn-string …] …]} (see the Python
+    ;; reference); tolerate :rows as a fallback alias.
+    (let [{:keys [rows_edn rows]} (post-fn "q" {:graph graph :query_edn (pr-str query)})]
+      (shape-rows query (or rows_edn rows))))
+
+  (-pull [_ pattern eid]
+    ;; `.pull` returns the (possibly nested) entity as `entity_edn`, so
+    ;; component pulls like the decomposed storyboard reconstruct server-side.
+    (let [{:keys [entity_edn entity]} (post-fn "pull" {:graph graph
+                                                       :entity (pr-str eid)
+                                                       :pattern_edn (pr-str pattern)})]
+      (some-> (or entity_edn entity) edn/read-string)))
+
+  (-read-string [_ s] (edn/read-string s)))
+
+(defn graph-label->cid
+  "Pass through if already a CID-shaped label, else use the label as-is.
+  (The server resolves label→CID; we keep the configured label.)"
+  [label] label)
+
+(defn kotoba-store
+  "Builds a kotoba-datomic store from env (KOTOBA_GRAPH label). `post-fn`
+  defaults to the live HTTP transport; inject a fake for tests."
+  ([] (kotoba-store http-post!))
+  ([post-fn]
+   (->KotobaStore (graph-label->cid (or (System/getenv "KOTOBA_GRAPH") "mangaka-storyboard-v1"))
+                  post-fn)))

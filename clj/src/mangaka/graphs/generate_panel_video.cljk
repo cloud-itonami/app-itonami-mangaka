@@ -1,0 +1,120 @@
+(ns mangaka.graphs.generate-panel-video
+  "mangakaGeneratePanelFromVideo — an alternative panel-generation pipeline
+  that does NOT start from an image. Where mangaka.graphs.generate-panel /
+  generate-panel-quality txt2img a still directly (mangaka.comfy), this
+  graph generates a short seedance video clip (mangaka.video, cloud-murakumo
+  :seedance engine, ADR-2607170500) and samples several candidate stills
+  back out of it, then picks a winner with the SAME 8-axis rubric critique
+  generate-panel-quality uses (mangaka.critique, shared so scores are
+  comparable across pipelines):
+
+    plan -> generate-video -> sample-frames -> critique -> persist
+
+  Additive, not a replacement: the existing generate-panel/*-loop/*-quality/
+  coscientist-panel txt2img graphs are untouched and remain the default.
+  This is a new, explicitly-invoked NSID a caller opts into per-panel or via
+  the scripts/production-loop-video.cljk operator loop.
+
+  plan* is reused unmodified from mangaka.graphs.generate-panel (:doc-id +
+  :panel-index storyboard-aware, or free-form :prompt) so the SAME
+  storyboard/tags/scene prompt composition drives both pipelines. Persisted
+  panels land in the exact same :panel/* shape as generate-panel (plus
+  seedance provenance fields), so mangakaGeneratePage / composeKomawari's
+  existing page-assembly step consumes a video-sourced panel with zero
+  changes -- it only ever reads :panel/image-b64 / :panel/image-key."
+  (:require [mangaka.blob :as blob]
+            [mangaka.critique :as critique]
+            [mangaka.graphs.generate-panel :as panel]
+            [mangaka.perception :as perception]
+            [mangaka.store :as store]
+            [mangaka.video :as video]
+            [langgraph.graph :as g]))
+
+(def ^:private default-frame-count video/default-frame-count)
+(def ^:private default-duration-sec video/default-duration-sec)
+
+(defn- offload
+  "Same offload-to-blob-store shape as mangaka.graphs.gen / *-quality (kept
+  local so node fns don't reach into another ns's private helper)."
+  [blobs {:keys [image-b64 mime] :as m}]
+  (if (and blobs image-b64)
+    (let [k (blob/put! blobs image-b64 mime)]
+      (assoc m :image-key k :image-url (str "/blob/" k)))
+    m))
+
+(defn- score-frame
+  "Act->Observe for one sampled frame: vision-critique it against the shared
+  rubric, then augment with the perception axes (:facePresence). Score
+  preference: axes aggregate, else the model's own :score, else nil (= no
+  signal, same offline discipline as generate-panel-quality)."
+  [critique-fn detect-fn spec frame]
+  (let [img (:image-b64 frame)
+        verdict (critique-fn spec img)
+        axes (perception/augment-axes (:axes verdict) spec img detect-fn)]
+    (merge {:spec spec :score nil :axes nil :notes "no vision model (offline/mock)"
+            :image-b64 (:image-b64 frame) :mime (:mime frame) :time-ms (:time-ms frame)}
+           verdict
+           {:axes axes :score (or (critique/aggregate-score axes) (:score verdict))})))
+
+(defn make
+  "opts (optional, injectable for deterministic tests -- same shape as
+  generate-panel-quality):
+   {:video-fn  (fn [{:keys [prompt model duration-sec size]}] -> video/generate-video! shape)
+    :frames-fn (fn [{:keys [video-file prompt n]}] -> video/sample-frames! shape)
+    :critique-fn (fn [spec image-b64] -> verdict-map|nil)
+    :detect-fn   (fn [image-b64] -> faces|nil)}"
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [video-fn frames-fn critique-fn detect-fn]}]
+   (let [video-fn (or video-fn video/generate-video!)
+         frames-fn (or frames-fn video/sample-frames!)
+         critique-fn (or critique-fn critique/default-critique-fn)]
+     (-> (g/state-graph {:channels {:input {} :spec {} :video {} :candidates {} :result {}}})
+         (g/add-node :plan
+                     (fn [{:keys [input]}] {:spec (panel/plan* store input)}))
+         (g/add-node :generate-video
+                     (fn [{:keys [input spec]}]
+                       {:video (video-fn {:prompt (:prompt spec)
+                                          :model (:video-model input)
+                                          :duration-sec (or (:duration-sec input) default-duration-sec)
+                                          :size (:video-size input)})}))
+         (g/add-node :sample-frames
+                     (fn [{:keys [input spec video]}]
+                       (let [frames (frames-fn {:video-file (:video-file video)
+                                                :prompt (:prompt spec)
+                                                :n (or (:frame-count input) default-frame-count)})]
+                         {:candidates (mapv #(score-frame critique-fn detect-fn spec %) frames)})))
+         (g/add-node :persist
+                     (fn [{:keys [input spec video candidates]}]
+                       (let [best (offload blobs (critique/best-of candidates))
+                             idx (or (:panel-index input) (:index input))
+                             pid (or (:panel-id input)
+                                     (when (:doc-id input) (str "panel-" (:doc-id input) "-" idx))
+                                     (str "panel-" (hash [(:prompt spec) (:time-ms best)])))]
+                         (store/save-panel!
+                          store {:id pid :doc-id (:doc-id input) :index idx
+                                 :prompt (:prompt spec) :model (:model spec)
+                                 :score (:score best)
+                                 :critique (pr-str {:axes (:axes best) :notes (:notes best)})
+                                 :image-key (:image-key best)
+                                 :image-b64 (when-not (:image-key best) (:image-b64 best))
+                                 :image-mime (or (:mime best) "image/png")
+                                 :source "seedance-frame-sample"
+                                 :video-model (:model video)
+                                 :video-source (:source video)
+                                 :video-error (:error video)
+                                 :frame-time-ms (:time-ms best)
+                                 :frame-count (count candidates)})
+                         {:result {:panel-id pid :doc-id (:doc-id input) :index idx
+                                   :best best :candidates candidates
+                                   :video-source (:source video) :video-error (:error video)
+                                   :image-b64 (:image-b64 best) :image-key (:image-key best)
+                                   :image-url (:image-url best) :mime (:mime best)}})))
+         (g/set-entry-point :plan)
+         (g/add-edge :plan :generate-video)
+         (g/add-edge :generate-video :sample-frames)
+         (g/add-edge :sample-frames :persist)
+         (g/set-finish-point :persist)
+         (g/compile-graph)))))
+
+(defn handler [compiled]
+  (fn [input _thread-id] (:result (g/invoke compiled {:input input}))))

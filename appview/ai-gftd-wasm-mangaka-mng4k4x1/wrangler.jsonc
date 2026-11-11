@@ -1,0 +1,39 @@
+{
+  "name": "magatama-mng4k4x1",
+  "main": "src/app.cljc",
+  "compatibility_date": "2025-03-17",
+  "compatibility_flags": ["nodejs_compat", "nodejs_als"],
+  "assets": {
+    "directory": "./svelte/build",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "single-page-application"
+  },
+  "vars": {
+    "APP_ACTOR_HANDLE": "mangaka",
+    "APP_CAPABILITIES": "[\"edge-assets\",\"bpmn-dispatch\"]",
+    "APP_DESCRIPTION": "Thin Cloudflare edge facade for Mangaka. Page, panel, scene-3d, cine pipeline, and Hume-emotion business logic runs in AgentGateway MCP + pod-side LangServer workers. Domain data persists to Cloudflare D1 (ai-gftd-mangaka) via the internal /_d1 endpoint.",
+    "APP_DISPLAY_NAME": "Mangaka",
+    "APP_FRAMEWORK": "ts-native",
+    "APP_NANOID": "mng4k4x1",
+    "APP_PERFORMER_TYPE": "service",
+    "APP_UI_TYPE": "appview"
+  },
+  // Domain data on Cloudflare D1 (RW decommission 2026-06-11). The pod posts
+  // to /_d1 (svelte/src/routes/_d1/+server.cljc) which binds MANGAKA_DB.
+  // database_id: fill after `wrangler d1 create ai-gftd-mangaka`.
+  "d1_databases": [
+    { "binding": "MANGAKA_DB", "database_name": "ai-gftd-mangaka", "database_id": "534176d4-980b-44d9-ad09-0e3e0ff327d9" }
+  ],
+  "services": [
+    { "binding": "PDS_SERVICE", "service": "ai-gftd-pds-2603241700" },
+    { "binding": "PDS_RPC", "service": "ai-gftd-pds-2603241700", "entrypoint": "PdsRPC" }
+  ],
+  "secrets_store_secrets": [
+    { "binding": "DISPATCHER_INTERNAL_SECRET", "store_id": "1824561668fe47cc9127d493961885af", "secret_name": "dispatcher_internal_secret" }
+  ],
+  "routes": [
+    { "pattern": "mng4k4x1.gftd.ai/*", "zone_name": "gftd.ai" },
+    { "pattern": "mangaka.gftd.ai/*", "zone_name": "gftd.ai" }
+  ]
+}

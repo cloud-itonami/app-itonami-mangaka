@@ -1,0 +1,30 @@
+(ns mangaka.layout.komawari
+  "コマ割り (komawari / panel-division) design — proposes panel geometry
+  (:panel/rect :panel/tilt :panel/polygon :panel/z :panel/bleed) for a page
+  from an authored beat sequence.
+
+  ADR-2607141700: this namespace's algorithm (golden-ratio proportional
+  weighting, force-line row-shear, named artist styles (:toriyama/:togashi;
+  :araki/:urasawa/:inoue added by ADR-2607172200),
+  panel-in-panel frame-break inset, the deterministic governor) was
+  developed and proven here against real Ghost Hacker Arc0-1 panels
+  (ADR-2607051520/2607051530), then ported to `kotoba-lang/kami-mangaka-page`
+  as `kami.mangaka.komawari` so `app-aozora` and any other `kami-mangaka-page`
+  consumer share one implementation instead of independent copies. This
+  namespace is now a thin re-export of that canonical implementation — see
+  `kami.mangaka.komawari` for the full algorithm docstrings and
+  implementation. Kept as a separate ns (rather than deleting it and
+  updating every caller in this repo to `kami.mangaka.komawari` directly) so
+  `mangaka.graphs.compose-komawari` and this repo's own
+  `mangaka.layout.komawari-test` keep working unchanged."
+  (:require [kami.mangaka.komawari :as k]))
+
+(def phi k/phi)
+(def styles k/styles)
+(def default-style k/default-style)
+(def beat-weight k/beat-weight)
+(def tilt-for k/tilt-for)
+(def row-tilt k/row-tilt)
+(def apply-inset k/apply-inset)
+(def propose-page-layout k/propose-page-layout)
+(def validate-layout k/validate-layout)

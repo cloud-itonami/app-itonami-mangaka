@@ -1,0 +1,22 @@
+;; mangaka-reader — cljs Worker build.
+;; test:   npm test      (cljs.test → out/node-tests.js)
+;; build:  npm run build (amu compile --target wasm32-browser worker → dist/worker.js)
+;; deploy: npm run deploy
+{:deps true
+
+ :builds
+ {:worker
+  {:target :esm
+   :output-dir "dist"
+   :modules {:worker {:exports {default mangaka-reader.worker/handler}}}}
+
+  ;; mangaka.gftd.ai retirement redirect (deployed from ../redirect)
+  :redirect
+  {:target :esm
+   :output-dir "../redirect/dist"
+   :modules {:redirect {:exports {default mangaka-reader.redirect/handler}}}}
+
+  :test
+  {:target :node-test
+   :output-to "out/node-tests.js"
+   :ns-regexp "-test$"}}}

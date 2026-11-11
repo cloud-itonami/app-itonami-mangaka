@@ -1,0 +1,198 @@
+(ns mangaka.py-port-test
+  "Golden-fixture tests for the pure-logic ports from the pruned Python tree
+   (../lg, removed 2026-07-07). Every expected value below was produced by
+   running the original Python modules (lg_mangaka.{recipe_fingerprint,
+   engagement_metric,v11_tensor_score,v10_pipeline_router,v11_page_layout,
+   style_registry}) immediately before the prune — see the fixture generation
+   script output recorded in the port commit."
+  (:require [kotoba.lang.text] [clojure.test :refer [deftest is testing]]
+            [mangaka.layout :as layout]
+            [mangaka.metrics :as metrics]
+            [mangaka.recipe :as recipe]
+            [mangaka.style-registry :as style]))
+
+(defn- approx= [a b] (< (Math/abs (- (double a) (double b))) 1e-9))
+
+;; ── recipe_fingerprint.py ───────────────────────────────────────────────────
+
+(deftest fingerprint-golden
+  (is (= "61766e19740a12fd"
+         (recipe/fingerprint {"style_tags" "B, a , c" "negative" "x"
+                              "cfg" 7 "sampler" "dpmpp_2m_sde"})))
+  (testing "extra_prompt and seed are excluded; cfg accepts numeric strings"
+    (is (= "ecf61b488a3323e1"
+           (recipe/fingerprint {"style_tags" "masterpiece, best quality, monochrome, manga"
+                                "negative" "low quality, bad hands"
+                                "cfg" "7.0" "sampler" "euler_a"
+                                "extra_prompt" "ignored" "seed" 42}))))
+  (testing "all-nil levers"
+    (is (= "2d888cff1bc41186"
+           (recipe/fingerprint {"style_tags" nil "negative" nil "cfg" nil "sampler" nil}))))
+  (testing "tag sort/trim/lower + cfg half-even rounding (6.75 → 6.8)"
+    (is (= "a455ba17f530529c"
+           (recipe/fingerprint {"style_tags" "A,b" "negative" "n1, N2"
+                                "cfg" 6.75 "sampler" "DPM++"})))))
+
+(deftest ledger-pure-parts
+  (let [r   {"style_tags" "A,b" "negative" "n1, N2" "cfg" 6.75 "sampler" "DPM++"}
+        row (recipe/ledger-row r {:work-rkey "w1" :post-uri "at://p/1" :ts "2026-07-07T00:00:00Z"})]
+    (is (= "a455ba17f530529c" (get row "fingerprint")))
+    (is (= ["at://p/1"]
+           (recipe/post-uris-for [row {"fingerprint" "ffff" "post_uri" "at://other"}]
+                                 "a455ba17f530529c")))))
+
+;; ── engagement_metric.py ────────────────────────────────────────────────────
+
+(deftest wilson-golden
+  (is (approx= 0.20654329147389294 (metrics/wilson-lower-bound 1 1)))
+  (is (approx= 0.963005192523998   (metrics/wilson-lower-bound 100 100)))
+  (is (approx= 0.30063605244263664 (metrics/wilson-lower-bound 3 4)))
+  (is (approx= 0.4512336165999552  (metrics/wilson-lower-bound 200 400)))
+  (is (= 0.0 (metrics/wilson-lower-bound 0 0))))
+
+(deftest reaction-fitness-golden
+  (is (= 12.1 (metrics/reaction-fitness {:likes 10 :reposts 2 :replies 3 :impressions 100})))
+  (is (= 30.1 (metrics/reaction-fitness {:likes 3 :impressions 4})))
+  (is (= 64.2 (metrics/reaction-fitness {:likes 5})))
+  (is (nil? (metrics/reaction-fitness {})))
+  (is (= 68.4 (metrics/reaction-fitness {:likes 50 :reposts 20 :replies 10
+                                         :impressions 200 :influence 1.5})))
+  (testing "influence clamped to [0.5, 2.0]"
+    (is (= 6.3 (metrics/reaction-fitness {:likes 2 :reposts 1 :impressions 50 :influence 99})))))
+
+(deftest reaction-trustworthy-golden
+  (is (true?  (metrics/reaction-trustworthy? 30)))
+  (is (false? (metrics/reaction-trustworthy? 29)))
+  (is (true?  (metrics/reaction-trustworthy? nil 31)))
+  (is (false? (metrics/reaction-trustworthy? nil 5))))
+
+(deftest merge-recordlog-rows-golden
+  (is (= {"at://a/p/1" {:likes 3 :reposts 0 :replies 0 :views nil}
+          "at://a/p/2" {:likes 4 :reposts 0 :replies 2 :views nil}}
+         (metrics/merge-recordlog-rows
+          ["at://a/p/1" "at://a/p/2"]
+          [{"p" "at://a/p/1" "collection" "app.bsky.feed.like" "n" 3}
+           {"p" "at://a/p/1" "collection" "app.bsky.feed.repost" "n" -2}   ; net<0 clamped
+           {"p" "at://a/p/2" "collection" "app.bsky.feed.like" "n" "4"}    ; stringly n
+           {"p" "at://zzz" "collection" "app.bsky.feed.like" "n" 9}]       ; unknown uri
+          [{"p" "at://a/p/2" "n" 2} {"p" "at://a/p/1" "n" nil}]))))
+
+;; ── v11_tensor_score.py ─────────────────────────────────────────────────────
+
+(def ^:private fake-panels
+  [{"scores" {"line_clarity" 9 "character_anatomy" 8 "panel_dynamism" 6
+              "sfx_text" 0 "manga_authenticity" 9}}
+   {"scores" {"line_clarity" 9 "character_anatomy" 9 "panel_dynamism" 9
+              "sfx_text" 10 "manga_authenticity" 9}}
+   {"scores" {"line_clarity" 8 "character_anatomy" 9 "panel_dynamism" 7
+              "sfx_text" 4 "manga_authenticity" 9}}])
+
+(deftest page-tensor-score-golden
+  (is (= {:total 85.8 :mean 7.67 :style-variance 0.148 :dynamism-variance 9.222
+          :anchor-strength 1.333 :n-panels 3 :n-axes 5 :weighted false}
+         (metrics/page-tensor-score fake-panels)))
+  (is (= {:total 85.3 :mean 7.62 :style-variance 0.142 :dynamism-variance 10.267
+          :anchor-strength 1.384 :n-panels 3 :n-axes 5 :weighted true}
+         (metrics/page-tensor-score fake-panels {:panel-importance [1.0 0.85 0.6]})))
+  (is (= {:total 0 :error "no scores"} (metrics/page-tensor-score []))))
+
+(deftest panel-importance-golden
+  (is (= [1.0 0.51 0.36 1.0 0.75 0.7]
+         (metrics/panel-importance-from-manifest
+          [{"panelLayout" {"gh:emphasis" "impact"} "shot" "Wide" "focusedCharacters" ["a"]}
+           {"panelLayout" {"gh:emphasis" "beat"} "shot" "Insert" "focusedCharacters" []}
+           {"panelLayout" {} "shot" "insert shot" "focusedCharacters" []}
+           {"panelLayout" {"gh:emphasis" "punchline"} "shot" "close" "focusedCharacters" ["b"]}
+           {"panelLayout" {"gh:emphasis" "transition"} "shot" "" "focusedCharacters" []}
+           {"panelLayout" {"gh:emphasis" "establish"} "shot" "wide" "focusedCharacters" []}]))))
+
+;; ── v10_pipeline_router.py ──────────────────────────────────────────────────
+
+(def ^:private router-panels
+  [{"tone" "Shock" "shot" "close" "focusedCharacters" ["a"]}
+   {"tone" "calm" "shot" "Wide Establishing" "focusedCharacters" []}
+   {"tone" "calm" "shot" "extreme close-up" "focusedCharacters" []}
+   {"tone" "calm" "shot" "medium" "focusedCharacters" ["a"]}
+   {"panel_pipeline" "cu_ink" "tone" "action" "shot" "wide" "focusedCharacters" []}])
+
+(deftest select-pipeline-golden
+  (is (= ["cu_action" "cu_color_usd" "cu_color" "cu_color" "cu_ink"]
+         (mapv layout/select-pipeline router-panels))))
+
+(deftest select-pipeline-for-preset-golden
+  (is (= ["cu_action" "cu_ink_usd" "cu_ink" "cu_ink" "cu_ink"]
+         (mapv #(layout/select-pipeline-for-preset % "ghosthacker") router-panels)))
+  (testing "unknown preset falls back to jump_global_golden"
+    (is (= "cu_color_usd"
+           (layout/select-pipeline-for-preset (nth router-panels 1) "nonexistent")))))
+
+;; ── v11_page_layout.py ──────────────────────────────────────────────────────
+
+(deftest detect-page-layout-type-golden
+  (is (= "single_dramatic"
+         (layout/detect-page-layout-type
+          [{"panelLayout" {"gh:emphasis" "establish"} "pageTitle" "Opener"}])))
+  (is (= "action_sequence"
+         (layout/detect-page-layout-type
+          (into (vec (repeat 3 {"panelLayout" {"gh:emphasis" "impact"} "tone" "action"}))
+                [{"panelLayout" {"gh:emphasis" "beat"} "tone" "tense"}
+                 {"panelLayout" {} "tone" "calm"}]))))
+  (is (= "dialogue_heavy"
+         (layout/detect-page-layout-type
+          (vec (repeat 4 {"panelLayout" {} "dialogues" [{"text" "hi"}]})))))
+  (is (= "standard_grid"
+         (layout/detect-page-layout-type (vec (repeat 3 {"panelLayout" {}})))))
+  (is (= "standard_grid" (layout/detect-page-layout-type []))))
+
+(deftest apply-page-layout-override-golden
+  (testing "single_dramatic: setdefault semantics — explicit gh:size preserved"
+    (is (= [{"panelLayout" {"gh:size" "small" "gh:bleed" "full"
+                            "gh:row" 1 "gh:colSpan" 6 "gh:rowSpan" 6}}]
+           (layout/apply-page-layout-override
+            [{"panelLayout" {"gh:size" "small"}}] "single_dramatic"))))
+  (testing "action_sequence: impact+action tilts/bleeds, punchline bleeds bottom"
+    (is (= [{"panelLayout" {"gh:emphasis" "impact" "gh:angle" -8 "gh:bleed" "right"}
+             "tone" "action"}
+            {"panelLayout" {"gh:emphasis" "punchline" "gh:bleed" "bottom"}
+             "tone" "calm"}]
+           (layout/apply-page-layout-override
+            [{"panelLayout" {"gh:emphasis" "impact"} "tone" "action"}
+             {"panelLayout" {"gh:emphasis" "punchline"} "tone" "calm"}]
+            "action_sequence")))))
+
+(deftest page-arc-summary-golden
+  (is (= "Single dramatic page: Opener"
+         (layout/page-arc-summary [{"pageTitle" "Opener"}] "single_dramatic")))
+  (is (= "Story page" (layout/page-arc-summary [{"panelLayout" {}}] "standard_grid")))
+  (is (= "" (layout/page-arc-summary [] "anything"))))
+
+;; ── style_registry.py (resolve over data/style-registry.edn) ────────────────
+
+(deftest style-registry-golden
+  (let [reg (style/load-registry)]
+    (testing "work override + wide shot modifier"
+      (let [r (style/resolve-style reg {:work-rkey "yamainu-1" :shot "wide"})]
+        (is (= :sumi-e-gritty (:profile r)))
+        (is (= :ink (:mode r)))
+        (is (= 7.0 (:cfg r)))
+        (is (= (str "masterpiece, best quality, monochrome, manga, traditional_media, "
+                    "sumi-e ink wash, heavy black ink, deep blacks, dramatic chiaroscuro, "
+                    "heavy cross-hatching, high-frequency texture, ink splatter, "
+                    "fine detailed linework, meiji era japan, wide establishing shot, "
+                    "clear readable composition, restrained ink splatter")
+               (:positive r)))))
+    (testing "genre mapping + closeup modifier"
+      (let [r (style/resolve-style reg {:genre "音楽×超常ドラマ" :shot "closeup"})]
+        (is (= :soft-watercolor (:profile r)))
+        (is (= :color (:mode r)))
+        (is (kotoba.lang.text/ends-with? (:positive r) "extreme close-up, intense detail, dramatic"))))
+    (testing "work override, no shot"
+      (let [r (style/resolve-style reg {:work-rkey "halfgram-1"})]
+        (is (= :bright-clean (:profile r)))
+        (is (= "dpmpp_2m_sde" (:sampler r)))))
+    (testing "unknown genre → default profile"
+      (let [r (style/resolve-style reg {:genre "unknown"})]
+        (is (= :cyber-noir-ink (:profile r)))
+        (is (= 7.5 (:cfg r)))
+        (is (= 30 (:steps r)))
+        (is (= "euler" (:sampler r)))))))

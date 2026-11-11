@@ -1,0 +1,97 @@
+(ns mangaka-reader.render-test
+  (:require [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [mangaka-reader.render :as render]))
+
+(def zankyo-row
+  {:rkey "zankyo-1"
+   :title "残響のカルテット"
+   :name nil
+   :props {:author "GFTD Mangaka AI" :series "第1話 遺品" :genre "音楽×超常ドラマ"
+           :pageCount 7 :logline "死者が最期に聴いた音を一度だけ再生できる調律師の少女。"}
+   :cover "zankyo-1-p01"})
+
+(deftest index-ssr-through-manga-viewer
+  (let [html (render/index-html [(render/row->index-work zankyo-row)])]
+    (testing "manga-viewer works-grid markup"
+      (is (str/includes? html "manga-viewer__grid"))
+      (is (str/includes? html "manga-viewer__card")))
+    (is (str/includes? html "残響のカルテット"))
+    (is (str/includes? html "href=\"/work/zankyo-1\""))
+    (is (str/includes? html "/img/zankyo-1-p01"))
+    (testing "genre splits into tags"
+      (is (str/includes? html ">音楽<"))
+      (is (str/includes? html ">超常ドラマ<")))
+    (testing "manga-viewer css is inlined"
+      (is (str/includes? html ".manga-viewer__thumb")))))
+
+(deftest reader-page-keeps-data-driven-parity
+  (let [html (render/work-html {:title "残響のカルテット" :author "GFTD Mangaka AI"}
+                               "{\"title\":\"残響のカルテット\",\"pages\":[]}")]
+    (is (str/includes? html "<title>残響のカルテット — Mangaka</title>"))
+    (is (str/includes? html "const DATA = {\"title\""))
+    (testing "mode buttons / zones / RTL hint survive verbatim"
+      (is (str/includes? html "id=\"m-spread\""))
+      (is (str/includes? html "id=\"z-left\""))
+      (is (str/includes? html "buildUnits"))
+      (is (str/includes? html "← 次へ")))))
+
+(deftest version-switch-bar
+  (testing "2 versions → bar with current highlighted + link to the other"
+    (let [html (render/work-html
+                {:title "Ghost Hacker" :author "GFTD Mangaka AI"
+                 :versions [{:rkey "gh-arc0-1" :label "v10 (python)" :current? true}
+                            {:rkey "gh-arc0-1-v11" :label "v11 (clj/edn)" :current? false}]}
+                "{}")]
+      (is (str/includes? html "class=\"versions\""))
+      (is (str/includes? html "v10 (python)"))
+      (is (str/includes? html "href=\"/work/gh-arc0-1-v11\""))))
+  (testing "single/no version → no bar (existing works unchanged)"
+    (is (not (str/includes? (render/work-html {:title "t" :author "a"} "{}")
+                            "class=\"versions\"")))
+    (is (not (str/includes? (render/work-html
+                             {:title "t" :author "a"
+                              :versions [{:rkey "x" :label "only" :current? true}]}
+                             "{}")
+                            "class=\"versions\"")))))
+
+(deftest html-escaping
+  (is (= "&lt;s&gt;&amp;&quot;" (render/esc "<s>&\"")))
+  (let [html (render/work-html {:title "<xss>" :author "a&b"} "{}")]
+    (is (not (str/includes? html "<xss>")))
+    (is (str/includes? html "&lt;xss&gt;"))))
+
+(deftest json-shapes-match-live-api
+  (let [w (render/work-json zankyo-row [{:n 1 :src "/img/zankyo-1-p01"}])]
+    (is (= "zankyo-1" (:rkey w)))
+    (is (= "音楽×超常ドラマ" (:genre w)))
+    (is (= 7 (:pageCount w)))
+    (is (= [{:n 1 :src "/img/zankyo-1-p01"}] (:pages w))))
+  (let [ws (render/works-json [zankyo-row])]
+    (is (= 1 (count (:works ws))))
+    (is (= "/img/zankyo-1-p01" (:cover (first (:works ws)))))))
+
+(deftest work-meta-update-rules
+  (testing "whitelisted string fields merge; others ignored"
+    (is (= {:author "A" :genre "G" :coverBlobKey "keep"}
+           (render/merge-work-props {:author "old" :coverBlobKey "keep"}
+                                    {:author "A" :genre "G" :coverBlobKey "evil" :pageCount 999}))))
+  (testing "title: blank keeps current, non-blank trims"
+    (is (= "current" (render/pick-title {:title "   "} "current")))
+    (is (= "new" (render/pick-title {:title " new "} "current")))
+    (is (= "current" (render/pick-title {} "current")))))
+
+(deftest page-blobkey-update-rules
+  (testing "only blobKey merges; blank/absent keeps props"
+    (is (= {:workRkey "zankyo-1" :blobKey "zankyo-1-p01-v2"}
+           (render/merge-page-props {:workRkey "zankyo-1" :blobKey "zankyo-1-p01"}
+                                    {:blobKey " zankyo-1-p01-v2 " :workRkey "evil"})))
+    (is (= {:blobKey "keep"}
+           (render/merge-page-props {:blobKey "keep"} {:blobKey "  "})))
+    (is (= {} (render/merge-page-props nil {})))))
+
+(deftest page-path-parsing
+  (is (= {:rkey "zankyo-1" :page-number 3}
+         (render/parse-page-path "/api/work/zankyo-1/page/3")))
+  (is (nil? (render/parse-page-path "/api/work/zankyo-1")))
+  (is (nil? (render/parse-page-path "/api/work/zankyo-1/page/x"))))

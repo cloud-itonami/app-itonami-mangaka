@@ -1,0 +1,95 @@
+(ns mangaka.generate-panel-video-test
+  "mangakaGeneratePanelFromVideo — plan -> generate-video -> sample-frames ->
+  critique -> persist, with video-fn/frames-fn/critique-fn injected so the
+  fan-out/selection/persist wiring is tested without a live seedance key or
+  ffmpeg (mirrors comfy_test.cljc / core_test.cljc's generate-panel-quality
+  coverage style)."
+  (:require [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [mangaka.critique :as critique]
+            [mangaka.graphs.generate-panel-video :as panel-video]
+            [mangaka.store :as store]))
+
+(defn- fake-frame [time-ms]
+  {:image-b64 (str "frame-b64-" time-ms) :mime "image/png" :time-ms time-ms})
+
+(deftest offline-degrades-to-a-stub-video-and-a-placeholder-frame
+  (testing "no injected video-fn/frames-fn/critique-fn -> the real host-fns
+            run, degrade offline (no SEEDANCE_API_KEY / no ffmpeg needed --
+            mangaka.video/sample-frames! falls through to a placeholder svg
+            when video-file is nil), and the graph still completes end to end"
+    (let [store (store/mem-store)
+          h (panel-video/handler (panel-video/make store nil))
+          res (h {:prompt "shiro sprints across a rooftop"} "v1")]
+      (is (some? (:panel-id res)))
+      (is (= "stub" (:video-source res)))
+      (is (string? (:video-error res)))
+      (is (string? (:image-b64 res)))
+      (let [p (store/load-panel store (:panel-id res))]
+        (is (= "seedance-frame-sample" (:panel/source p)))
+        (is (= "stub" (:panel/video-source p)))))))
+
+(deftest selects-the-best-sampled-frame-by-the-shared-rubric
+  (testing "candidate frames differ only by time-ms; the rubric prefers one ->
+            persisted panel is the fan-out winner, not the first sample"
+    (let [store (store/mem-store)
+          video-fn (fn [{:keys [prompt]}]
+                     {:video-file "/tmp/fake.mp4" :source "murakumo-seedance"
+                      :model "seedance-2.0" :gpu-seconds 12.0})
+          frames-fn (fn [{:keys [video-file n]}]
+                      (is (= "/tmp/fake.mp4" video-file))
+                      (mapv fake-frame (take n [500 1500 2500 3500 4500])))
+          critique-fn (fn [_spec img]
+                        {:axes (zipmap critique/rubric-axes
+                                       (repeat (if (= "frame-b64-2500" img) 0.92 0.4)))})
+          h (panel-video/handler (panel-video/make store nil
+                                                    {:video-fn video-fn :frames-fn frames-fn
+                                                     :critique-fn critique-fn}))
+          res (h {:prompt "alley chase" :frame-count 5} "v2")]
+      (is (= 2500 (:time-ms (:best res))) "the winning candidate, not the first")
+      (is (= 92 (:score (:best res))))
+      (is (= "murakumo-seedance" (:video-source res)))
+      (let [p (store/load-panel store (:panel-id res))]
+        (is (= 92 (:panel/score p)))
+        (is (= 2500 (:panel/frame-time-ms p)))
+        (is (= 5 (:panel/frame-count p)))
+        (is (= "seedance-2.0" (:panel/video-model p)))
+        (is (str/includes? (:panel/critique p) ":axes"))))))
+
+(deftest doc-aware-prompt-composition-matches-the-txt2img-pipeline
+  (testing "generate-panel/plan* is reused unmodified, so a storyboard-driven
+            panel-from-video gets the SAME shot/focal/scene/tags prompt the
+            txt2img pipeline would have composed"
+    (let [store (store/mem-store)
+          seen-prompt (atom nil)
+          video-fn (fn [{:keys [prompt]}] (reset! seen-prompt prompt)
+                     {:video-file nil :source "stub" :model "seedance-2.0"})
+          frames-fn (fn [{:keys [prompt]}] [(fake-frame 0)])
+          h (panel-video/handler (panel-video/make store nil
+                                                    {:video-fn video-fn :frames-fn frames-fn}))
+          _ (store/save-document! store
+                                   {:id "d1" :title "T"
+                                    :page {:page/title "T" :page/base-tags ["night"]
+                                           :page/panels [{:panel/shot "wide establishing"
+                                                          :panel/tags ["rain"]}]}})
+          res (h {:doc-id "d1" :panel-index 0} "v3")]
+      (is (str/includes? @seen-prompt "wide establishing"))
+      (is (str/includes? @seen-prompt "rain"))
+      (is (str/includes? @seen-prompt "night"))
+      (is (= "panel-d1-0" (:panel-id res))))))
+
+(deftest a-failed-video-job-still-completes-and-records-the-error
+  (testing "video-fn returning an error (e.g. seedance job failed) doesn't
+            throw -- the graph falls through to whatever frames-fn returns
+            and persists the error for visibility instead of pretending the
+            render succeeded"
+    (let [store (store/mem-store)
+          video-fn (fn [_] {:video-file nil :source "stub" :model "seedance-2.0"
+                            :error "seedance job failed: quota exceeded"})
+          frames-fn (fn [_] [(fake-frame 0)])
+          h (panel-video/handler (panel-video/make store nil
+                                                    {:video-fn video-fn :frames-fn frames-fn}))
+          res (h {:prompt "quiet street"} "v4")]
+      (is (= "seedance job failed: quota exceeded" (:video-error res)))
+      (let [p (store/load-panel store (:panel-id res))]
+        (is (= "seedance job failed: quota exceeded" (:panel/video-error p)))))))

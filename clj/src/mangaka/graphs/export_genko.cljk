@@ -1,0 +1,31 @@
+(ns mangaka.graphs.export-genko
+  "Stored storyboard -> editable layered Genko EDN. Callers may supply richer
+  segmented :renders; otherwise the latest stored flattened panel renders are
+  placed on background layers without inventing segmentation."
+  (:require [kami.mangaka.genko-project :as project]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.util :as util]
+            [mangaka.store :as store]))
+
+(defn- stored-renders [store doc-id]
+  (mapv (fn [{:keys [id]}]
+          (let [r (store/load-panel store id)]
+            {:image-b64 (:panel/image-b64 r)
+             :image-key (:panel/image-key r)
+             :mime (:panel/image-mime r)
+             :prompt (:panel/prompt r)}))
+        (store/renders-for-document store doc-id)))
+
+(defn make [store]
+  (util/single-node
+   :export-genko
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [doc (store/load-document store (:doc-id input))]
+       (when-not doc
+         (throw (ex-info (str "document not found: " (:doc-id input))
+                         {:type :bad-input})))
+       (project/page->doc (:doc-id input) (:page doc)
+                          (or (:renders input) (stored-renders store (:doc-id input))))))))
+
+(def handler util/result-handler)

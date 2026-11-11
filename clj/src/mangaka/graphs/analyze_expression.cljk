@@ -1,0 +1,145 @@
+(ns mangaka.graphs.analyze-expression
+  "analyzeExpression — apply the manga-EXPRESSION patterns (kami.mangaka.expression,
+  HUNTER×HUNTER 王位継承戦編 由来) to a storyboard: キャラクターごとに、セリフ種別×
+  感情×強度 で 吹き出しの形(:bubble/shape)・文字の薄さ(:bubble/weight)・大きさ
+  (:bubble/scale)・書体(:bubble/font=fontRole)・背景トーン(:panel/tone) を決めて
+  enrich する。LLM 不要の決定的解析なのでオフラインでも完全に動く
+  (enrichScene/analyzeCharacterGraph の姉妹、ただし LLM に依らない)。
+
+  入力はどちらか:
+    {:id \"doc-…\"}    stored document を load → enrich → (persist) → 返す
+    {:page {…}}       inline page を enrich して返す(store 不要)
+  省略可: {:cast {\"ガター\" \"hot-blooded\" …}} speaker→archetype、
+          {:persist false} で :id 指定でも保存しない。
+  storyboard domain(:page/panels/:panel/bubbles) と kotoba-lang authoring
+  (:panels/:dialogue) の両形を受ける。"
+  (:require [langgraph.graph :as g]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]
+            [kami.mangaka.expression :as expr]))
+
+(def ^:private patterns (delay (expr/load-patterns)))
+
+(defn- kw [x] (cond (keyword? x) x (nil? x) nil :else (keyword (str x))))
+
+(defn- normalize-cast
+  "input :cast (string/keyword archetype 値) → {speaker archetype-kw}."
+  [cast]
+  (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k)) (kw v)])) (or cast {})))
+
+(defn- domain-shape? [page] (contains? page :page/panels))
+
+;; ── cast (speaker→archetype) を store の character enrichment から自動解決 ────
+;; 手渡しの :cast が無くても、focal キャラの :character/enrichment に :archetype が
+;; あればそれを、無ければ role/personality/appearanceTags から推定して cast を組む。
+
+(defn infer-archetype
+  "role/personality/tags のテキストから archetype を推定 (該当なし → nil)。"
+  [s]
+  (let [s (str/lower (str s))
+        has? (fn [& ws] (boolean (some #(str/includes? s %) ws)))]
+    (cond
+      (has? "cold" "cruel" "ruthless" "menac" "冷酷" "非情" "残酷" "威圧") :cold-menace
+      (has? "hotblood" "hot-blood" "angry" "rage" "fierce" "熱血" "激" "短気" "怒") :hot-blooded
+      (has? "cheer" "energetic" "bright" "playful" "lively" "元気" "明る" "陽気") :energetic
+      (has? "strateg" "calm" "cool" "analy" "tactician" "軍師" "冷静" "知的" "参謀") :strategist
+      (has? "gentle" "kind" "warm" "優し" "穏や" "温厚") :gentle
+      (has? "mob" "crowd" "background" "群衆" "モブ") :mob
+      :else nil)))
+
+(defn- char-archetype
+  "store の character (id 慣習 char-<slug>) の enrichment から archetype を得る。"
+  [store name]
+  (when-let [c (store/load-character store (str "char-" (domain/slug name)))]
+    (let [enr (try (some-> (:character/enrichment c) edn/read-string)
+                   (catch #?(:clj Exception :cljs :default) _ nil))
+          enr (when (map? enr) enr)]
+      (or (kw (:archetype enr))
+          (infer-archetype (str (:role enr) " " (:personality enr) " "
+                                (str/join " " (:appearanceTags enr))))))))
+
+(defn store-cast
+  "page の全 focal キャラについて store から archetype を解決した {name archetype}。"
+  [store page]
+  (if-not store
+    {}
+    (let [names (if (domain-shape? page)
+                  (mapcat #(map domain/focal-name (:panel/focal %)) (:page/panels page))
+                  (mapcat :characters (:panels page)))]
+      (into {} (keep (fn [n] (when-let [a (char-archetype store n)] [n a]))) (distinct (remove nil? names))))))
+
+;; ── storyboard domain (:page/panels/:panel/bubbles) の enrich ────────────────
+
+(defn- domain-panel->authoring
+  "domain panel → kami.mangaka.expression が食える authoring 形。"
+  [p]
+  (let [focal (mapv domain/focal-name (:panel/focal p))]
+    {:characters focal
+     :tone (kw (:panel/tone p))
+     :dialogue (mapv (fn [b]
+                       (into {:speaker (first focal) :text (:bubble/text b)}
+                             (remove (comp nil? val))   ; 未設定の任意キーは省く(明示 nil を渡さない)
+                             {:bubble (kw (:bubble/shape b))
+                              :register (kw (:bubble/register b))
+                              :expression (:bubble/emotion b)
+                              :intensity (:bubble/intensity b)}))
+                     (:panel/bubbles p))}))
+
+(defn- enrich-domain-panel [pats cast p]
+  (let [a (expr/analyze-panel pats cast (domain-panel->authoring p))
+        bubbles (mapv (fn [b da]
+                        (cond-> (assoc b :bubble/shape (name (:bubble da))
+                                         :bubble/register (name (:register da))
+                                         :bubble/weight (name (:weight da))
+                                         :bubble/scale (:scale da))
+                          (:font-role da) (assoc :bubble/font (name (:font-role da)))))
+                      (:panel/bubbles p) (:dialogue a))]
+    (cond-> (assoc p :panel/bubbles bubbles)
+      (:tone a) (assoc :panel/tone (name (:tone a))))))
+
+(defn analyze
+  "Enrich a page (either shape) with the expression patterns. Pure."
+  [pats cast page]
+  (if (domain-shape? page)
+    (update page :page/panels (fn [ps] (mapv #(enrich-domain-panel pats cast %) ps)))
+    (expr/analyze-page pats cast page)))
+
+(defn- summary [page]
+  (if (domain-shape? page)
+    {:panels  (count (:page/panels page))
+     :bubbles (reduce + 0 (map #(count (:panel/bubbles %)) (:page/panels page)))}
+    {:panels  (count (:panels page))
+     :bubbles (reduce + 0 (map #(count (:dialogue %)) (:panels page)))}))
+
+(defn make [store]
+  (-> (g/state-graph {:channels {:input {} :doc {} :page {} :result {}}})
+      (g/add-node :analyze
+                  (fn [{:keys [input]}]
+                    (let [loaded (when (and store (:id input)) (store/load-document store (:id input)))
+                          page   (or (:page input) (:page loaded)
+                                     (throw (ex-info "analyzeExpression needs :page or a stored :id"
+                                                     {:type :bad-input})))
+                          ;; cast: store の character enrichment 由来を土台に、手渡し :cast が勝つ
+                          cast   (merge (store-cast store page) (normalize-cast (:cast input)))
+                          enr    (analyze @patterns cast page)]
+                      {:doc loaded :page enr
+                       :result {:page enr :analysis (summary enr) :cast cast}})))
+      (g/add-node :persist
+                  (fn [{:keys [input doc page result]}]
+                    (let [save? (boolean (and store (:id input) (not (false? (:persist input)))))]
+                      (when save?
+                        (when (domain-shape? page) (domain/valid-page! page))
+                        (store/save-document! store {:id (:id input)
+                                                     :kind (or (:kind doc) "storyboard")
+                                                     :page page}))
+                      {:result (assoc result :id (:id input) :persisted save?)})))
+      (g/set-entry-point :analyze)
+      (g/add-edge :analyze :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(defn handler [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

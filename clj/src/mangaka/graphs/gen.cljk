@@ -1,0 +1,62 @@
+(ns mangaka.graphs.gen
+  "Shared scaffold for txt2img generation graphs (panel, character, and the
+  scene/page graphs to come). Every such graph is the same three-superstep
+  pipeline — plan → render → persist — differing only in how the prompt is
+  built (`:plan`) and how the result is stored (`:persist`). This namespace
+  owns the wiring, validation and per-node streaming; a concrete graph
+  supplies just the two functions.
+
+  Generation is one-shot (no cross-request resume), so the graph is NOT
+  checkpointed and the comfy run uses a throwaway per-render conn
+  (`comfy/fresh-scratch`) — nothing accumulates process-wide. Durable output
+  goes to the real `store` in :persist."
+  (:require [langgraph.graph :as g]
+            [mangaka.comfy :as comfy]
+            [mangaka.blob :as blob]
+            [mangaka.domain :as domain]))
+
+(defn- offload
+  "If a blob store is present, move the render's :image-b64 into it and attach
+  :image-key + :image-url (so persist can store the key, not the inline base64).
+  With no blob store, the render is unchanged (inline base64 fallback)."
+  [blobs render]
+  (if (and blobs (:image-b64 render))
+    (let [k (blob/put! blobs (:image-b64 render) (:mime render))]
+      (assoc render :image-key k :image-url (str "/blob/" k)))
+    render))
+
+(defn build
+  "Compiles a plan→render→persist graph. `blobs` (optional, may be nil) is a
+  content-addressed blob store for offloading the rendered image.
+
+    :plan    (fn [input]                     → render-spec for comfy)
+    :persist (fn [store input spec render]   → result map)"
+  [store blobs {:keys [plan persist]}]
+  (-> (g/state-graph {:channels {:input {} :spec {} :render {} :result {}}})
+      (g/add-node :plan    (fn [{:keys [input]}] {:spec (plan input)}))
+      (g/add-node :render  (fn [{:keys [spec]}]
+                             {:render (offload blobs (comfy/render-panel (comfy/fresh-scratch) spec))}))
+      (g/add-node :persist (fn [{:keys [input spec render]}]
+                             {:result (persist store input spec render)}))
+      (g/set-entry-point :plan)
+      (g/add-edge :plan :render)
+      (g/add-edge :render :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(defn handler
+  "Run-to-completion handler. opts: {:require [keys…]}."
+  [compiled opts]
+  (fn [input _tid]
+    (when-let [ks (:require opts)] (domain/require-input! input ks))
+    (:result (g/invoke compiled {:input input}))))
+
+(defn stream-handler
+  "Per-node streaming handler — emits {:node :step} per superstep, then the
+  result. Same opts as `handler`."
+  [compiled opts]
+  (fn [input _tid emit]
+    (when-let [ks (:require opts)] (domain/require-input! input ks))
+    (-> (g/run* compiled {:input input}
+                {:on-event (fn [ev] (emit {:node (:node ev) :step (:step ev)}))})
+        :state :result)))

@@ -1,0 +1,171 @@
+(ns mangaka.graphs.train-character-lora
+  "trainCharacterLora — 自前 character-consistency LoRA の学習ハーネス
+  (mangaka 側; ADR-2607164200、fleet 側設計は ADR-2607155500 Phase 1)。
+
+  backlog 名 :mangakaTrainCharacterLora をグラフ化したもの。one-shot 線形
+  3 ノード (checkpoint なし — 生成系と同じ規約):
+
+    plan     — mangaka.models の LoRA スロット解決 + dataset manifest
+               (shiropico character-refs の実在確認と画像数カウント、JVM)。
+    dispatch — cloud-murakumo :gen.job 形の学習ジョブ envelope
+               {:modality :training :engine :comfy-train :model <base>} を
+               構築し、MURAKUMO_DISPATCH_URL 設定時は
+               POST {url}/infer/dispatch (local-murakumo routes.cljc の
+               受理形: modality + prompt|refs) へ送る。未設定・非 2xx・
+               transport 例外はすべて :queued-local に degrade — never
+               throw (offline 完全動作の repo 規約)。
+    register — :model/* datoms として store へ永続化 (status: dispatch が
+               通れば \"queued\"、ローカル退避なら \"staged\")。学習が完了して
+               重み CID (DataLad+B2; 重みバイナリは git に入れない) が
+               確定したら :model/lora-cid を同 entity に追記する — それを
+               generate-panel-quality の with-lora が拾い、生成 spec の
+               :lora {:id :cid} として流れる。
+
+  実 GPU 学習の実行は本ハーネスのスコープ外 — fleet 側 :comfy-train engine
+  (cloud-murakumo services/lora-train) の配線と ADR-2607155500 Phase 0
+  (gad ROCm benchmark) が gate。ここは「学習を宣言し、ジョブを正しい形で
+  送り出し、ライフサイクルを datoms で追跡可能にする」ことに責任を持つ。
+
+  Input: {:character \"shiro\" (required — mangaka.models にスロットの
+  ある cast のみ)、:steps (default 1200)、:rank (default 16)、
+  :base-model (default はスロットの :model/base)、:dataset-dir (optional
+  override)}。"
+  (:require [mangaka.models :as models]
+            [mangaka.store :as store]
+            [langgraph.graph :as g]
+            #?@(:clj [[org.httpkit.client :as http]
+                      [jsonista.core :as json]
+                      [clojure.java.io :as io]])))
+
+(def ^:private default-steps 1200)
+(def ^:private default-rank 16)
+
+(defn- bad! [msg] (throw (ex-info msg {:type :bad-input})))
+
+#?(:clj
+   (defn- dataset-manifest
+     "Resolves the reference-image directory for `character` and counts its
+     images. Never throws: an absent directory yields {:available? false} —
+     the harness can still stage the job (the fleet node, not this process,
+     is what ultimately needs the files)."
+     [input slot character]
+     (let [home (System/getProperty "user.home")
+           candidates (remove nil?
+                              [(:dataset-dir input)
+                               (some-> (System/getenv "MANGAKA_LORA_DATASET_DIR")
+                                       (str "/" character))
+                               (str home "/gftdcojp/ghosthacker-shiropico-assets/character-refs/" character)])
+           dir (first (filter #(.isDirectory (io/file %)) candidates))
+           images (when dir
+                    (->> (.listFiles (io/file dir))
+                         (filter #(re-find #"(?i)\.(png|jpe?g|webp)$" (.getName %)))
+                         count))]
+       {:declared (:model/dataset slot)
+        :dir (or dir (first candidates))
+        :available? (boolean dir)
+        :images (or images 0)}))
+   :cljs
+   (defn- dataset-manifest [input slot _character]
+     {:declared (:model/dataset slot)
+      :dir (:dataset-dir input)
+      :available? false
+      :images 0}))
+
+(defn job-envelope
+  "cloud-murakumo :gen.job 形 (dispatch.cljc / gen.cljc 規約) の学習ジョブ。
+  :refs は入力 artifact 参照 = dataset dir、:params が学習ハイパーパラメータ。"
+  [{:keys [character base-model steps rank model-id dataset]}]
+  {:gen.job/modality :training
+   :gen.job/engine :comfy-train
+   :gen.job/model base-model
+   :gen.job/input {:prompt (str "character-consistency LoRA for " character)
+                   :refs [(:dir dataset)]
+                   :params {:character character :lora-name model-id
+                            :rank rank :steps steps
+                            :resolution 1024}}
+   :gen.job/status :queued
+   :gen.job/actor "ai.gftd.mangaka"})
+
+#?(:clj
+   (defn- post-dispatch
+     "POST {MURAKUMO_DISPATCH_URL}/infer/dispatch — local-murakumo の受理形
+     (modality 必須 + prompt|refs)。2xx → :dispatched、それ以外・例外 →
+     :queued-local (理由付き)。"
+     [job]
+     (if-let [base (System/getenv "MURAKUMO_DISPATCH_URL")]
+       (try
+         (let [input (:gen.job/input job)
+               body (json/write-value-as-string
+                     {:modality (name (:gen.job/modality job))
+                      :model (:gen.job/model job)
+                      :prompt (:prompt input)
+                      :refs (:refs input)
+                      :params (:params input)
+                      :actor (:gen.job/actor job)})
+               token (System/getenv "MURAKUMO_SERVICE_TOKEN")
+               {:keys [status error]} @(http/post (str base "/infer/dispatch")
+                                                  {:headers (cond-> {"content-type" "application/json"}
+                                                              token (assoc "authorization" (str "Bearer " token)))
+                                                   :body body :timeout 30000})]
+           (if (and (nil? error) status (<= 200 status 299))
+             {:transport :dispatched :status status}
+             {:transport :queued-local
+              :note (str "dispatch not accepted (status=" status
+                         (when error (str ", error=" (.getMessage ^Throwable error))) ")")}))
+         (catch Exception e
+           {:transport :queued-local :note (str "dispatch failed: " (.getMessage e))}))
+       {:transport :queued-local :note "MURAKUMO_DISPATCH_URL unset"}))
+   :cljs
+   (defn- post-dispatch [_job]
+     {:transport :queued-local :note "no JVM transport"}))
+
+(defn make [store]
+  (-> (g/state-graph {:channels {:input {} :spec {} :job {} :result {}}})
+      (g/add-node :plan
+                  (fn [{:keys [input]}]
+                    (let [character (:character input)
+                          _ (when-not (seq (str character)) (bad! "provide :character"))
+                          slot (or (models/character-lora character)
+                                   (bad! (str "no character-LoRA slot for " character
+                                              " — declare it in mangaka.models"
+                                              " (training data must be staged first)")))
+                          base-id (or (:base-model input) (:model/base slot))
+                          base (or (models/model base-id)
+                                   (bad! (str "unknown base model " base-id)))]
+                      {:spec {:model-id (:model/id slot)
+                              :character (:model/character slot)
+                              :base-model (:model/id base)
+                              :hf-repo (:hf/repo base)
+                              :steps (or (:steps input) default-steps)
+                              :rank (or (:rank input) default-rank)
+                              :dataset (dataset-manifest input slot (:model/character slot))}})))
+      (g/add-node :dispatch
+                  (fn [{:keys [spec]}]
+                    (let [job (job-envelope spec)]
+                      {:job (merge job (post-dispatch job))})))
+      (g/add-node :register
+                  (fn [{:keys [spec job]}]
+                    (let [status (if (= :dispatched (:transport job)) "queued" "staged")]
+                      (store/save-model! store {:id (:model-id spec)
+                                                :kind "character-lora"
+                                                :character (:character spec)
+                                                :base (:base-model spec)
+                                                :dataset (pr-str (:dataset spec))
+                                                :job (pr-str job)
+                                                :status status})
+                      {:result {:model-id (:model-id spec)
+                                :character (:character spec)
+                                :base-model (:base-model spec)
+                                :hf-repo (:hf-repo spec)
+                                :status status
+                                :dataset (:dataset spec)
+                                :job job}})))
+      (g/set-entry-point :plan)
+      (g/add-edge :plan :dispatch)
+      (g/add-edge :dispatch :register)
+      (g/set-finish-point :register)
+      (g/compile-graph)))
+
+(defn handler [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

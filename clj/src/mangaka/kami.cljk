@@ -1,0 +1,70 @@
+(ns mangaka.kami
+  "Bridge: mangaka storyboard → KAMI scene / render-IR, via kami-engine-sdk-clj
+  (etzhayyim/kami-engine). This unifies the genko/storyboard rendering on the
+  clj KAMI engine — clj is the brain (scene + ECS + render-IR as data), the
+  Rust/wgpu `kami-render` is the GPU arm. A storyboard page becomes a KAMI
+  scene (one camera + one quad per panel, laid out from :panel/rect); the
+  result flows through the same pure path as any KAMI scene —
+  scene → ECS world → render-IR frame → ipc/pack bytes → Rust GPU host — with
+  no bespoke SVG canvas and no GPU needed until the final submit.
+
+  Pure .cljc: runs on the JVM (authoring) and in the browser (kami.backend)."
+  (:require [kami.scene :as scene]
+            [kami.ecs :as ecs]
+            [kami.render :as render]
+            [kami.ipc :as ipc]
+            [mangaka.domain :as domain]))
+
+(def panel-assets
+  "Builtin quad mesh + unlit material — panels are textured quads on a plane."
+  [{:asset/id "mesh/panel-quad" :asset/kind :mesh     :asset/uri "kami://builtin/quad"}
+   {:asset/id "mat/panel"       :asset/kind :material :asset/uri "kami://builtin/unlit"}])
+
+(defn- panel->entity
+  "One storyboard panel → a KAMI quad entity. :panel/rect is [x y w h] in
+  normalized page coords (origin top-left, y down); map to a centered scene
+  plane (origin center, y up)."
+  [i panel]
+  (let [[x y w h] (domain/panel-rect panel i)
+        cx (+ x (/ w 2.0))
+        cy (+ y (/ h 2.0))]
+    (first (scene/add-entity
+            {:kami/name (str "panel-" (or (:panel/index panel) i))
+             :transform/translation [(double (- cx 0.5)) (double (- 0.5 cy)) 0.0]
+             :transform/rotation    [0.0 0.0 0.0 1.0]
+             :transform/scale       [(double w) (double h) 1.0]
+             :mesh/asset     [:asset/id "mesh/panel-quad"]
+             :material/asset [:asset/id "mat/panel"]
+             ;; carry the panel's storyboard content so the scene reflects what
+             ;; to draw (shot / focal / background scene / bubble text), not just
+             ;; blank geometry — the Rust host reads these to texture the quad.
+             :material/params (pr-str {:shot (:panel/shot panel)
+                                       :focal (vec (:panel/focal panel))
+                                       :scene (:panel/scene panel)
+                                       :tone (:panel/tone panel)
+                                       :bubbles (mapv :bubble/text (:panel/bubbles panel))})}))))
+
+(defn storyboard->snapshot
+  "page map → a validated KAMI scene snapshot (a camera + one quad per panel)."
+  [page]
+  (let [cam (first (scene/add-entity
+                    {:kami/name "page-cam"
+                     :camera/fov 50.0 :camera/near 0.1 :camera/far 100.0 :camera/active? true
+                     :transform/translation [0.0 0.0 2.0]
+                     :transform/rotation    [0.0 0.0 0.0 1.0]}))
+        panels (into [cam] (map-indexed panel->entity (:page/panels page)))
+        snap (scene/build-snapshot panels panel-assets
+                                   {:scene (or (:page/title page) "storyboard")})]
+    (scene/valid? snap)
+    snap))
+
+(defn storyboard->frame
+  "page map → a KAMI render-IR frame (pure; the golden/record-replay surface)."
+  ([page] (storyboard->frame page {}))
+  ([page opts]
+   (-> (storyboard->snapshot page) ecs/load-snapshot (render/frame opts))))
+
+(defn storyboard->packed
+  "page map → a packed KamiFrame buffer (+ layout/meta) for the Rust/wgpu host."
+  [page]
+  (ipc/pack (storyboard->frame page)))

@@ -1,0 +1,86 @@
+(ns mangaka.graphs.generate-panel
+  "mangaka_generate_panel — render a panel. Two modes, both on the
+  plan→render→persist scaffold (mangaka.graphs.gen):
+
+    free-form  {:prompt … :tags […]}            — render an ad-hoc prompt.
+    doc-aware  {:doc-id … :panel-index n}        — render a *stored* storyboard
+               panel: the prompt is composed from that panel's shot / focal
+               characters / tags plus the page's base tags, so the storyboard
+               datoms drive generation (the storyboard→render loop). An extra
+               :prompt is appended as a hint.
+
+  The rendered image is persisted as a :panel/id entity linked back to the
+  storyboard via :panel/doc-id + :panel/index, so renders stay queryable.
+  Validation lives in the plan node: a free-form call needs :prompt, a
+  doc-aware call needs :panel-index."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.gen :as gen]
+            [mangaka.store :as store]))
+
+(defn- bad! [msg] (throw (ex-info msg {:type :bad-input})))
+
+(defn- compose-from-panel [page panel scene-prompt extra]
+  (->> [(:panel/shot panel)
+        (when (seq (:panel/focal panel)) (str/join ", " (map domain/focal-name (:panel/focal panel))))
+        ;; the panel's linked background scene (if any) drives the environment
+        scene-prompt
+        (when (seq (:panel/tags panel)) (str/join ", " (:panel/tags panel)))
+        (when (seq (:page/base-tags page)) (str/join ", " (:page/base-tags page)))
+        extra]
+       (remove nil?) (remove str/blank?) (str/join ", ")))
+
+(defn plan*
+  "Composes a full render spec from free-form or doc-aware input. Public so
+  `mangaka.graphs.generate-panel-loop` (ReAct-style refinement over this same
+  plan→render→score cycle) can reuse the exact same prompt composition."
+  [store {:keys [prompt tags negative seed width height model doc-id panel-index
+                 focal-count character]}]
+  ;; doc-aware mode is signalled by :panel-index (render a stored panel);
+  ;; otherwise it's a free-form prompt (:doc-id, if given, is just a label).
+  (let [focal (volatile! nil)   ; doc-aware: 期待 focal 数 (知覚軸 :facePresence 用)
+        full (if (some? panel-index)
+               (let [_ (when (str/blank? (str doc-id)) (bad! "doc-id is required with panel-index"))
+                     doc (or (store/load-document store doc-id)
+                             (bad! (str "document not found: " doc-id)))
+                     panel (or (nth (:page/panels (:page doc)) panel-index nil)
+                               (bad! (str "panel not found: " doc-id "#" panel-index)))
+                     ;; pull the linked scene's prompt so its environment drives the render
+                     scene-prompt (when-let [sid (:panel/scene panel)]
+                                    (:scene/prompt (store/load-scene store sid)))]
+                 (vreset! focal (count (:panel/focal panel)))
+                 (compose-from-panel (:page doc) panel scene-prompt prompt))
+               (do (when (str/blank? (str prompt)) (bad! "prompt is required"))
+                   (->> [prompt (when (seq tags) (str/join ", " tags))]
+                        (remove nil?) (str/join ", "))))]
+    {:prompt full
+     :negative (or negative "lowres, bad anatomy, worst quality")
+     :seed (or seed 0) :width (or width 832) :height (or height 1216) :model model
+     ;; 期待 focal 数: doc-aware は storyboard から、free-form は明示指定
+     ;; または :character 指定 (= その 1 人が写っているはず) から
+     :focal-count (or focal-count
+                      (when (some? panel-index) @focal)
+                      (when (seq (str character)) 1))}))
+
+(defn- persist [store input spec render]
+  (let [idx (or (:panel-index input) (:index input))
+        pid (or (:panel-id input)
+                (when (:doc-id input) (str "panel-" (:doc-id input) "-" idx))
+                (str "panel-" (hash [(:prompt spec) (:seed spec)])))]
+    ;; store the blob key when offloaded (no inline base64 → no datom bloat),
+    ;; else the inline base64 (no blob store wired)
+    (store/save-panel! store {:id pid :doc-id (:doc-id input) :index idx
+                              :prompt (:prompt spec) :seed (:seed spec) :model (:model spec)
+                              :image-key (:image-key render)
+                              :image-b64 (when-not (:image-key render) (:image-b64 render))
+                              :image-mime (:mime render)})
+    {:panel-id pid :doc-id (:doc-id input) :index idx
+     :image-b64 (:image-b64 render) :image-key (:image-key render) :image-url (:image-url render)
+     :mime (:mime render) :source (:source render) :seed (:seed spec) :run-id (:run-id render)}))
+
+(def ^:private opts {})  ; validation happens in plan*
+
+(defn make [store blobs]
+  (gen/build store blobs {:plan #(plan* store %) :persist persist}))
+(defn handler [compiled] (gen/handler compiled opts))
+(defn stream-handler [compiled] (gen/stream-handler compiled opts))

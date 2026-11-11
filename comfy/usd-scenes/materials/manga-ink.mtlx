@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<materialx version="1.39" colorspace="acescg">
+  <!-- MaterialX network for manga NPR look.
+       Three top-level materials defined here:
+
+         MangaInk          — high-contrast B&W edge ink shader,
+                              parameterized by tension (from narrative
+                              customData) so anxious scenes get
+                              thicker, more dramatic line weight.
+
+         MangaScreentone   — dot/halftone pattern fill, density
+                              parameterized by emotion.
+
+         MangaFlatFill     — pure black fill region (kuro-beta),
+                              triggered when narrative:tension > 0.7.
+
+       The shaders are consumed by Blender Cycles via the
+       MaterialX -> USD bind in Blender 4.x. Each is implemented in
+       OSL (lg/scripts/usd-scenes/osl/*.osl).
+  -->
+
+  <!-- ============================================================
+       Shared input definitions
+       ============================================================ -->
+  <input name="narrative_tension" type="float" value="0.0"
+          uiname="Tension (0..1)" uimin="0" uimax="1"/>
+  <input name="narrative_emotion" type="string" value="neutral"
+          uiname="Emotion"
+          enum="neutral,anxious,shocked,sad,angry,joyful,determined,fearful,contemplative,embarrassed"/>
+
+  <!-- ============================================================
+       MangaInk surface shader — edge detection + line weight
+       ============================================================ -->
+  <surfaceshader name="MangaInk_shader" type="surfaceshader"
+                  nodedef="ND_OSL_MangaLineWeight">
+    <input name="base_thickness" type="float" value="2.0"/>
+    <input name="tension_multiplier" type="float" value="1.5"/>
+    <input name="tension"
+            nodename="NarrativeTension_passthrough" type="float"/>
+    <input name="ink_color" type="color3" value="0.0, 0.0, 0.0"/>
+    <input name="paper_color" type="color3" value="1.0, 1.0, 1.0"/>
+  </surfaceshader>
+
+  <material name="MangaInk">
+    <input name="surfaceshader" nodename="MangaInk_shader" type="surfaceshader"/>
+  </material>
+
+  <!-- ============================================================
+       MangaScreentone — halftone dot pattern fill
+       ============================================================ -->
+  <surfaceshader name="MangaScreentone_shader" type="surfaceshader"
+                  nodedef="ND_OSL_MangaScreentone">
+    <input name="emotion"
+            nodename="NarrativeEmotion_passthrough" type="string"/>
+    <input name="dot_size" type="float" value="0.02"/>
+    <input name="dot_angle" type="float" value="0.785398" doc="45 degrees in radians"/>
+    <!-- Density auto-resolved from emotion via OSL lookup -->
+    <input name="base_density" type="float" value="0.30"/>
+  </surfaceshader>
+
+  <material name="MangaScreentone">
+    <input name="surfaceshader" nodename="MangaScreentone_shader" type="surfaceshader"/>
+  </material>
+
+  <!-- ============================================================
+       MangaFlatFill — solid black, gated by tension threshold
+       ============================================================ -->
+  <surfaceshader name="MangaFlatFill_shader" type="surfaceshader"
+                  nodedef="ND_OSL_MangaFlatFill">
+    <input name="tension"
+            nodename="NarrativeTension_passthrough" type="float"/>
+    <input name="fill_threshold" type="float" value="0.7"/>
+    <input name="fill_color" type="color3" value="0.0, 0.0, 0.0"/>
+  </surfaceshader>
+
+  <material name="MangaFlatFill">
+    <input name="surfaceshader" nodename="MangaFlatFill_shader" type="surfaceshader"/>
+  </material>
+
+  <!-- ============================================================
+       Narrative passthrough nodes — read from the USD prim's
+       customData via OSL getattribute() at render time.
+       ============================================================ -->
+  <node name="NarrativeTension_passthrough" type="float"
+         nodedef="ND_OSL_NarrativeAttr">
+    <input name="attr_name" type="string" value="narrative:tension"/>
+    <input name="default_value" type="float" value="0.0"/>
+  </node>
+
+  <node name="NarrativeEmotion_passthrough" type="string"
+         nodedef="ND_OSL_NarrativeAttrString">
+    <input name="attr_name" type="string" value="narrative:emotion"/>
+    <input name="default_value" type="string" value="neutral"/>
+  </node>
+</materialx>

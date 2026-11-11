@@ -1,0 +1,102 @@
+(ns mangaka.kotoba-test
+  "kotoba-datomic backend tests. The pure query/decode/pull helpers are
+  unit-tested directly; the full Store is driven against a fake kotoba
+  server (backed by langchain.db) that reproduces kotoba's `.q`/.transact
+  wire contract — Datalog rows always arrive as Vec<Vec> of EDN scalars."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [langchain.db :as db]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]
+            [mangaka.store.kotoba :as k]))
+
+;; ───────────────────────── pure helpers ─────────────────────────
+
+(deftest coll-find-detection
+  (is (true?  (k/coll-find? '[:find [?id ...] :where [?e :doc/id ?id]])))
+  (is (false? (k/coll-find? '[:find [?a ?v] :where [?e ?a ?v]]))))
+
+(deftest decode-cell-edn-strings
+  ;; Mirrors parse_edn_value: keywords stay raw strings; only quoted strings,
+  ;; bools, nil and numbers are parsed — so EDN payloads survive intact.
+  (is (= ":doc/title" (k/decode-cell ":doc/title")))            ; keyword kept as string
+  (is (= "{:page/number 1}" (k/decode-cell "\"{:page/number 1}\"")))  ; EDN payload intact
+  (is (= 42 (k/decode-cell "42")))
+  (is (= "plain" (k/decode-cell "\"plain\"")))
+  (is (false? (k/decode-cell "false")))
+  (is (= 7 (k/decode-cell 7))))                                 ; native passthrough
+
+(deftest shape-rows-by-find-form
+  (testing "collection find → flat vector (string values arrive EDN-quoted)"
+    (is (= ["a" "b"] (k/shape-rows '[:find [?id ...] :where _] [["\"a\""] ["\"b\""]]))))
+  (testing "relation find → set of tuples; keyword attrs stay strings until projection"
+    (is (= #{[":doc/title" "Arc"] [":doc/page-number" 1]}
+           (k/shape-rows '[:find ?a ?v :where _]
+                         [[":doc/title" "\"Arc\""] [":doc/page-number" "1"]])))))
+
+;; ───────────────────────── fake kotoba server ─────────────────────────
+
+(defn fake-kotoba
+  "A post-fn backed by langchain.db that mimics the kotoba wire contract:
+  `.q` returns {:rows_edn [[edn-string …]…]} (every cell EDN-encoded);
+  `.pull` returns {:entity_edn \"…\"} (the pulled entity, possibly nested)."
+  [conn]
+  (fn [method {:keys [tx_edn query_edn entity pattern_edn]}]
+    (case method
+      "transact" (do (db/transact! conn (edn/read-string tx_edn)) {:tx_cid "fake"})
+      "q" (let [res (db/q (edn/read-string query_edn) (db/db conn))
+                rows (cond (set? res)    (vec res)            ; relation find
+                           (vector? res) (mapv vector res)    ; coll find → wrap
+                           :else         [[res]])]
+            {:rows_edn (mapv (fn [row] (mapv pr-str row)) rows)})
+      "pull" (let [m (db/pull (db/db conn) (edn/read-string pattern_edn) (edn/read-string entity))]
+               {:entity_edn (pr-str m)}))))
+
+(deftest full-roundtrip-via-fake-server
+  (let [conn  (db/create-conn domain/schema)
+        st    (k/kotoba-store (fake-kotoba conn))
+        page  {:page/number 3 :page/title "Ghost Hacker"
+               :page/panels [{:panel/index 0 :panel/shot "wide"
+                              :panel/focal [":character/Nei"]
+                              :panel/bubbles [{:bubble/text "起動"}]}]}]
+    (testing "decomposed storyboard round-trips through .transact/.q/.pull"
+      (store/save-document! st {:id "d1" :title "Ghost Hacker" :page page})
+      (store/save-document! st {:id "d2" :title "Side B" :page {:page/number 4 :page/panels []}})
+      (is (= #{"d1" "d2"} (set (map :id (store/list-documents st)))))
+      (let [doc (store/load-document st "d1")]
+        (is (= "Ghost Hacker" (:title doc)))
+        (is (= page (:page doc)))))
+    (testing "Datalog character query works over the wire"
+      (is (= ["d1"] (store/documents-with-character st ":character/Nei"))))
+    (testing "pull of an absent entity is nil"
+      (is (nil? (store/load-document st "missing"))))))
+
+(deftest character-queries-via-fake-server
+  ;; The character-resolution / cast-graph query shapes added for the chat
+  ;; agent (coll find for refs, 2-var relation find for panels, enrichment
+  ;; pull) all go through kotoba's own shape-rows/decode-cell parsing — so
+  ;; exercise them against the wire contract, not just the mem backend.
+  (let [conn (db/create-conn domain/schema)
+        st   (k/kotoba-store (fake-kotoba conn))]
+    (store/save-document! st {:id "d1" :title "Arc"
+                              :page {:page/number 1
+                                     :page/panels [{:panel/index 0 :panel/shot "wide"
+                                                    :panel/focal [":character/Nei"]}
+                                                   {:panel/index 1 :panel/shot "close"
+                                                    :panel/focal [":character/Nei"]}]}})
+    (store/save-character! st {:id "char-nei" :name "Nei"
+                               :enrichment (pr-str {:relationships {:Ren "best friend"}})})
+    (store/save-character! st {:id "char-ren" :name "Ren"})
+    (testing "character-refs (collection find) decodes the cast's focal refs over the wire"
+      (is (= [":character/Nei"] (store/character-refs st))))
+    (testing "resolve-character-ref is case-insensitive over the wire backend"
+      (is (= ":character/Nei" (store/resolve-character-ref st "nei")))
+      (is (= ":character/Nei" (store/resolve-character-ref st ":character/NEI")))
+      (is (nil? (store/resolve-character-ref st "ghost"))))
+    (testing "panels-with-character (2-var relation find) shapes tuples correctly"
+      (is (= [{:doc-id "d1" :index 0} {:doc-id "d1" :index 1}]
+             (store/panels-with-character st ":character/Nei"))))
+    (testing "character-graph reads enrichment relationships pulled over the wire"
+      (let [g (store/character-graph st)]
+        (is (= #{"Nei" "Ren"} (set (map :name (:nodes g)))))
+        (is (some #{{:from "Nei" :to "Ren" :rel "best friend"}} (:edges g)))))))

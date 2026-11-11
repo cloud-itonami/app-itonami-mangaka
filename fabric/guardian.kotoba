@@ -1,0 +1,2 @@
+(ns mangaka-fabric-guardian)
+(defn main [] 8)

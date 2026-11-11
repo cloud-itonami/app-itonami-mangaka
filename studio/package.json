@@ -1,0 +1,26 @@
+{
+  "name": "mangaka-studio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "原稿スタジオ — the kami-genko editor, published at app.itonami.cloud/mangaka/",
+  "scripts": {
+    "build": "amu compile --target wasm32-browser studio",
+    "page": "export CLJ_CP=\"$(kbb -Spath)\"; kbb --backend sci --classpath \"$CLJ_CP\" scripts/gen-page.cljs",
+    "page:check": "export CLJ_CP=\"$(kbb -Spath)\"; kbb --backend sci --classpath \"$CLJ_CP\" scripts/gen-page.cljs --check",
+    "deploy": "wrangler deploy --dispatch-namespace ai-gftd-repository-dispatch"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "@ipld/dag-cbor": "^9.2.1",
+    "@noble/curves": "^1.7.0",
+    "@noble/hashes": "^1.6.1"
+  },
+  "devDependencies": {
+    "shadow-cljs": "2.28.20",
+    "wrangler": "^4.42.0"
+  },
+  "overrides": {
+    "undici": "7.29.0"
+  }
+}

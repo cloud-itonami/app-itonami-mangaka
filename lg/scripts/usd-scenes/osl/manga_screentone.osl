@@ -1,0 +1,67 @@
+// manga_screentone.osl — Open Shading Language halftone / screentone
+// pattern shader for manga NPR. Reads `narrative:emotion` from USD
+// customData and picks dot density from a lookup table:
+//
+//   joyful / contemplative -> light dots (low density)
+//   anxious / sad           -> medium hatch
+//   shocked / angry / fearful -> dense crosshatch
+//
+// Implements rotated dot lattice in screen UV space so the pattern
+// doesn't follow surface curvature (manga convention — screentone
+// is a printed overlay, not a surface texture).
+//
+// Compile: oslc manga_screentone.osl -o manga_screentone.oso
+
+shader manga_screentone(
+    string emotion = "neutral",
+    float dot_size = 0.02,
+    float dot_angle = 0.785398,    // 45 degrees
+    float base_density = 0.30,
+
+    output color Ci = color(1, 1, 1),
+    output closure color BSDF = 0
+) {
+    string e = emotion;
+    if (e == "neutral") {
+        string a = "";
+        if (getattribute("narrative:emotion", a)) e = a;
+    }
+
+    // Emotion -> density lookup
+    float density = base_density;
+    if      (e == "joyful")        density = 0.20;
+    else if (e == "contemplative") density = 0.25;
+    else if (e == "embarrassed")   density = 0.40;
+    else if (e == "sad")           density = 0.45;
+    else if (e == "determined")    density = 0.50;
+    else if (e == "anxious")       density = 0.55;
+    else if (e == "fearful")       density = 0.70;
+    else if (e == "shocked")       density = 0.75;
+    else if (e == "angry")         density = 0.80;
+    else                           density = 0.30;
+
+    // Use screen-space UV (Cycles supports getattribute("uv"))
+    float u_val = u;
+    float v_val = v;
+    // Rotate UV by dot_angle
+    float ca = cos(dot_angle), sa = sin(dot_angle);
+    float ur = u_val * ca - v_val * sa;
+    float vr = u_val * sa + v_val * ca;
+
+    // Tile UV
+    float lattice_u = mod(ur / dot_size, 1.0);
+    float lattice_v = mod(vr / dot_size, 1.0);
+
+    float dx = lattice_u - 0.5;
+    float dy = lattice_v - 0.5;
+    float dist = sqrt(dx * dx + dy * dy);
+
+    // Dot radius scaled by density
+    float dot_radius = sqrt(density) * 0.5;
+    float dot_mask = smoothstep(dot_radius + 0.01, dot_radius - 0.01, dist);
+
+    color paper = color(1, 1, 1);
+    color ink = color(0, 0, 0);
+    Ci = mix(paper, ink, dot_mask);
+    BSDF = Ci * diffuse(N);
+}

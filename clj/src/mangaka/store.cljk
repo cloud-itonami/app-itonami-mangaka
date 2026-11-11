@@ -1,0 +1,336 @@
+(ns mangaka.store
+  "Backend-agnostic storyboard store — the durable domain surface.
+
+  One protocol fronts two backends with identical Datalog/transact
+  semantics (ADR-0013 / kotoba-datomic shadow-write):
+
+    mem    — langchain.db in-memory EAV store (dev, tests, CLJS).
+    kotoba — kotoba-datomic over XRPC (prod persistence).
+
+  This store holds *durable* artifacts (storyboard documents, rendered
+  panels). Graph execution scratch — langgraph checkpoints and the
+  comfyui exec cache — stays on a fast in-memory langchain.db conn
+  created in `mangaka.runtime`, mirroring how the Python app kept the
+  storyboard SSoT separate from its Postgres checkpoint tables.
+
+  `-q` takes a fully-formed query whose constants are already inlined
+  (so the HTTP backend needs no parameter-binding round-trip)."
+  (:require [mangaka.domain :as domain]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [langchain.db :as db]))
+
+(defprotocol Store
+  (-transact! [s tx-data] "Transact a vector of entity maps / datom ops.")
+  (-q [s query] "Datalog query (constants inlined) → result set/coll.")
+  (-pull [s pattern eid] "Datomic pull on an entity id / lookup ref.")
+  (-read-string [s edn-str] "Host EDN reader (for :doc/body)."))
+
+;; ───────────────────────── in-memory (langchain.db) ─────────────────────────
+
+(defrecord MemStore [conn]
+  Store
+  (-transact! [_ tx-data] (db/transact! conn tx-data))
+  (-q [_ query] (db/q query (db/db conn)))
+  (-pull [_ pattern eid] (db/pull (db/db conn) pattern eid))
+  (-read-string [_ s] (edn/read-string s)))
+
+(defn mem-store
+  "In-memory store. Extra schema (e.g. checkpoint/exec) may be merged in."
+  ([] (mem-store {}))
+  ([extra-schema]
+   (->MemStore (db/create-conn (merge domain/schema extra-schema)))))
+
+;; ───────────────────────── repo ops (domain-level) ─────────────────────────
+
+(defn- storyboard-eids
+  "All entity ids tagged with this doc id (doc + its panels/bubbles/sfx)."
+  [store id]
+  (-q store [:find '[?e ...] :where ['?e :stb/doc id]]))
+
+(defn save-document!
+  "Upserts a storyboard document as a datom graph. Re-saving retracts the
+  prior graph (doc + components) first, so the document is replaced cleanly
+  rather than accreting orphan panels. The retract + add run in a SINGLE
+  transaction so a re-save is atomic — concurrent saves of the same doc
+  can't interleave into a half-retracted graph."
+  [store {:keys [id] :as doc}]
+  (let [retracts (mapv (fn [e] [:db/retractEntity e]) (storyboard-eids store id))]
+    (-transact! store (into retracts (domain/doc->tx doc))))
+  {:id id :ok true})
+
+(defn delete-document!
+  "Hard-deletes a storyboard document, its component graph (panels, bubbles,
+  sfx) AND its render outputs — the rendered panels (:panel/id) and the composed
+  page render (:page-render/id), both linked by doc-id — in one transaction.
+  Returns {:id :deleted :renders-removed}; :deleted is false when no such
+  document existed (idempotent). Hard delete only (the repo convention forbids
+  soft-delete `_alive` flags). Cleaning up the renders keeps listRenders /
+  loadPageRender / stats consistent — the content-addressed image blobs are
+  left (they are dedup'd and may be shared by other renders)."
+  [store id]
+  (let [stb      (storyboard-eids store id)
+        renders  (-q store [:find '[?e ...] :where ['?e :panel/doc-id id] ['?e :panel/id '?pid]])
+        pages    (-q store [:find '[?e ...] :where ['?e :page-render/doc-id id] ['?e :page-render/id '?prid]])
+        outputs  (concat renders pages)
+        eids     (distinct (concat stb outputs))]
+    (when (seq eids)
+      (-transact! store (mapv (fn [e] [:db/retractEntity e]) eids)))
+    {:id id :deleted (boolean (seq stb)) :renders-removed (count outputs)}))
+
+(defn delete-entity!
+  "Hard-deletes a single entity by its unique :ns/id (e.g. ns \"character\" →
+  :character/id). Returns {:id :deleted bool}, idempotent (absent → false).
+  Used to prune generated assets (characters, scenes). Any storyboard focal
+  refs to a deleted character are left as-is — lint then reports them as
+  :unknown-character, which is the correct signal rather than a silent cascade."
+  [store ns id]
+  (let [eids (-q store [:find '[?e ...] :where ['?e (keyword ns "id") id]])]
+    (when (seq eids)
+      (-transact! store (mapv (fn [e] [:db/retractEntity e]) eids)))
+    {:id id :deleted (boolean (seq eids))}))
+
+(defn delete-character! [store id] (delete-entity! store "character" id))
+(defn delete-scene!     [store id] (delete-entity! store "scene" id))
+
+(defn load-document
+  "Returns {:id :kind :title :page-number :page} or nil. The page map is
+  reconstructed from the decomposed datom graph via a nested pull."
+  [store id]
+  (let [m (-pull store domain/doc-pull [:doc/id id])]
+    (when (:doc/id m)
+      {:id (:doc/id m)
+       :kind (:doc/kind m)
+       :title (:page/title m)
+       :page-number (:page/number m)
+       :page (domain/pulled->page m)})))
+
+(defn- ->sortable-num
+  "Coerce a page-number to a sortable long for ordering: numbers pass through,
+  a JSON-string like \"2\" parses, anything else → 0. Keeps `sort-by` from
+  throwing on a mixed String/Long page-number set (e.g. a JSON save/duplicate
+  that sent the number as a string)."
+  [n]
+  (cond (number? n) n
+        (string? n) (or (parse-long n) 0)
+        :else 0))
+
+(defn list-documents
+  "All documents as lightweight headers, sorted by page-number (robust to a
+  non-numeric page-number — see `->sortable-num`)."
+  [store]
+  (->> (-q store '[:find [?id ...] :where [?e :doc/id ?id]])
+       (map (fn [id]
+              (let [m (-pull store '[:doc/id :page/title :page/number] [:doc/id id])]
+                {:id id
+                 :title (:page/title m "")
+                 :page-number (:page/number m 0)})))
+       (sort-by (comp ->sortable-num :page-number))
+       vec))
+
+(defn- documents-with-panel-attr
+  "Ids of documents whose panels match [attr value] — the shared shape behind
+  the by-character / by-scene queries (the payoff of storing the storyboard as
+  datoms rather than an opaque blob)."
+  [store attr value]
+  (vec (sort (-q store [:find '[?id ...]
+                        :where ['?p attr value] ['?p :stb/doc '?id]]))))
+
+(defn documents-with-character
+  "Ids of documents whose panels feature `char-ref` (e.g. \":character/Nei\")
+  in :panel/focal."
+  [store char-ref]
+  (documents-with-panel-attr store :panel/focal char-ref))
+
+(defn documents-with-scene
+  "Ids of documents whose panels are set in `scene-id` (a :panel/scene ref) —
+  the scene counterpart. Useful e.g. to see what references a scene before
+  deleting it."
+  [store scene-id]
+  (documents-with-panel-attr store :panel/scene scene-id))
+
+(defn- focal-key
+  "Normalizes a focal ref/name to a case-insensitive comparison key: strips
+  any :character/ prefix and lower-cases the name (\":character/Nei\",
+  \"Nei\", \"nei\" all collapse to \"nei\")."
+  [s]
+  (-> (str s) (str/replace #"^:character/" "") str/lower))
+
+(defn character-refs
+  "All distinct :character/<Name> refs appearing in any panel's :panel/focal —
+  the cast that the storyboard datoms actually reference."
+  [store]
+  (vec (sort (-q store [:find '[?ref ...] :where ['?p :panel/focal '?ref]]))))
+
+(defn resolve-character-ref
+  "Resolves a user/LLM-supplied character argument (a bare name like \"nei\" or
+  a full ref \":character/Nei\", in any case) to the canonical stored focal
+  ref, or nil if no panel features that character. Case-insensitive so chat /
+  query input that doesn't match the stored casing still finds documents —
+  the Datalog value match itself is exact, so resolution happens here."
+  [store arg]
+  (let [want (focal-key arg)]
+    (some (fn [ref] (when (= want (focal-key ref)) ref)) (character-refs store))))
+
+(defn storyboard-panel
+  "The storyboard panel map at `index` within document `doc-id`, or nil."
+  [store doc-id index]
+  (when-let [doc (load-document store doc-id)]
+    (nth (:page/panels (:page doc)) index nil)))
+
+(defn stats
+  "Datalog-powered counts of the durable entities — a dashboard / overview.
+  Each is a one-line collection query over the unique id attribute."
+  [store]
+  (let [n (fn [attr] (count (-q store [:find ['?id '...] :where ['?e attr '?id]])))]
+    {:documents    (n :doc/id)
+     :characters   (n :character/id)
+     :scenes       (n :scene/id)
+     :renders      (n :panel/id)          ; rendered (generated) panels
+     :page-renders (n :page-render/id)}))
+
+(defn renders-for-document
+  "Rendered-panel headers for a document (the :panel/id entities linked via
+  :panel/doc-id), sorted by index — image payload excluded so the listing
+  stays small. Useful to see which panels are rendered and their QA scores."
+  [store doc-id]
+  (->> (-q store [:find '[?id ...] :where ['?p :panel/doc-id doc-id] ['?p :panel/id '?id]])
+       (map (fn [id]
+              (let [m (-pull store '[:panel/id :panel/index :panel/seed :panel/image-key
+                                     :panel/score :panel/status] [:panel/id id])]
+                (cond-> {:id id :index (:panel/index m) :seed (:panel/seed m)
+                         :score (:panel/score m) :status (:panel/status m)}
+                  (:panel/image-key m) (assoc :image-url (domain/blob-url (:panel/image-key m)))))))
+       (sort-by #(or (:index %) 0))
+       vec))
+
+(defn- panels-with-panel-attr
+  "Datalog join: the individual panels matching [attr value] as
+  {:doc-id :index} sorted by (doc, index) — shared by the by-character /
+  by-scene panel queries."
+  [store attr value]
+  (->> (-q store [:find '?id '?idx
+                  :where ['?p attr value]
+                         ['?p :stb/doc '?id]
+                         ['?p :panel/index '?idx]])
+       (map (fn [[id idx]] {:doc-id id :index idx}))
+       (sort-by (juxt :doc-id :index))
+       vec))
+
+(defn panels-with-character
+  "The individual panels featuring `char-ref`, as {:doc-id :index}."
+  [store char-ref]
+  (panels-with-panel-attr store :panel/focal char-ref))
+
+(defn panels-with-scene
+  "The individual panels set in `scene-id`, as {:doc-id :index} — the scene
+  counterpart of panels-with-character."
+  [store scene-id]
+  (panels-with-panel-attr store :panel/scene scene-id))
+
+(defn save-entity!
+  "Upserts an entity under attribute namespace `ns` (e.g. \"panel\") from a
+  field map. Field key :k → attribute :ns/k; nil fields are skipped; :id
+  is required and becomes :ns/id; :status defaults to \"done\". Used by the
+  generation graphs' persist steps."
+  [store ns {:keys [id] :as fields}]
+  (let [attr (fn [k] (keyword ns (name k)))
+        base {(attr :id) id (attr :status) (or (:status fields) "done")}
+        e (reduce-kv (fn [m k v]
+                       (if (and (some? v) (not (#{:id :status} k))) (assoc m (attr k) v) m))
+                     base (dissoc fields :id :status))]
+    (-transact! store [e])
+    {:id id :ok true}))
+
+(defn save-panel!     [store panel]     (save-entity! store "panel" panel))
+(defn save-character! [store character] (save-entity! store "character" character))
+(defn save-scene!     [store scene]     (save-entity! store "scene" scene))
+
+(defn load-panel
+  "The stored rendered panel entity by :panel/id, or nil."
+  [store id]
+  (let [m (-pull store '[:panel/id :panel/doc-id :panel/index :panel/prompt :panel/seed
+                         :panel/model :panel/image-b64 :panel/image-key :panel/image-mime
+                         :panel/score :panel/critique :panel/faces :panel/jump-qa :panel/status
+                         ;; seedance video->frame-sample provenance (mangaka.graphs.generate-panel-video)
+                         :panel/source :panel/video-model :panel/video-source :panel/video-error
+                         :panel/frame-time-ms :panel/frame-count]
+                 [:panel/id id])]
+    (when (:panel/id m) (dissoc m :db/id))))
+(defn save-page-render! [store render]  (save-entity! store "page-render" render))
+
+(defn- load-entity
+  "Pulls a full entity by its unique :ns/id, or nil. `attrs` is the pull
+  pattern; the entity is absent when its id attr is missing. Strips the
+  internal :db/id so it never leaks to clients."
+  [store ns attrs id]
+  (let [m (-pull store attrs [(keyword ns "id") id])]
+    (when (get m (keyword ns "id")) (dissoc m :db/id))))
+
+(defn- list-ids
+  "All entity ids under :ns/id, with a per-id header built by `header-fn`."
+  [store ns header-fn]
+  (->> (-q store [:find ['?id '...] :where ['?e (keyword ns "id") '?id]])
+       (map (fn [id] (header-fn id)))
+       (sort-by :id)
+       vec))
+
+(defn load-character [store id]
+  (load-entity store "character"
+               '[:character/id :character/name :character/prompt :character/seed
+                 :character/model :character/image-b64 :character/image-key :character/image-mime
+                 :character/enrichment :character/status]
+               id))
+
+(defn list-characters [store]
+  (list-ids store "character"
+            (fn [id] {:id id
+                      :name (:character/name (-pull store '[:character/name] [:character/id id]) "")})))
+
+(defn character-graph
+  "The cast's relationship graph as data: {:nodes [{:id :name}] :edges
+  [{:from :to :rel}] :count n}. Each character's :character/enrichment may
+  carry {:relationships {<other> <rel>}} (populated by importGhosthacker);
+  an edge is (this character → the named other). Shared by the
+  analyzeCharacterGraph graph and the chat agent's cast grounding tool."
+  [store]
+  (let [chars (->> (list-characters store)
+                   (map #(load-character store (:id %)))
+                   (filter some?))
+        nodes (mapv (fn [c] {:id (:character/id c) :name (:character/name c)}) chars)
+        edges (vec (for [c chars
+                         :let [enr (some->> (:character/enrichment c)
+                                            (-read-string store))]
+                         [target rel] (:relationships enr)]
+                     {:from (:character/name c) :to (name target) :rel rel}))]
+    {:nodes nodes :edges edges :count (count nodes)}))
+
+(defn load-scene [store id]
+  (load-entity store "scene"
+               '[:scene/id :scene/name :scene/prompt :scene/seed :scene/model
+                 :scene/image-b64 :scene/image-key :scene/image-mime :scene/enrichment :scene/status]
+               id))
+
+(defn list-scenes [store]
+  (list-ids store "scene"
+            (fn [id] {:id id
+                      :name (:scene/name (-pull store '[:scene/name] [:scene/id id]) "")})))
+
+(defn load-page-render [store id]
+  (load-entity store "page-render"
+               '[:page-render/id :page-render/doc-id :page-render/prompt :page-render/seed
+                 :page-render/model :page-render/image-b64 :page-render/image-key
+                 :page-render/image-mime :page-render/jump-qa :page-render/score
+                 :page-render/review :page-render/status]
+               id))
+
+(defn save-model! [store model] (save-entity! store "model" model))
+
+(defn load-model
+  "The stored own-model lifecycle entity by :model/id, or nil
+  (train_character_lora's register step; ADR-2607164200)."
+  [store id]
+  (load-entity store "model"
+               '[:model/id :model/kind :model/character :model/base :model/dataset
+                 :model/job :model/lora-cid :model/status]
+               id))

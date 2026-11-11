@@ -1,0 +1,253 @@
+(ns mangaka-reader.worker
+  "Cloudflare Worker (workerd) host for the manga.gftd.ai reader — thin
+  D1/R2/auth/CORS shell over the pure mangaka-reader.render. shadow-cljs
+  :esm build emits `export default { fetch }`.
+
+  Bindings (wrangler.jsonc): MANGAKA_DB (D1), CDN (R2),
+  MANGAKA_ADMIN_TOKEN (secret — studio write auth, ADR-2607071100 ③)."
+  (:require [kotoba.lang.text :as str]
+            [mangaka-reader.render :as render]))
+
+(def ^:private blob-prefix "blobs/mng4k4x1.gftd.ai/")
+
+(def ^:private api-cors
+  {"access-control-allow-origin" "*"
+   "access-control-allow-methods" "GET,POST,OPTIONS"
+   "access-control-allow-headers" "authorization,content-type"})
+
+(defn- html-response [html]
+  (js/Response. html #js {:headers #js {"content-type" "text/html; charset=utf-8"}}))
+
+(defn- json-response
+  ([m] (json-response m 200))
+  ([m status]
+   (js/Response. (js/JSON.stringify (clj->js m))
+                 (clj->js {:status status
+                           :headers (assoc api-cors
+                                           "content-type" "application/json; charset=utf-8")}))))
+
+;; ── D1 helpers ───────────────────────────────────────────────────────────────
+
+(defn- stmt [^js env sql binds]
+  (let [^js p (.prepare ^js (.-MANGAKA_DB env) sql)]
+    (if (seq binds)
+      ;; .bind is variadic — apply it over the bind values
+      (.apply (.-bind p) p (clj->js (vec binds)))
+      p)))
+
+(defn- q-all [env sql & binds]
+  (-> (.all (stmt env sql binds))
+      (.then (fn [^js r] (js->clj (or (.-results r) #js []) :keywordize-keys true)))))
+
+(defn- q-first [env sql & binds]
+  (-> (.first (stmt env sql binds))
+      (.then (fn [row] (when row (js->clj row :keywordize-keys true))))))
+
+(defn- q-run [env sql & binds]
+  (.run ^js (stmt env sql binds)))
+
+(defn- parse-props [s]
+  (try (js->clj (js/JSON.parse (or s "{}")) :keywordize-keys true)
+       (catch :default _ {})))
+
+(defn- with-props [row]
+  (when row (update row :props parse-props)))
+
+;; ── data access ──────────────────────────────────────────────────────────────
+
+(defn- work-rows [env]
+  (q-all env "SELECT rkey, title, name, props FROM vertex_mangaka WHERE kind='work' ORDER BY created_at DESC LIMIT 200"))
+
+(defn- cover-key
+  "First page's blob key for a work (index thumbnail), or nil."
+  [env rkey]
+  (-> (q-first env "SELECT rkey, props FROM vertex_mangaka WHERE kind='page' AND json_extract(props,'$.workRkey')=? ORDER BY page_number ASC LIMIT 1" rkey)
+      (.then (fn [row]
+               (when row (or (:blobKey (parse-props (:props row))) (:rkey row)))))))
+
+(defn- work-row [env rkey]
+  (-> (q-first env "SELECT rkey, title, name, props FROM vertex_mangaka WHERE kind='work' AND rkey=? LIMIT 1" rkey)
+      (.then with-props)))
+
+(defn- version-rows
+  "同じ props.versionGroup を持つ work 群 (バージョン切替 — versions.edn が
+  SSoT、D1 の props はその projection。ADR-2607165100 addendum 3)。"
+  [env group]
+  (q-all env "SELECT rkey, title, props FROM vertex_mangaka WHERE kind='work' AND json_extract(props,'$.versionGroup')=? ORDER BY created_at ASC LIMIT 20" group))
+
+(defn- versions-of
+  "work の versionGroup から切替候補 [{:rkey :label :current?}] を解決する
+  Promise。group が無い work は [] (バーは描かれない)。"
+  [env work current-rkey]
+  (if-let [group (get-in work [:props :versionGroup])]
+    (-> (version-rows env group)
+        (.then (fn [rows]
+                 (mapv (fn [r]
+                         (let [p (parse-props (:props r))]
+                           {:rkey (:rkey r)
+                            :label (or (:versionLabel p) (:rkey r))
+                            :current? (= (:rkey r) current-rkey)}))
+                       rows))))
+    (js/Promise.resolve [])))
+
+(defn- page-list [env rkey]
+  (-> (q-all env "SELECT rkey, page_number, props FROM vertex_mangaka WHERE kind='page' AND json_extract(props,'$.workRkey')=? ORDER BY page_number ASC LIMIT 1000" rkey)
+      (.then (fn [rows]
+               (mapv (fn [{:keys [rkey page_number props]}]
+                       {:n page_number
+                        :src (str "/img/" (render/url-encode
+                                           (or (:blobKey (parse-props props)) rkey)))})
+                     rows)))))
+
+;; ── handlers ─────────────────────────────────────────────────────────────────
+
+(defn- handle-index [env]
+  (-> (work-rows env)
+      (.then (fn [rows]
+               (-> (js/Promise.all
+                    (clj->js (map (fn [{:keys [rkey]}] (cover-key env rkey)) rows)))
+                   (.then (fn [covers]
+                            (let [works (map (fn [row cover]
+                                               (render/row->index-work
+                                                (assoc (with-props row) :cover cover)))
+                                             rows (array-seq covers))]
+                              (html-response (render/index-html works))))))))))
+
+(defn- handle-img [env key]
+  (-> (.get ^js (.-CDN ^js env) (str blob-prefix key))
+      (.then (fn [^js obj]
+               (if-not obj
+                 (js/Response. "not found" #js {:status 404})
+                 (js/Response. (.-body obj)
+                               (clj->js {:headers {"content-type" (or (some-> obj .-httpMetadata .-contentType) "image/png")
+                                                   "cache-control" "public, max-age=31536000, immutable"
+                                                   "access-control-allow-origin" "*"}})))))))
+
+(defn- handle-work [env rkey]
+  (-> (work-row env rkey)
+      (.then (fn [work]
+               (if-not work
+                 (html-response (render/not-found-html))
+                 (-> (js/Promise.all #js [(page-list env rkey) (versions-of env work rkey)])
+                     (.then (fn [[pages versions]]
+                              (let [title (or (:title work) (:name work))
+                                    author (or (get-in work [:props :author]) "")
+                                    data-json (js/JSON.stringify
+                                               (clj->js {:title title :author author :pages pages}))]
+                                (html-response
+                                 (render/work-html {:title title :author author
+                                                    :versions versions}
+                                                   data-json)))))))))))
+
+(defn- handle-works-api [env]
+  (-> (work-rows env)
+      (.then (fn [rows]
+               (-> (js/Promise.all
+                    (clj->js (map (fn [{:keys [rkey]}] (cover-key env rkey)) rows)))
+                   (.then (fn [covers]
+                            (json-response
+                             (render/works-json
+                              (map (fn [row cover] (assoc (with-props row) :cover cover))
+                                   rows (array-seq covers)))))))))))
+
+(defn- handle-work-api [env rkey]
+  (-> (work-row env rkey)
+      (.then (fn [work]
+               (if-not work
+                 (json-response {:error "not found"} 404)
+                 (-> (js/Promise.all #js [(page-list env rkey) (versions-of env work rkey)])
+                     (.then (fn [[pages versions]]
+                              (json-response
+                               (cond-> (render/work-json work pages)
+                                 (seq versions) (assoc :versions versions)))))))))))
+
+(defn- handle-work-update [^js env ^js req rkey]
+  (let [auth (or (.get (.-headers req) "authorization") "")
+        token (.-MANGAKA_ADMIN_TOKEN env)]
+    (if (or (empty? (str token)) (not= auth (str "Bearer " token)))
+      (js/Promise.resolve (json-response {:error "unauthorized"} 401))
+      (-> (.json req)
+          (.then (fn [j] (js->clj j :keywordize-keys true))
+                 (fn [_] :invalid-json))
+          (.then (fn [body]
+                   (if (= body :invalid-json)
+                     (json-response {:error "invalid json"} 400)
+                     (-> (work-row env rkey)
+                         (.then (fn [work]
+                                  (if-not work
+                                    (json-response {:error "not found"} 404)
+                                    (let [props (render/merge-work-props (:props work) body)
+                                          title (render/pick-title body (:title work))]
+                                      (-> (q-run env "UPDATE vertex_mangaka SET title=?, props=? WHERE kind='work' AND rkey=?"
+                                                 title (js/JSON.stringify (clj->js props)) rkey)
+                                          (.then (fn [_]
+                                                   (json-response {:ok true :rkey rkey
+                                                                   :title title :props props}))))))))))))))))
+
+(defn- handle-page-update [^js env ^js req {:keys [rkey page-number]}]
+  (let [auth (or (.get (.-headers req) "authorization") "")
+        token (.-MANGAKA_ADMIN_TOKEN env)]
+    (if (or (empty? (str token)) (not= auth (str "Bearer " token)))
+      (js/Promise.resolve (json-response {:error "unauthorized"} 401))
+      (-> (.json req)
+          (.then (fn [j] (js->clj j :keywordize-keys true))
+                 (fn [_] :invalid-json))
+          (.then (fn [body]
+                   (if (= body :invalid-json)
+                     (json-response {:error "invalid json"} 400)
+                     (-> (q-first env "SELECT rkey, props FROM vertex_mangaka WHERE kind='page' AND json_extract(props,'$.workRkey')=? AND page_number=? LIMIT 1"
+                                  rkey page-number)
+                         (.then (fn [row]
+                                  (if-not row
+                                    (json-response {:error "not found"} 404)
+                                    (let [props (render/merge-page-props
+                                                 (parse-props (:props row)) body)]
+                                      (-> (q-run env "UPDATE vertex_mangaka SET props=? WHERE kind='page' AND rkey=?"
+                                                 (js/JSON.stringify (clj->js props)) (:rkey row))
+                                          (.then (fn [_]
+                                                   (json-response {:ok true :rkey rkey
+                                                                   :page page-number
+                                                                   :props props}))))))))))))))))
+
+;; ── router ───────────────────────────────────────────────────────────────────
+
+(defn- decode [s] (js/decodeURIComponent s))
+
+(defn fetch-handler [^js req env _ctx]
+  (let [url (js/URL. (.-url req))
+        path (.-pathname url)
+        method (.-method req)]
+    (-> (cond
+          (or (= path "/") (= path "")) (handle-index env)
+
+          (str/starts-with? path "/img/")
+          (handle-img env (decode (subs path 5)))
+
+          (and (= method "OPTIONS") (str/starts-with? path "/api/"))
+          (js/Promise.resolve (js/Response. nil (clj->js {:status 204 :headers api-cors})))
+
+          (= path "/api/works") (handle-works-api env)
+
+          (and (= method "POST") (render/parse-page-path path))
+          (handle-page-update env req (update (render/parse-page-path path)
+                                              :rkey decode))
+
+          (and (= method "POST") (str/starts-with? path "/api/work/"))
+          (handle-work-update env req (decode (subs path 10)))
+
+          (str/starts-with? path "/api/work/")
+          (handle-work-api env (decode (subs path 10)))
+
+          (str/starts-with? path "/work/")
+          (handle-work env (decode (subs path 6)))
+
+          (= path "/health")
+          (js/Promise.resolve
+           (js/Response. (js/JSON.stringify #js {:ok true})
+                         #js {:headers #js {"content-type" "application/json"}}))
+
+          :else (js/Promise.resolve (js/Response. "not found" #js {:status 404})))
+        (.catch (fn [e]
+                  (js/Response. (str "error: " (.-message e)) #js {:status 500}))))))
+
+(def handler #js {:fetch fetch-handler})

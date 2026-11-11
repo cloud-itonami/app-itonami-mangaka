@@ -1,0 +1,118 @@
+(ns mangaka.graphs.recover-storyboard
+  "recoverStoryboard — 完成ページ画像から storyboard datoms を復元
+  (ADR-2607165100 addendum 4)。
+
+  退役 Python 世代の公開物は最終 PNG しか残っておらず EDN 正本を失っている
+  (45p の storyboard 源は D1 にも mangaka-data にも無い — 2026-07-17 調査)。
+  このグラフは「PNG → EDN 正本化」の実行系:
+
+    1. perception/detect-panels — コマ矩形 (読み順)
+    2. kami.mangaka.qa.recover/page-script-prompt — VLM で per-panel の
+       shot / 登場キャラ (store の cast で ground) / 台詞 / SFX を抽出
+    3. merge-boxes-and-script — 読み順 zip (食い違いは :mismatch で明示)
+    4. storyboard doc に組み上げ、docs/make-save で永続化 + lint
+
+  復元は**推定**であり原本ではない — doc には :page/recovered-from を焼き、
+  結果にも :recovered? true を返す。offline (vision なし) は :applied false
+  で何も書かない。復元した doc は既存の doc-aware 生成 (品質ループ /
+  coscientist) の入力にそのまま使える — これが v11 全ページ化の入口。
+
+  Input: {:image-b64 …} または {:panel-id \"…\"} (stored render)、
+  :doc-id (出力 storyboard id、必須)、:page-number (default 1)、
+  :persist? (default true)。"
+  (:require [mangaka.blob :as blob]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.documents :as docs]
+            [mangaka.graphs.lint-document :as lint]
+            [mangaka.graphs.util :as util]
+            [mangaka.llm :as llm]
+            [mangaka.perception :as perception]
+            [mangaka.store :as store]
+            [kami.mangaka.qa.recover :as recover]))
+
+(defn- bad! [msg] (throw (ex-info msg {:type :bad-input})))
+
+(defn- image-of [store blobs input]
+  (or (:image-b64 input)
+      (when-let [pid (:panel-id input)]
+        (let [p (store/load-panel store pid)]
+          (or (when (and blobs (:panel/image-key p))
+                (:b64 (blob/fetch blobs (:panel/image-key p))))
+              (:panel/image-b64 p))))))
+
+(defn- ->storyboard-panel
+  "復元パネル {:index :rect :shot :characters :dialogue :sfx} → domain の
+  storyboard panel datoms。キャラ名は cast に照合済み (\"unknown\" は focal
+  に載せない — 捏造キャラを正本に混ぜない)。"
+  [store {:keys [index rect shot characters dialogue sfx]}]
+  (cond-> {:panel/index index
+           :panel/rect (vec rect)
+           :panel/shot shot}
+    (seq (remove #{"unknown"} characters))
+    (assoc :panel/focal (mapv #(or (store/resolve-character-ref store %)
+                                   (domain/character-ref %))
+                              (remove #{"unknown"} characters)))
+    (seq dialogue)
+    (assoc :panel/bubbles (mapv (fn [t] {:bubble/text t}) dialogue))
+    (seq sfx)
+    (assoc :panel/sfx (mapv (fn [t] {:sfx/text t :sfx/pos [0.5 0.5]
+                                     :sfx/scale 1.5 :sfx/style "impact"})
+                            sfx))))
+
+(defn make
+  "opts (optional): {:vision-fn (fn [prompt image-b64] → map|nil)} — 既定は
+  llm/vision-json。detect-panels と page-script 抽出の両方に使う。"
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [vision-fn]}]
+   (let [vision-fn (or vision-fn llm/vision-json)
+         save-g (docs/make-save store)
+         lint-g (lint/make store)]
+     (util/single-node :recover-storyboard
+       (fn [{:keys [input]}]
+         (let [doc-id (or (:doc-id input) (:doc_id input))
+               _ (when-not (seq (str doc-id)) (bad! "provide :doc-id"))
+               img (or (image-of store blobs input)
+                       (bad! "provide :image-b64 or :panel-id"))
+               boxes (perception/detect-panels img vision-fn)]
+           (if-not (seq boxes)
+             {:status "ok" :applied false :doc-id doc-id
+              :method "no-vision-offline"
+              :note "panel detection returned no signal — nothing recovered, nothing written"}
+             (let [cast (mapv :name (store/list-characters store))
+                   ;; 同定 co-scientist の勝者 (ADR-2607165100 addendum 5):
+                   ;; cast 名のみだと grounding がほぼ 0 になる — 各キャラの
+                   ;; 外見記述 (:character/prompt = import 時の text_desc) を
+                   ;; ガイドとして prompt に添付すると grounding が上がる。
+                   appearance (into {}
+                                    (keep (fn [{:keys [id name]}]
+                                            (when-let [d (:character/prompt
+                                                          (store/load-character store id))]
+                                              [name d])))
+                                    (store/list-characters store))
+                   script (recover/parse-page-script
+                           (vision-fn (recover/page-script-prompt cast (count boxes) appearance) img)
+                           cast)
+                   merged (recover/merge-boxes-and-script boxes (:panels script))
+                   panels (mapv #(->storyboard-panel store %) (:panels merged))
+                   doc {:id doc-id :kind "storyboard"
+                        :title (str "recovered: " doc-id)
+                        :page {:page/number (or (:page-number input) 1)
+                               :page/title (or (:synopsis script) (str "recovered " doc-id))
+                               :page/layout "recovered"
+                               :page/recovered-from (or (:panel-id input) "image-b64")
+                               :page/base-tags ["monochrome" "screentone" "manga"]
+                               :page/panels panels}}
+                   persisted (when (not= false (:persist? input))
+                               ((docs/handler save-g) doc nil))
+                   lint-res ((lint/handler lint-g) {:doc-id doc-id} nil)]
+               {:status "ok" :applied true :recovered? true
+                :doc-id doc-id
+                :panels (count panels)
+                :synopsis (:synopsis script)
+                :mismatch (:mismatch merged)
+                :dialogue-count (reduce + 0 (map (comp count :dialogue) (:panels merged)))
+                :persisted (boolean persisted)
+                :lint (select-keys lint-res [:ok :count])
+                :doc doc}))))))))
+
+(def handler util/result-handler)

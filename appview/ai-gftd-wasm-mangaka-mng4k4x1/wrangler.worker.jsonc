@@ -1,0 +1,26 @@
+{
+  // Lean CF-Worker-only EDGE edition (phase 4). Separate from the project's JVM
+  // langgraph reference (../../clj) and the live wrangler.jsonc. main = src/app.ts
+  // (cljs-backed dual-write Worker, importing ../js/mangaka.js).
+  "name": "mangaka-worker-mng4k4x1",
+  "main": "src/edge-app.ts",
+  "compatibility_date": "2025-03-17",
+  "compatibility_flags": ["nodejs_compat", "nodejs_als"],
+  "alias": {
+    "@gftd/magatama-host-sdk": "/Users/junkawasaki/gftdcojp/ai-gftd-apps-gftdcojp/orgs/gftdcojp/ai-gftd-magatama-host-sdk/src/index.ts"
+  },
+  "vars": {
+    "KOTOBA_BACKEND_URL": "https://kotobase.net",
+    "KOTOBA_DATOMIC_NSID": "ai.gftd.apps.kotobase.datomic",
+    "KOTOBA_GRAPH": "mangaka-v1"
+  },
+  "d1_databases": [
+    { "binding": "MANGAKA_DB", "database_name": "ai-gftd-mangaka", "database_id": "534176d4-980b-44d9-ad09-0e3e0ff327d9" }
+  ],
+  "r2_buckets": [
+    { "binding": "CACHE_R2", "bucket_name": "ai-gftd-cache" }
+  ],
+  "build": {
+    "command": "cd ../../clj-edge && kbb -M:cljs -m shadow.cljs.devtools.cli release worker"
+  }
+}

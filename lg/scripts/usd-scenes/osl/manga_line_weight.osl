@@ -1,0 +1,56 @@
+// manga_line_weight.osl — Open Shading Language NPR ink shader for
+// manga-style edge-detected line rendering. Compatible with Blender
+// Cycles + USD MaterialX binding.
+//
+// Reads `narrative:tension` (0..1) from the USD prim's customData
+// via getattribute(), then renders an edge line whose thickness =
+// base_thickness + tension * tension_multiplier. Anxious / shocked
+// panels (tension > 0.7) get bold dramatic ink; calm panels stay
+// thin and clean.
+//
+// Compile: oslc manga_line_weight.osl -o manga_line_weight.oso
+// Reference in MaterialX: nodedef="ND_OSL_MangaLineWeight"
+
+shader manga_line_weight(
+    float base_thickness = 2.0,
+    float tension_multiplier = 1.5,
+    float tension = 0.0,
+    color ink_color = color(0, 0, 0),
+    color paper_color = color(1, 1, 1),
+
+    output color Ci = color(1, 1, 1),
+    output closure color BSDF = 0
+) {
+    // Pull tension from prim attribute if not driven by upstream
+    float t = tension;
+    if (t == 0.0) {
+        float attr_val = 0.0;
+        if (getattribute("narrative:tension", attr_val))
+            t = attr_val;
+    }
+
+    float thickness = base_thickness + t * tension_multiplier;
+
+    // Edge detection via screen-space derivatives of position.
+    // For Blender Cycles, this gives a thick contour around the
+    // silhouette of each mesh.
+    vector dPdu = Dx(P);
+    vector dPdv = Dy(P);
+    float edge_strength = length(dPdu) + length(dPdv);
+
+    // Threshold proportional to thickness — higher tension = wider band
+    float edge_thresh = 0.5 / thickness;
+
+    // Also include surface-normal-driven hatching for crease-rich
+    // silhouettes (manga "crease lines")
+    float n_dot_v = abs(dot(N, I));
+    float silhouette = 1.0 - smoothstep(0.0, 0.3, n_dot_v);
+
+    float ink_mask = max(
+        smoothstep(edge_thresh, edge_thresh * 0.5, edge_strength),
+        silhouette
+    );
+
+    Ci = mix(paper_color, ink_color, ink_mask);
+    BSDF = Ci * diffuse(N);
+}

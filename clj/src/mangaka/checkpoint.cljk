@@ -1,0 +1,12 @@
+(ns mangaka.checkpoint
+  "A latest-only graph checkpointer over a Datomic-API conn — facade over
+  `langgraph-store.checkpoint` (extracted; mangaka.checkpoint and
+  animeka.checkpoint were byte-identical copies — see
+  90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md and
+  90-docs/adr/2607011900-genapp-clj-mangaka-animeka-commons.md). Kept as a
+  facade so existing `mangaka.checkpoint/...` call sites (`runtime.cljc`,
+  `graphs/chat.cljc`) don't change."
+  (:require [langgraph-store.checkpoint :as g]))
+
+(def schema g/schema)
+(def latest-checkpointer g/latest-checkpointer)

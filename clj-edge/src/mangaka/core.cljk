@@ -1,0 +1,60 @@
+(ns mangaka.core
+  "mangaka CF-Worker EDGE SSoT (phase 4). Shared wire/D1/util logic lives in
+  gftd.edge-core; this holds only mangaka's entities, table config, queries.
+  Single-table D1 model (vertex_mangaka, kind-discriminated)."
+  (:require [gftd.edge-core :as ec]))
+
+;; shared helpers (re-exported so worker_api + callers keep one import)
+(def ->int ec/->int)
+(def slug ec/slug)
+(def gen-rkey ec/gen-rkey)
+(def shape-rows ec/shape-rows)
+(def shape-pull-rows ec/shape-pull-rows)
+(def pulled-entity ec/pulled-entity)
+(def lookup-ref ec/lookup-ref)
+(def entity-pull-edn ec/entity-pull-edn)
+(def paginate ec/paginate)
+(def ->tx-edn ec/->tx-edn)
+
+(def app-did "did:web:mangaka.gftd.ai")
+(defn vertex-id [kind rkey] (str "at://" app-did "/ai.gftd.mangaka." kind "/" rkey))
+
+;; ── entities ─────────────────────────────────────────────────────────────────
+(defn build-character [{:keys [id name status created-at]}]
+  (ec/prune {:character/id id :character/name name :character/status (or status "active") :character/created-at created-at}))
+(defn build-work [{:keys [id title status created-at]}]
+  (ec/prune {:work/id id :work/title title :work/status (or status "draft") :work/created-at created-at}))
+(defn build-environment [{:keys [id name status created-at]}]
+  (ec/prune {:environment/id id :environment/name name :environment/status (or status "active") :environment/created-at created-at}))
+(defn build-chapter [{:keys [id work-id title status created-at]}]
+  (ec/prune {:chapter/id id :chapter/work-id work-id :chapter/title title :chapter/status (or status "draft") :chapter/created-at created-at}))
+(defn build-page [{:keys [id chapter-id page-number status created-at]}]
+  (ec/prune {:page/id id :page/chapter-id chapter-id :page/page-number (ec/->int page-number 0) :page/status (or status "draft") :page/created-at created-at}))
+(defn build-panel [{:keys [id page-id panel-number status prompt seed image-key created-at]}]
+  (ec/prune {:panel/id id :panel/page-id page-id :panel/panel-number (ec/->int panel-number 0)
+             :panel/status (or status "draft") :panel/prompt prompt
+             :panel/seed (when (some? seed) (ec/->int seed 0)) :panel/image-key image-key :panel/created-at created-at}))
+
+(defn character->tx-edn   [in] (ec/->tx-edn (build-character in)))
+(defn work->tx-edn        [in] (ec/->tx-edn (build-work in)))
+(defn environment->tx-edn [in] (ec/->tx-edn (build-environment in)))
+(defn chapter->tx-edn     [in] (ec/->tx-edn (build-chapter in)))
+(defn page->tx-edn        [in] (ec/->tx-edn (build-page in)))
+(defn panel->tx-edn       [in] (ec/->tx-edn (build-panel in)))
+
+;; ── query-edn ────────────────────────────────────────────────────────────────
+(defn- q-list [id-attr] (pr-str [:find '(pull ?e [*]) :where ['?e id-attr '?id]]))
+(defn q-list-characters   [] (q-list :character/id))
+(defn q-list-works        [] (q-list :work/id))
+(defn q-list-environments [] (q-list :environment/id))
+(defn q-chapters-for-work [work-id] (pr-str [:find '(pull ?e [*]) :where ['?e :chapter/work-id work-id] ['?e :chapter/id '?id]]))
+(defn q-pages-for-chapter [chapter-id] (pr-str [:find '(pull ?e [*]) :where ['?e :page/chapter-id chapter-id] ['?e :page/id '?id]]))
+(defn q-panels-for-page [page-id] (pr-str [:find '(pull ?e [*]) :where ['?e :panel/page-id page-id] ['?e :panel/id '?id]]))
+
+;; ── D1 (single vertex_mangaka table) ─────────────────────────────────────────
+(def ^:private field->col
+  {"name" "name" "title" "title" "status" "status" "created-at" "created_at"
+   "page-number" "page_number" "panel-number" "panel_number"})
+(defn entity->d1 [owner-did e]
+  (ec/single-vertex->d1 {:table "vertex_mangaka" :owner owner-did
+                         :ns-prefix "ai.gftd.mangaka" :field->col field->col} e))

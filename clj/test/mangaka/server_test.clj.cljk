@@ -1,0 +1,160 @@
+(ns mangaka.server-test
+  "HTTP-surface tests — drive the ring handler directly (no socket), covering
+  the success path plus the structured error paths added for robustness:
+  404 unknown NSID, 400 malformed body, 500 handler exception."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [jsonista.core :as j]
+            [mangaka.blob :as blob]
+            [mangaka.runtime :as rt]
+            [mangaka.server :as server]))
+
+(defn- req [method uri & [body]]
+  (cond-> {:request-method method :uri uri
+           :headers {"content-type" "application/json"}}
+    body (assoc :body (java.io.ByteArrayInputStream. (.getBytes (j/write-value-as-string body))))))
+
+(defn- raw-req [method uri raw]
+  {:request-method method :uri uri
+   :headers {"content-type" "application/json"}
+   :body (java.io.ByteArrayInputStream. (.getBytes raw))})
+
+(defn- edn-req
+  "A request with an EDN body and no JSON headers — exercises the canonical
+  default wire format (EDN in, EDN out)."
+  [method uri data]
+  {:request-method method :uri uri :headers {"content-type" "application/edn"}
+   :body (java.io.ByteArrayInputStream. (.getBytes (pr-str data)))})
+
+(defn- accept-edn-get [uri] {:request-method :get :uri uri :headers {}})
+
+(defn- body-json [resp]
+  (when (string? (:body resp)) (j/read-value (:body resp) j/keyword-keys-object-mapper)))
+
+(defn- ctype [resp] (get-in resp [:headers "content-type"]))
+
+(deftest health-ok
+  (let [resp (server/app (req :get "/health"))]
+    (is (= 200 (:status resp)))
+    (is (= "ok" (:status (body-json resp))))))
+
+(deftest xrpc-success
+  (let [resp (server/app (req :post "/xrpc/ai.gftd.mangaka.health" {}))]
+    (is (= 200 (:status resp)))
+    (is (= "ok" (:status (body-json resp))))))
+
+(deftest wire-format-content-negotiation
+  (testing "EDN is the default response format (no Accept header)"
+    (let [resp (server/app (accept-edn-get "/health"))]
+      (is (= 200 (:status resp)))
+      (is (str/includes? (ctype resp) "edn"))
+      (is (= "ok" (:status (edn/read-string (:body resp)))))))    ; parses as EDN
+  (testing "JSON is served when the client asks via Accept"
+    (let [resp (server/app {:request-method :get :uri "/health"
+                            :headers {"accept" "application/json"}})]
+      (is (str/includes? (ctype resp) "json"))
+      (is (= "ok" (:status (body-json resp))))))
+  (testing "EDN request body round-trips through an EDN response"
+    (let [page {:page/number 1 :page/title "Arc" :page/panels []}
+          save (server/app (edn-req :post "/xrpc/ai.gftd.mangaka.saveDocument" {:id "edn1" :page page}))
+          load (server/app (edn-req :post "/xrpc/ai.gftd.mangaka.loadDocument" {:id "edn1"}))]
+      (is (str/includes? (ctype save) "edn"))
+      (is (= {:id "edn1" :ok true} (edn/read-string (:body save))))
+      (is (= page (:page (edn/read-string (:body load)))))))   ; namespaced keywords intact
+  (testing "the browser Studio path: a JSON storyboard round-trips slash-keys ↔ namespaced keywords"
+    ;; the Studio (api.cljs) speaks JSON. Slash-keys ("page/number") must decode
+    ;; to namespaced keywords on the way in, survive datom decomposition +
+    ;; reconstruction, and serialize back to slash-keys in the JSON response.
+    (let [page {:page/number 2 :page/title "Neon"
+                :page/panels [{:panel/index 0 :panel/shot "wide"
+                               :panel/focal [":character/Nei"] :panel/tags ["rain"]
+                               :panel/bubbles [{:bubble/text "起動"}]}]}
+          save (server/app (req :post "/xrpc/ai.gftd.mangaka.saveDocument" {:id "json1" :page page}))
+          load (server/app (req :post "/xrpc/ai.gftd.mangaka.loadDocument" {:id "json1"}))
+          loaded (body-json load)]
+      (is (str/includes? (ctype save) "json"))
+      (is (= {:id "json1" :ok true} (body-json save)))
+      ;; body-json re-keywordizes the JSON response, so slash-keys come back as
+      ;; namespaced keywords — proving both serialize directions are intact.
+      (is (= page (:page loaded)) "storyboard structure survives the JSON round-trip")
+      (is (= "ai.gftd.mangaka.storyboard" (get-in loaded [:lexicon :$type])) "derived lexicon present over JSON"))))
+
+(deftest xrpc-unknown-nsid-404
+  (let [resp (server/app (req :post "/xrpc/ai.gftd.mangaka.doesNotExist" {}))]
+    (is (= 404 (:status resp)))
+    (is (re-find #"unknown" (:error (body-json resp))))))
+
+(deftest malformed-body-400
+  (testing "invalid JSON yields a structured 400, not a 500"
+    (let [resp (server/app (raw-req :post "/xrpc/ai.gftd.mangaka.health" "{not json"))]
+      (is (= 400 (:status resp)))
+      (is (re-find #"malformed" (:error (body-json resp)))))))
+
+(deftest handler-exception-500
+  (testing "a throwing handler is caught and reported as a structured 500"
+    ;; :tags as a non-seqable value makes the plan node throw inside the graph.
+    (let [resp (server/app (req :post "/xrpc/ai.gftd.mangaka.mangakaGeneratePanel"
+                                {:prompt "x" :tags 123}))]
+      (is (= 500 (:status resp)))
+      (is (re-find #"graph error" (:error (body-json resp)))))))
+
+(deftest missing-required-input-400
+  (testing "a graph's missing-input validation surfaces as HTTP 400"
+    (let [resp (server/app (req :post "/xrpc/ai.gftd.mangaka.saveDocument" {:title "no id"}))]
+      (is (= 400 (:status resp)))
+      (is (re-find #"required input" (:error (body-json resp)))))))
+
+(deftest preview-route-serves-svg
+  (testing "GET /preview/:id returns image/svg+xml for a stored doc, 404 otherwise"
+    (server/app (edn-req :post "/xrpc/ai.gftd.mangaka.saveDocument"
+                         {:id "pvroute" :page {:page/number 1 :page/title "Pv"
+                                               :page/panels [{:panel/index 0 :panel/rect [0.1 0.1 0.8 0.3]}]}}))
+    (let [resp (server/app {:request-method :get :uri "/preview/pvroute" :headers {}})]
+      (is (= 200 (:status resp)))
+      (is (str/includes? (ctype resp) "svg"))
+      (is (str/starts-with? (:body resp) "<svg")))
+    (let [resp (server/app {:request-method :get :uri "/preview/nope" :headers {}})]
+      (is (= 404 (:status resp)))
+      (is (str/includes? (ctype resp) "svg")))))
+
+(deftest cors-enabled
+  (testing "responses carry CORS headers (cross-origin Studio on :8280 → API)"
+    (let [resp (server/app (req :get "/health"))]
+      (is (= "*" (get-in resp [:headers "access-control-allow-origin"])))))
+  (testing "OPTIONS preflight is answered (204 + CORS headers)"
+    (let [resp (server/app {:request-method :options :uri "/xrpc/ai.gftd.mangaka.saveDocument" :headers {}})]
+      (is (= 204 (:status resp)))
+      (is (= "*" (get-in resp [:headers "access-control-allow-origin"])))
+      (is (str/includes? (get-in resp [:headers "access-control-allow-methods"]) "POST")))))
+
+(deftest blob-route-serves-image
+  (testing "GET /blob/:key serves the stored image (content-type), 404 if absent"
+    (let [k (blob/put! (rt/blobs*) "QUJD" "image/png")
+          resp (server/app {:request-method :get :uri (str "/blob/" k) :headers {}})]
+      (is (= 200 (:status resp)))
+      (is (str/includes? (ctype resp) "image/png")))
+    (let [resp (server/app {:request-method :get :uri "/blob/sha256-nope" :headers {}})]
+      (is (= 404 (:status resp))))))
+
+(deftest runs-dispatch
+  (testing "/runs resolves a full NSID"
+    (let [resp (server/app (req :post "/runs" {:nsid "ai.gftd.mangaka.health" :input {}}))]
+      (is (= 200 (:status resp)))
+      (is (= "ok" (:status (body-json resp))))))
+  (testing "/runs resolves a short assistant_id (langgraph-SDK compat shim)"
+    ;; the SDK posts {assistant_id, input, thread_id} with the short id, not the
+    ;; full NSID — resolve-handler matches by (name assistant). Previously untested.
+    (let [resp (server/app (req :post "/runs" {:assistant_id "health" :input {}}))]
+      (is (= 200 (:status resp)))
+      (is (= "ok" (:status (body-json resp)))))
+    ;; a multi-word assistant id (save_document) round-trips a document
+    (let [save (server/app (req :post "/runs"
+                                {:assistant_id "save_document"
+                                 :input {:id "runs1" :page {:page/panels []}}}))
+          load (server/app (req :post "/runs" {:assistant_id "load_document" :input {:id "runs1"}}))]
+      (is (= 200 (:status save)))
+      (is (= {:id "runs1" :ok true} (body-json save)))
+      (is (= "runs1" (:id (body-json load))))))
+  (testing "/runs with an unknown id is 404"
+    (is (= 404 (:status (server/app (req :post "/runs" {:assistant_id "no_such_assistant" :input {}})))))))

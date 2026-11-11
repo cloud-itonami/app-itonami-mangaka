@@ -1,0 +1,16 @@
+{
+  "_note": "漫画写植フォントパレット — ai.gftd.mangaka.page#fontRole の 10 ロールを実フォントファミリへ束縛するデータ定義。page.fontPalette / bubble.font / sfx.font が参照する。商用ファミリは例示 (実運用は契約フォントに差し替え)。",
+  "schema": "ai.gftd.mangaka.page#fontDef[]",
+  "fontPalette": [
+    { "role": "antigochi",  "family": "イワタアンチック体B + 中ゴシックBBB", "fallback": "ヒラギノ角ゴ Pro", "weight": "medium", "usage": "標準セリフ。漢字=ゴシック / かな=アンチック。最も一般的な吹き出し本文。" },
+    { "role": "gothic",     "family": "中ゴシックBBB",         "fallback": "ヒラギノ角ゴ W6",   "weight": "bold",   "usage": "強調・ナレーション囲み・看板・叫びの芯。" },
+    { "role": "mincho",     "family": "リュウミン R-KL",       "fallback": "ヒラギノ明朝 ProN W3", "weight": "regular", "usage": "独白・モノローグ・地の文・シリアスな語り。" },
+    { "role": "bold-mincho","family": "太ミンA101",           "fallback": "ヒラギノ明朝 ProN W6", "weight": "bold",   "usage": "回想・荘厳・重厚な決め台詞。" },
+    { "role": "maru",       "family": "じゅん 501 / ナール",   "fallback": "ヒラギノ丸ゴ ProN",  "weight": "regular", "usage": "優しい・コミカル・子供・日常のほのぼの。" },
+    { "role": "kyokasho",   "family": "教科書ICA",            "fallback": "UD デジタル教科書体", "weight": "regular", "usage": "手紙・几帳面な人物・学校・公式文書。" },
+    { "role": "brush",      "family": "闘龍 / 勘亭流",         "fallback": "AppleMyungjo",      "weight": "heavy",  "usage": "和風・時代物・力強いタイトル・気合の描き文字。" },
+    { "role": "handwritten","family": "はるひ学園 / 小波",     "fallback": "Klee",             "weight": "regular", "usage": "小声・ツッコミ・心の声・余白のメモ書き。" },
+    { "role": "digital",    "family": "OCR-B / DSEG",         "fallback": "Noto Sans Mono",    "weight": "medium", "usage": "電子音・SMS・機械音声・放送・AI/システム表示。" },
+    { "role": "horror",     "family": "切付角ゴ / ひび割れ",   "fallback": "ヒラギノ明朝 + 震えエフェクト", "weight": "heavy", "usage": "恐怖・不穏・狂気。震え/歪みエフェクトを併用。" }
+  ]
+}

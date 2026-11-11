@@ -1,0 +1,76 @@
+(ns mangaka.cljs.api
+  "XRPC client for the Studio UI — thin fetch wrappers over /xrpc/{nsid}.
+  Mirrors the server's NSID surface; bodies are JSON (the server decodes
+  slash-keys into namespaced keywords)."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:private base "")
+
+(defn xrpc
+  "POST /xrpc/{nsid} with `body`; calls (on-ok result) / (on-err msg)."
+  [nsid body on-ok on-err]
+  (-> (js/fetch (str base "/xrpc/" nsid)
+                #js {:method "POST"
+                     :headers #js {"content-type" "application/json"}
+                     :body (js/JSON.stringify (clj->js body))})
+      (.then (fn [r] (.json r)))
+      (.then (fn [j] (let [m (js->clj j :keywordize-keys true)]
+                       (if (:error m) (on-err (:error m)) (on-ok m)))))
+      (.catch (fn [e] (on-err (str e))))))
+
+(defn list-documents [on-ok on-err]
+  (xrpc "ai.gftd.mangaka.listDocuments" {} #(on-ok (:documents %)) on-err))
+
+(defn load-document [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.loadDocument" {:id id} on-ok on-err))
+
+(defn save-document [doc on-ok on-err]
+  (xrpc "ai.gftd.mangaka.saveDocument" doc on-ok on-err))
+
+(defn generate-panel [spec on-ok on-err]
+  (xrpc "ai.gftd.mangaka.mangakaGeneratePanel" spec on-ok on-err))
+
+(defn generate-character [spec on-ok on-err]
+  (xrpc "ai.gftd.mangaka.mangakaGenerateCharacter" spec on-ok on-err))
+
+(defn list-characters [on-ok on-err]
+  (xrpc "ai.gftd.mangaka.listCharacters" {} #(on-ok (:characters %)) on-err))
+
+(defn documents-by-character [character on-ok on-err]
+  (xrpc "ai.gftd.mangaka.documentsByCharacter" {:character character} on-ok on-err))
+
+(defn documents-by-scene [scene on-ok on-err]
+  (xrpc "ai.gftd.mangaka.documentsByScene" {:scene scene} on-ok on-err))
+
+(defn list-renders [doc-id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.listRenders" {:doc-id doc-id} #(on-ok (:renders %)) on-err))
+
+(defn generate-page [doc-id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.mangakaGeneratePage" {:doc-id doc-id} on-ok on-err))
+
+(defn load-page-render [doc-id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.loadPageRender" {:doc-id doc-id} on-ok on-err))
+
+(defn delete-character [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.deleteCharacter" {:id id} on-ok on-err))
+
+(defn list-scenes [on-ok on-err]
+  (xrpc "ai.gftd.mangaka.listScenes" {} #(on-ok (:scenes %)) on-err))
+
+(defn generate-scene [prompt on-ok on-err]
+  (xrpc "ai.gftd.mangaka.mangakaGenerateScene" {:prompt prompt} on-ok on-err))
+
+(defn delete-scene [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.deleteScene" {:id id} on-ok on-err))
+
+(defn lint-document [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.lintDocument" {:doc-id id} on-ok on-err))
+
+(defn delete-document [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.deleteDocument" {:id id} on-ok on-err))
+
+(defn duplicate-document [id on-ok on-err]
+  (xrpc "ai.gftd.mangaka.duplicateDocument" {:id id} on-ok on-err))
+
+(defn chat [message on-ok on-err]
+  (xrpc "ai.gftd.mangaka.chat" {:message message} on-ok on-err))

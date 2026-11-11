@@ -1,0 +1,36 @@
+;; versions.edn — 公開バージョンレジストリ (SSoT; ADR-2607165100 addendum 3)。
+;;
+;; manga.gftd.ai の「バージョン切替」の正本。各 version は D1 上では独立した
+;; work 行 (rkey) で、props に {:versionGroup :versionLabel} を projection
+;; する — reader はそれで切替バーを描く (worker.cljs versions-of /
+;; render.cljc version-nav)。このファイルは append-only: 公開のたびに
+;; :versions へ追記し、既存 entry は書き換えない (元 tx の訂正は新 entry)。
+;;
+;; pipeline の値:
+;;   :python-v10  — 退役 Python runtime (lg_mangaka) 世代。jump QA v10 系。
+;;   :clj-edn     — 現行 CLJ/EDN チェーン (storyboard datoms → 品質ループ
+;;                  [8軸 rubric + :facePresence] → komawari 合成
+;;                  [kami-mangaka-page] → page-level jumpBenchmarkQa)。
+{:version-groups
+ [{:group "gh-arc0-1"
+   :work "Ghost Hacker"
+   :note "arc0-1。group 値は元祖 rkey と同名 (既公開 45p を動かさないため)。"
+   :versions
+   [{:rkey "gh-arc0-1"
+     :label "v10 (python)"
+     :pipeline :python-v10
+     :pages 45
+     :published "2026-06-29"
+     :note "退役 Python 世代の公開版。全 45 ページ。この registry 導入時に
+            props へ versionGroup/versionLabel を追記 (内容不変)。"}
+    {:rkey "gh-arc0-1-v11"
+     :label "v11 (clj/edn)"
+     :pipeline :clj-edn
+     :pages 2
+     :published "2026-07-17"
+     :note "p01: 正本 storyboard から (page jump QA 70.0 vs v10 の 52.0)。
+            p02: recoverStoryboard で v10 公開 PNG から復元した storyboard
+            経由 (jump QA 57.0 — v10 p02 と同点。復元は成立するが原本
+            storyboard 由来の p01 ほどの品質差は出ない: キャラ ground が
+            unknown に落ちると facePresence 軸が効かない、が実測知見)。
+            残り 43p のバッチは復元精度の改善 (キャラ同定) とセット。"}]}]}

@@ -1,0 +1,294 @@
+(ns mangaka.graphs.registry
+  "NSID → handler registry — the Clojure analog of server.cljc's GRAPHS +
+  _NSID_TO_ASSISTANT map. A handler is (fn [input thread-id] → result-map).
+
+  Built once from the runtime deps (durable store + execution-scratch
+  conn). New graph ports become further entries following this exact pattern."
+  (:require [mangaka.graphs.chat :as chat]
+            [mangaka.graphs.compat :as compat]
+            [mangaka.graphs.documents :as docs]
+            [mangaka.graphs.lint-document :as lint]
+            [mangaka.graphs.generate-panel :as panel]
+            [mangaka.graphs.generate-panel-loop :as panel-loop]
+            [mangaka.graphs.generate-panel-quality :as panel-quality]
+            [mangaka.graphs.generate-panel-video :as panel-video]
+            [mangaka.graphs.coscientist-panel :as coscientist]
+            [mangaka.graphs.train-character-lora :as train-lora]
+            [mangaka.graphs.generate-character :as character]
+            [mangaka.graphs.generate-scene :as scene]
+            [mangaka.graphs.generate-page :as page]
+            [mangaka.graphs.comfy-run :as comfy-run]
+            [mangaka.graphs.enrich-characters :as enrich]
+            [mangaka.graphs.query-storyboard :as query]
+            [mangaka.graphs.vision-score :as vision]
+            [mangaka.graphs.review-page :as review-page]
+            [mangaka.graphs.export-genko :as export-genko]
+            [mangaka.graphs.assets :as assets]
+            [mangaka.graphs.import-ghosthacker :as ghosthacker]
+            [mangaka.graphs.kami-frame :as kami-frame]
+            [mangaka.graphs.stats :as stats]
+            [mangaka.graphs.preview :as preview]
+            [mangaka.graphs.compose-komawari :as komawari]
+            [mangaka.graphs.analyze-character-graph :as char-graph]
+            [mangaka.graphs.detect-faces :as detect-faces]
+            [mangaka.graphs.jump-benchmark-qa :as jump-qa]
+            [mangaka.graphs.recover-storyboard :as recover-sb]
+            [mangaka.graphs.enrich-scene :as enrich-scene]
+            [mangaka.graphs.analyze-expression :as analyze-expr]))
+
+(defn build
+  "Returns {nsid → {:assistant kw :handler fn}}. `blobs` (optional) is a
+  content-addressed blob store for offloading generated images; nil keeps the
+  inline-base64 fallback (used by tests)."
+  ([store scratch-conn] (build store scratch-conn nil))
+  ([store scratch-conn blobs]
+  ;; Only chat needs the persistent scratch conn (conversation checkpoints).
+  ;; Generation / comfy graphs are one-shot and self-manage throwaway conns,
+  ;; so the process-wide scratch never accumulates their run state.
+  (let [save-g  (docs/make-save store)
+        load-g  (docs/make-load store)
+        list-g  (docs/make-list store)
+        delete-g (docs/make-delete store)
+        duplicate-g (docs/make-duplicate store)
+        update-panel-g (docs/make-update-panel store)
+        add-panel-g    (docs/make-add-panel store)
+        remove-panel-g (docs/make-remove-panel store)
+        reorder-panels-g (docs/make-reorder-panels store)
+        panel-g (panel/make store blobs)
+        panel-loop-g (panel-loop/make store blobs)
+        panel-quality-g (panel-quality/make store blobs)
+        panel-video-g (panel-video/make store blobs)
+        coscientist-g (coscientist/make store blobs)
+        train-lora-g (train-lora/make store)
+        char-g  (character/make store blobs)
+        scene-g (scene/make store blobs)
+        page-g  (page/make store blobs)
+        lint-g (lint/make store)
+        vision-g (vision/make store blobs)
+        review-page-g (review-page/make store blobs)
+        export-genko-g (export-genko/make store)
+        analyze-expr-g (analyze-expr/make store)   ; chat-agent :actions が参照するため前に束縛
+        ;; chat is agentic: read tools over the store + actions to design,
+        ;; operate, render & QA the app (characters/scenes/panels/pages, edit,
+        ;; lint structurally + vision-score the render)
+        chat-agent (chat/make store scratch-conn
+                              {:actions {:create-document (docs/handler save-g)
+                                         :duplicate-document (docs/handler duplicate-g)
+                                         :generate-character (character/handler char-g)
+                                         :generate-scene (scene/handler scene-g)
+                                         :generate-panel (panel/handler panel-g)
+                                         :generate-panel-quality (panel-quality/handler panel-quality-g)
+                                         :coscientist-panel (coscientist/handler coscientist-g)
+                                         :generate-page (page/handler page-g)
+                                         :add-panel (docs/handler add-panel-g)
+                                         :update-panel (docs/handler update-panel-g)
+                                         :remove-panel (docs/handler remove-panel-g)
+                                         :reorder-panels (docs/handler reorder-panels-g)
+                                         :lint (lint/handler lint-g)
+                                         :vision-score (vision/handler vision-g)
+                                         :analyze-expression (analyze-expr/handler analyze-expr-g)}})
+        comfy-g (comfy-run/make store)
+        enrich-g (enrich/make store)
+        query-g  (query/make store)
+        query-scene-g (query/make-by-scene store)
+        list-chars-g (assets/make-list-characters store)
+        list-scenes-g (assets/make-list-scenes store)
+        load-char-g (assets/make-load-character store)
+        load-scene-g (assets/make-load-scene store)
+        list-renders-g (assets/make-list-renders store)
+        page-render-g (assets/make-page-render store)
+        delete-char-g (assets/make-delete-character store)
+        delete-scene-g (assets/make-delete-scene store)
+        ghosthacker-g (ghosthacker/make store)
+        kami-frame-g (kami-frame/make store)
+        stats-g (stats/make store)
+        preview-g (preview/make store)
+        char-graph-g (char-graph/make store)
+        enrich-scene-g (enrich-scene/make store)
+        enrich-orgs-g (compat/make-enrich-organizations store)
+        enrich-envs-g (compat/make-enrich-environments store)
+        derive-incidents-g (compat/make-derive-chapter-incidents store)
+        import-chat-history-g (compat/make-import-chat-history store)
+        backfill-edges-g (compat/make-backfill-mangaka-edges store)
+        record-op-log-g (compat/make-record-op-log store)
+        debug-canvas-g (compat/make-debug-canvas-state store)
+        detect-faces-g (detect-faces/make store blobs)   ; 実装版 (VLM; ADR-2607164200 addendum 3)
+        jump-qa-g (jump-qa/make store blobs)             ; Jump 誌基準 n-samples 審査 (ADR-2607165100 addendum 1)
+        recover-sb-g (recover-sb/make store blobs)       ; PNG → storyboard 復元 (ADR-2607165100 addendum 4)
+        score-emotion-g (compat/make-score-emotion store)
+        auth-mint-g (compat/make-auth-mint-api-key store)
+        komawari-g (komawari/make store)]
+    {"ai.gftd.mangaka.health"
+     {:assistant :health
+      :handler (fn [_ _] {:status "ok" :app "mangaka.gftd.ai" :impl "clj"})}
+
+     "ai.gftd.mangaka.chat"
+     {:assistant :agent_chat :handler (chat/handler chat-agent)}
+     "ai.gftd.mangaka.pipelineChat"
+     {:assistant :pipeline_chat :handler (chat/handler chat-agent)}
+     "ai.gftd.mangaka.projectChat"
+     {:assistant :project_chat :handler (chat/handler chat-agent)}
+
+     "ai.gftd.mangaka.saveDocument"
+     {:assistant :save_document :handler (docs/handler save-g)}
+
+     "ai.gftd.mangaka.loadDocument"
+     {:assistant :load_document :handler (docs/handler load-g)}
+
+     "ai.gftd.mangaka.listDocuments"
+     {:assistant :list_documents :handler (docs/handler list-g)}
+
+     "ai.gftd.mangaka.deleteDocument"
+     {:assistant :delete_document :handler (docs/handler delete-g)}
+
+     "ai.gftd.mangaka.duplicateDocument"
+     {:assistant :duplicate_document :handler (docs/handler duplicate-g)}
+
+     "ai.gftd.mangaka.updatePanel"
+     {:assistant :update_panel :handler (docs/handler update-panel-g)}
+     "ai.gftd.mangaka.addPanel"
+     {:assistant :add_panel :handler (docs/handler add-panel-g)}
+     "ai.gftd.mangaka.removePanel"
+     {:assistant :remove_panel :handler (docs/handler remove-panel-g)}
+     "ai.gftd.mangaka.reorderPanels"
+     {:assistant :reorder_panels :handler (docs/handler reorder-panels-g)}
+
+     "ai.gftd.mangaka.mangakaGeneratePanel"
+     {:assistant :mangaka_generate_panel
+      :handler (panel/handler panel-g)
+      :stream  (panel/stream-handler panel-g)}        ; per-node SSE
+
+     "ai.gftd.mangaka.mangakaGeneratePanelLoop"
+     {:assistant :mangaka_generate_panel_loop
+      :handler (panel-loop/handler panel-loop-g)}      ; ReAct/co-scientist generate→critique→refine loop
+
+     "ai.gftd.mangaka.mangakaGeneratePanelQuality"
+     {:assistant :mangaka_generate_panel_quality
+      :handler (panel-quality/handler panel-quality-g)} ; 多候補 fan-out + 8軸ルーブリック + refine gate (ADR-2607164200)
+
+     "ai.gftd.mangaka.mangakaGeneratePanelFromVideo"
+     {:assistant :mangaka_generate_panel_from_video
+      :handler (panel-video/handler panel-video-g)}     ; seedance video → frame-sample → 8軸ルーブリック critique → persist (additive alt. to txt2img)
+
+     "ai.gftd.mangaka.mangakaCoscientistPanel"
+     {:assistant :mangaka_coscientist_panel
+      :handler (coscientist/handler coscientist-g)}     ; co-scientist: Generate→Reflect→Rank(Elo)→Evolve→Meta (ADR-2607164200 addendum)
+
+     "ai.gftd.mangaka.trainCharacterLora"
+     {:assistant :train_character_lora
+      :handler (train-lora/handler train-lora-g)}       ; 自前 character-LoRA 学習ハーネス (ADR-2607164200)
+
+     "ai.gftd.mangaka.mangakaGenerateCharacter"
+     {:assistant :mangaka_generate_character
+      :handler (character/handler char-g)
+      :stream  (character/stream-handler char-g)}
+
+     "ai.gftd.mangaka.mangakaGenerateScene"
+     {:assistant :mangaka_generate_scene
+      :handler (scene/handler scene-g)
+      :stream  (scene/stream-handler scene-g)}
+
+     "ai.gftd.mangaka.mangakaGeneratePage"
+     {:assistant :mangaka_generate_page
+      :handler (page/handler page-g)
+      :stream  (page/stream-handler page-g)}
+
+     "ai.gftd.mangaka.comfyRun"
+     {:assistant :comfy_run :handler (comfy-run/handler comfy-g)}
+
+     "ai.gftd.mangaka.enrichCharacters"
+     {:assistant :enrich_characters :handler (enrich/handler enrich-g)}
+
+     "ai.gftd.mangaka.documentsByCharacter"
+     {:assistant :documents_by_character :handler (query/handler query-g)}
+
+     "ai.gftd.mangaka.documentsByScene"
+     {:assistant :documents_by_scene :handler (query/handler query-scene-g)}
+
+     "ai.gftd.mangaka.visionScorePanel"
+     {:assistant :vision_score_panel :handler (vision/handler vision-g)}
+
+     "ai.gftd.mangaka.reviewPage"
+     {:assistant :review_page :handler (review-page/handler review-page-g)}
+
+     "ai.gftd.mangaka.exportGenko"
+     {:assistant :export_genko :handler (export-genko/handler export-genko-g)}
+
+     "ai.gftd.mangaka.listCharacters"
+     {:assistant :list_characters :handler (assets/handler list-chars-g)}
+     "ai.gftd.mangaka.listScenes"
+     {:assistant :list_scenes :handler (assets/handler list-scenes-g)}
+     "ai.gftd.mangaka.loadCharacter"
+     {:assistant :load_character :handler (assets/handler load-char-g)}
+     "ai.gftd.mangaka.loadScene"
+     {:assistant :load_scene :handler (assets/handler load-scene-g)}
+     "ai.gftd.mangaka.listRenders"
+     {:assistant :list_renders :handler (assets/handler list-renders-g)}
+
+     "ai.gftd.mangaka.loadPageRender"
+     {:assistant :load_page_render :handler (assets/handler page-render-g)}
+
+     "ai.gftd.mangaka.deleteCharacter"
+     {:assistant :delete_character :handler (assets/handler delete-char-g)}
+     "ai.gftd.mangaka.deleteScene"
+     {:assistant :delete_scene :handler (assets/handler delete-scene-g)}
+
+     "ai.gftd.mangaka.importGhosthacker"
+     {:assistant :import_ghosthacker :handler (ghosthacker/handler ghosthacker-g)}
+
+     "ai.gftd.mangaka.kamiRenderFrame"
+     {:assistant :kami_render_frame :handler (kami-frame/handler kami-frame-g)}
+
+     "ai.gftd.mangaka.stats"
+     {:assistant :stats :handler (stats/handler stats-g)}
+
+     "ai.gftd.mangaka.previewSvg"
+     {:assistant :preview_svg :handler (preview/handler preview-g)}
+
+     "ai.gftd.mangaka.analyzeCharacterGraph"
+     {:assistant :analyze_character_graph :handler (char-graph/handler char-graph-g)}
+
+     "ai.gftd.mangaka.enrichScene"
+     {:assistant :enrich_scene :handler (enrich-scene/handler enrich-scene-g)}
+
+     "ai.gftd.mangaka.analyzeExpression"
+     {:assistant :analyze_expression :handler (analyze-expr/handler analyze-expr-g)}
+
+     "ai.gftd.mangaka.enrichOrganizations"
+     {:assistant :enrich_organizations :handler (compat/handler enrich-orgs-g)}
+     "ai.gftd.mangaka.enrichEnvironments"
+     {:assistant :enrich_environments :handler (compat/handler enrich-envs-g)}
+     "ai.gftd.mangaka.deriveChapterIncidents"
+     {:assistant :derive_chapter_incidents :handler (compat/handler derive-incidents-g)}
+     "ai.gftd.mangaka.importChatHistory"
+     {:assistant :import_chat_history :handler (compat/handler import-chat-history-g)}
+     "ai.gftd.mangaka.backfillMangakaEdges"
+     {:assistant :backfill_mangaka_edges :handler (compat/handler backfill-edges-g)}
+     "ai.gftd.mangaka.recordOpLog"
+     {:assistant :record_op_log :handler (compat/handler record-op-log-g)}
+     "ai.gftd.mangaka.debugCanvasState"
+     {:assistant :debug_canvas_state :handler (compat/handler debug-canvas-g)}
+     "ai.gftd.mangaka.detectFaces"
+     {:assistant :detect_faces :handler (detect-faces/handler detect-faces-g)}
+     "ai.gftd.mangaka.jumpBenchmarkQa"
+     {:assistant :jump_benchmark_qa :handler (jump-qa/handler jump-qa-g)}
+     "ai.gftd.mangaka.recoverStoryboard"
+     {:assistant :recover_storyboard :handler (recover-sb/handler recover-sb-g)}
+     "ai.gftd.mangaka.scoreEmotion"
+     {:assistant :score_emotion :handler (compat/handler score-emotion-g)}
+     "ai.gftd.mangaka.authMintApiKey"
+     {:assistant :auth_mint_api_key :handler (compat/handler auth-mint-g)}
+
+     "ai.gftd.mangaka.lintDocument"
+     {:assistant :lint_document :handler (lint/handler lint-g)}
+
+     "ai.gftd.mangaka.composeKomawari"
+     {:assistant :compose_komawari :handler (komawari/handler komawari-g)}})))
+
+(defn nsids [registry] (vec (sort (keys registry))))
+
+(defn resolve-entry
+  "Finds a registry entry by NSID or by short assistant id."
+  [registry ident]
+  (or (get registry ident)
+      (some (fn [[_ entry]] (when (= (name (:assistant entry)) ident) entry)) registry)))

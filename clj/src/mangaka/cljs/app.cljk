@@ -1,0 +1,464 @@
+(ns mangaka.cljs.app
+  "mangaka.gftd.ai Studio — reagent UI over the XRPC graph surface.
+  Three panes: document list · storyboard canvas · generate-panel + chat."
+  (:require [reagent.core :as r]
+            [reagent.dom :as rdom]
+            [kotoba.lang.text :as str]
+            [mangaka.cljs.api :as api]))
+
+(defonce state
+  (r/atom {:docs [] :doc nil :status "" :busy? false
+           :gen {:prompt "ghost hacker in a neon alley, rain"
+                 :tags "masterpiece, best quality, 1girl"
+                 :seed 42}
+           :result nil :renders [] :lint nil
+           :characters [] :cast-name "" :search "" :search-result nil
+           :scenes [] :scene-prompt "" :scene-search "" :scene-search-result nil
+           :chat [] :chat-input ""}))
+
+(defn- set-status! [s] (swap! state assoc :status s))
+
+;; defined below (cast/scenes section) but referenced by send-chat!'s resync
+(declare refresh-characters! refresh-scenes!)
+
+(defn- refresh-docs! []
+  (api/list-documents #(swap! state assoc :docs %)
+                      #(set-status! (str "list error: " %))))
+
+(defn- refresh-renders! [id]
+  (api/list-renders id
+                    #(swap! state assoc :renders %)
+                    #(set-status! (str "renders error: " %))))
+
+(defn- open-doc! [id]
+  (set-status! (str "loading " id "…"))
+  (swap! state assoc :renders [] :lint nil :page-render nil)
+  (refresh-renders! id)
+  ;; load any existing composed page render so it shows on open
+  (api/load-page-render id #(swap! state assoc :page-render %) (fn [_]))
+  (api/load-document id
+                     #(do (swap! state assoc :doc %) (set-status! ""))
+                     #(set-status! (str "load error: " %))))
+
+(defn- render-page! []
+  (when-let [id (get-in @state [:doc :id])]
+    (set-status! (str "rendering page " id "…"))
+    (api/generate-page id
+                       #(do (swap! state assoc :page-render %) (set-status! "page rendered"))
+                       #(set-status! (str "page render error: " %)))))
+
+(defn- adjacent-doc
+  "The document `delta` positions from the open one in the page-number-ordered
+  list (the sidebar order), or nil at the ends."
+  [delta]
+  (let [docs (:docs @state)
+        cur (get-in @state [:doc :id])
+        i (some (fn [[idx d]] (when (= (:id d) cur) idx)) (map-indexed vector docs))]
+    (when i (get (vec docs) (+ i delta)))))
+
+(defn- nav-doc! [delta]
+  (when-let [target (adjacent-doc delta)] (open-doc! (:id target))))
+
+(defn- lint-doc! []
+  (when-let [id (get-in @state [:doc :id])]
+    (set-status! (str "linting " id "…"))
+    (api/lint-document id
+                       #(do (swap! state assoc :lint %)
+                            (set-status! (if (:ok %) "no issues" (str (:count %) " issue(s)"))))
+                       #(set-status! (str "lint error: " %)))))
+
+(defn- delete-doc! []
+  (when-let [id (get-in @state [:doc :id])]
+    (when (js/confirm (str "Delete document " id "? This cannot be undone."))
+      (set-status! (str "deleting " id "…"))
+      (api/delete-document id
+                           (fn [_] (swap! state assoc :doc nil :renders [] :lint nil)
+                             (refresh-docs!) (set-status! (str "deleted " id)))
+                           #(set-status! (str "delete error: " %))))))
+
+(defn- duplicate-doc! []
+  (when-let [id (get-in @state [:doc :id])]
+    (set-status! (str "duplicating " id "…"))
+    (api/duplicate-document id
+                            (fn [res] (refresh-docs!)
+                              (open-doc! (:new-id res))   ; switch to the clone
+                              (set-status! (str "duplicated → " (:new-id res))))
+                            #(set-status! (str "duplicate error: " %)))))
+
+(defn- new-doc! []
+  (let [id (str "doc-" (.toString (js/Math.floor (* 1e6 (js/Math.random)))))]
+    (api/save-document
+     {:id id :title "Untitled page"
+      :page {"page/number" (inc (count (:docs @state)))
+             "page/title" "Untitled page" "page/panels" []}}
+     (fn [_] (refresh-docs!) (open-doc! id))
+     #(set-status! (str "save error: " %)))))
+
+(defn- gen-panel! []
+  (let [{:keys [prompt tags seed panel-index]} (:gen @state)
+        doc-id (get-in @state [:doc :id])
+        pidx (when (and panel-index (not (str/blank? (str panel-index))))
+               (js/parseInt panel-index))
+        ;; doc-aware (compose from the stored storyboard panel) when a panel
+        ;; index is given, else free-form prompt
+        spec (if (and doc-id pidx)
+               {:doc-id doc-id :panel-index pidx}
+               {:prompt prompt
+                :tags (->> (str/split (or tags "") #",") (map str/trim) (remove str/blank?) vec)
+                :seed (js/parseInt seed)
+                :doc-id doc-id})]
+    (swap! state assoc :busy? true)
+    (set-status! "rendering panel…")
+    (api/generate-panel spec
+                        (fn [r] (swap! state assoc :result r :busy? false)
+                          (when-let [id (get-in @state [:doc :id])] (refresh-renders! id))
+                          (set-status! (str "rendered (" (:source r) ")")))
+                        (fn [e] (swap! state assoc :busy? false)
+                          (set-status! (str "gen error: " e))))))
+
+(defn- send-chat! []
+  (let [msg (str/trim (:chat-input @state))]
+    (when (seq msg)
+      (swap! state update :chat conj {:role "user" :content msg})
+      (swap! state assoc :chat-input "")
+      (api/chat msg
+                (fn [res]
+                  (swap! state update :chat conj {:role "assistant" :content (:reply res)})
+                  ;; the agent's tools can create/edit storyboards and design
+                  ;; characters/scenes — resync every panel so its work shows in
+                  ;; the canvas / list / cast / scenes instead of going stale.
+                  (refresh-docs!)
+                  (refresh-characters!)
+                  (refresh-scenes!)
+                  (when-let [id (get-in @state [:doc :id])] (open-doc! id)))
+                #(set-status! (str "chat error: " %))))))
+
+;; cast (characters) + storyboard search
+
+(defn- refresh-characters! []
+  (api/list-characters #(swap! state assoc :characters %)
+                       #(set-status! (str "cast error: " %))))
+
+(defn- gen-character! []
+  (let [name (str/trim (:cast-name @state))]
+    (when (seq name)
+      (set-status! (str "designing " name "…"))
+      (api/generate-character
+       {:name name}
+       (fn [_] (swap! state assoc :cast-name "") (refresh-characters!) (set-status! ""))
+       #(set-status! (str "character error: " %))))))
+
+(defn- delete-character! [id]
+  (when (js/confirm (str "Delete character " id "?"))
+    (api/delete-character id
+                          (fn [_] (refresh-characters!) (set-status! (str "deleted " id)))
+                          #(set-status! (str "delete error: " %)))))
+
+(defn- refresh-scenes! []
+  (api/list-scenes #(swap! state assoc :scenes %)
+                   #(set-status! (str "scenes error: " %))))
+
+(defn- gen-scene! []
+  (let [p (str/trim (:scene-prompt @state))]
+    (when (seq p)
+      (set-status! (str "designing scene…"))
+      (api/generate-scene p
+                          (fn [_] (swap! state assoc :scene-prompt "") (refresh-scenes!) (set-status! ""))
+                          #(set-status! (str "scene error: " %))))))
+
+(defn- delete-scene! [id]
+  (when (js/confirm (str "Delete scene " id "?"))
+    (api/delete-scene id
+                      (fn [_] (refresh-scenes!) (set-status! (str "deleted " id)))
+                      #(set-status! (str "delete error: " %)))))
+
+(defn- search-character! []
+  (let [c (str/trim (:search @state))]
+    (when (seq c)
+      (api/documents-by-character
+       c
+       #(swap! state assoc :search-result %)
+       #(set-status! (str "search error: " %))))))
+
+(defn- search-scene! []
+  (let [s (str/trim (:scene-search @state))]
+    (when (seq s)
+      (api/documents-by-scene
+       s
+       #(swap! state assoc :scene-search-result %)
+       #(set-status! (str "scene search error: " %))))))
+
+;; ───────────────────────── views ─────────────────────────
+
+(defn- data-uri [{:keys [mime image-b64]}]
+  (str "data:" (or mime "image/png") ";base64," image-b64))
+
+(defn- field-style [] {:background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                       :borderRadius 6 :padding 8})
+
+(defn cast-panel []
+  (let [{:keys [characters cast-name search search-result scenes scene-prompt
+                scene-search scene-search-result]} @state]
+    [:div {:style {:display "flex" :flexDirection "column" :gap 6 :marginTop 8}}
+     [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase"}} "Cast"]
+     [:div {:style {:display "flex" :gap 6}}
+      [:input {:value cast-name :placeholder "character name"
+               :on-change #(swap! state assoc :cast-name (.. % -target -value))
+               :on-key-down #(when (= "Enter" (.-key %)) (gen-character!))
+               :style (assoc (field-style) :flex 1)}]
+      [:button {:on-click gen-character!
+                :style {:background "#2a3142" :border "none" :color "#fff"
+                        :padding "8px 10px" :borderRadius 8 :cursor "pointer"}} "+"]]
+     (for [c characters]
+       ^{:key (:id c)}
+       [:div {:style {:fontSize 12 :color "#8aa0c0" :padding "2px 4px"
+                      :display "flex" :alignItems "center" :gap 6}}
+        [:span {:style {:flex 1}} (:name c) " " [:span {:style {:color "#5e6b82"}} (:id c)]]
+        [:span {:on-click #(delete-character! (:id c)) :title "delete"
+                :style {:cursor "pointer" :color "#5e6b82" :fontSize 11}} "✕"]])
+     [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase" :marginTop 8}} "Find by character"]
+     [:div {:style {:display "flex" :gap 6}}
+      [:input {:value search :placeholder "e.g. Nei"
+               :on-change #(swap! state assoc :search (.. % -target -value))
+               :on-key-down #(when (= "Enter" (.-key %)) (search-character!))
+               :style (assoc (field-style) :flex 1)}]
+      [:button {:on-click search-character!
+                :style {:background "#2a3142" :border "none" :color "#fff"
+                        :padding "8px 10px" :borderRadius 8 :cursor "pointer"}} "🔍"]]
+     (when search-result
+       [:div {:style {:fontSize 12 :color "#8aa0c0"}}
+        (str (:character search-result) " → ")
+        (if (seq (:documents search-result))
+          (for [id (:documents search-result)]
+            ^{:key id}
+            [:span {:on-click #(open-doc! id)
+                    :style {:cursor "pointer" :textDecoration "underline" :marginRight 6}} id])
+          [:span {:style {:color "#5e6b82"}} "no documents"])])
+     ;; Scenes — generate / browse / delete the storyboard's backgrounds
+     [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase" :marginTop 8}} "Scenes"]
+     [:div {:style {:display "flex" :gap 6}}
+      [:input {:value scene-prompt :placeholder "scene prompt"
+               :on-change #(swap! state assoc :scene-prompt (.. % -target -value))
+               :on-key-down #(when (= "Enter" (.-key %)) (gen-scene!))
+               :style (assoc (field-style) :flex 1)}]
+      [:button {:on-click gen-scene!
+                :style {:background "#2a3142" :border "none" :color "#fff"
+                        :padding "8px 10px" :borderRadius 8 :cursor "pointer"}} "+"]]
+     (for [s scenes]
+       ^{:key (:id s)}
+       [:div {:style {:fontSize 12 :color "#8aa0c0" :padding "2px 4px"
+                      :display "flex" :alignItems "center" :gap 6}}
+        ;; click a scene id to find the documents set in it
+        [:span {:on-click #(do (swap! state assoc :scene-search (:id s)) (search-scene!))
+                :title "find documents in this scene"
+                :style {:flex 1 :cursor "pointer"}}
+         (:name s) " " [:span {:style {:color "#5e6b82"}} (:id s)]]
+        [:span {:on-click #(delete-scene! (:id s)) :title "delete"
+                :style {:cursor "pointer" :color "#5e6b82" :fontSize 11}} "✕"]])
+     (when scene-search-result
+       [:div {:style {:fontSize 12 :color "#8aa0c0"}}
+        (str (:scene scene-search-result) " → ")
+        (if (seq (:documents scene-search-result))
+          (for [id (:documents scene-search-result)]
+            ^{:key id}
+            [:span {:on-click #(open-doc! id)
+                    :style {:cursor "pointer" :textDecoration "underline" :marginRight 6}} id])
+          [:span {:style {:color "#5e6b82"}} "no documents"])])]))
+
+(defn sidebar []
+  (let [{:keys [docs doc]} @state]
+    [:div {:style {:width 240 :borderRight "1px solid #1e2230" :padding 16 :overflowY "auto"
+                   :display "flex" :flexDirection "column" :gap 8}}
+     [:div {:style {:fontWeight 700 :fontSize 16 :marginBottom 4}} "mangaka " [:span {:style {:color "#5e6b82"}} "studio"]]
+     [:button {:on-click new-doc!
+               :style {:background "#2b6fff" :border "none" :color "#fff"
+                       :padding "8px 10px" :borderRadius 8 :cursor "pointer"}}
+      "+ New page"]
+     [:div {:style {:fontSize 11 :color "#5e6b82" :marginTop 8 :textTransform "uppercase"}} "Documents"]
+     (for [d docs]
+       ^{:key (:id d)}
+       [:div {:on-click #(open-doc! (:id d))
+              :style {:padding "8px 10px" :borderRadius 8 :cursor "pointer" :display "flex" :gap 8
+                      :background (if (= (:id d) (:id doc)) "#1a2030" "transparent")}}
+        ;; server-rendered thumbnail (GET /preview/:id → image/svg+xml)
+        [:img {:src (str "/preview/" (:id d)) :alt "" :loading "lazy"
+               :style {:width 38 :height 54 :flexShrink 0 :borderRadius 3
+                       :border "1px solid #1e2230" :background "#fff" :objectFit "cover"}}]
+        [:div
+         [:div {:style {:fontSize 13}} (or (:title d) "(untitled)")]
+         [:div {:style {:fontSize 11 :color "#5e6b82"}} "p." (:page-number d) " · " (:id d)]]])
+     [cast-panel]]))
+
+(defn panel-svg [panels]
+  ;; Lay panels out by :rect [x y w h] (0..1) when present, else stack.
+  [:svg {:viewBox "0 0 320 452" :width 320 :height 452
+         :style {:background "#fff" :borderRadius 6}}
+   (if (seq panels)
+     (map-indexed
+      (fn [i p]
+        (let [[x y w h] (or (:rect p) [0.04 (+ 0.02 (* i 0.24)) 0.92 0.22])]
+          ^{:key i}
+          [:g
+           [:rect {:x (* x 320) :y (* y 452) :width (* w 320) :height (* h 452)
+                   :fill "none" :stroke "#111" :strokeWidth 2}]
+           [:text {:x (+ 6 (* x 320)) :y (+ 16 (* y 452)) :fontSize 9 :fill "#444"}
+            (str "#" (:index p) " " (:shot p))]
+           (for [[bi b] (map-indexed vector (:bubbles p))]
+             ^{:key bi}
+             [:text {:x (+ 10 (* x 320)) :y (+ 34 (* 12 bi) (* y 452)) :fontSize 9 :fill "#111"}
+              (:text b)])]))
+      panels)
+     [:text {:x 110 :y 220 :fontSize 11 :fill "#999"} "no panels yet"])])
+
+(defn renders-gallery []
+  (let [renders (:renders @state)]
+    (when (seq renders)
+      [:div {:style {:marginTop 20}}
+       [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase" :marginBottom 6}}
+        (str "renders (" (count renders) ")")]
+       [:div {:style {:display "flex" :gap 8 :flexWrap "wrap"}}
+        (for [r renders]
+          ^{:key (:id r)}
+          [:div {:style {:fontSize 10 :color "#8aa0c0" :textAlign "center"}}
+           [:img {:src (or (:image-url r) "") :width 90 :loading "lazy"
+                  :style {:borderRadius 4 :border "1px solid #1e2230" :background "#fff" :display "block"}}]
+           (str "#" (:index r) (when (:score r) (str " · " (:score r))))])]])))
+
+(defn- lint-panel []
+  (when-let [lint (:lint @state)]
+    (let [sev-color {:error "#ff6b6b" :warn "#e3b341"}]
+      [:div {:style {:marginTop 12 :padding 8 :borderRadius 6
+                     :background "#11141c" :border "1px solid #1e2230"}}
+       [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase" :marginBottom 4}}
+        (str "lint · " (if (:ok lint) "clean" (str (:count lint) " issue(s)")))]
+       (if (:ok lint)
+         [:div {:style {:fontSize 12 :color "#6bbf6b"}} "✓ no structural problems"]
+         (for [[i issue] (map-indexed vector (:issues lint))]
+           ^{:key i}
+           [:div {:style {:fontSize 12 :color (get sev-color (keyword (:severity issue)) "#8aa0c0")}}
+            (when (:panel issue) (str "#" (:panel issue) " · "))
+            (:message issue)]))])))
+
+(defn- page-render-src [pr]
+  (or (:image-url pr)
+      (when-let [b (or (:image-b64 pr) (:page-render/image-b64 pr))]
+        (str "data:" (or (:mime pr) (:page-render/image-mime pr) "image/png") ";base64," b))))
+
+(defn canvas []
+  (let [{:keys [doc result page-render]} @state]
+    [:div {:style {:flex 1 :padding 24 :overflow "auto"}}
+     (if doc
+       [:div
+        [:div {:style {:display "flex" :alignItems "center" :gap 10 :marginBottom 12}}
+         (let [nav-style (fn [enabled] {:background "#11141c" :border "1px solid #1e2230"
+                                        :color (if enabled "#8aa0c0" "#3a4150")
+                                        :padding "4px 8px" :borderRadius 6 :fontSize 12
+                                        :cursor (if enabled "pointer" "default")})]
+           [:span {:style {:display "flex" :gap 4}}
+            [:button {:on-click #(nav-doc! -1) :disabled (nil? (adjacent-doc -1))
+                      :title "previous page" :style (nav-style (some? (adjacent-doc -1)))} "‹"]
+            [:button {:on-click #(nav-doc! 1) :disabled (nil? (adjacent-doc 1))
+                      :title "next page" :style (nav-style (some? (adjacent-doc 1)))} "›"]])
+         [:span {:style {:fontWeight 600}}
+          (get-in doc [:lexicon :pageTitle]) " "
+          [:span {:style {:color "#5e6b82" :fontSize 12}} "p." (get-in doc [:lexicon :pageNumber])]]
+         [:span {:style {:flex 1}}]
+         [:button {:on-click render-page!
+                   :style {:background "#2b6fff" :border "none" :color "#fff"
+                           :padding "5px 10px" :borderRadius 6 :cursor "pointer" :fontSize 12}} "Render page"]
+         [:button {:on-click lint-doc!
+                   :style {:background "#2a3142" :border "none" :color "#fff"
+                           :padding "5px 10px" :borderRadius 6 :cursor "pointer" :fontSize 12}} "Lint"]
+         [:button {:on-click duplicate-doc!
+                   :style {:background "#2a3142" :border "none" :color "#fff"
+                           :padding "5px 10px" :borderRadius 6 :cursor "pointer" :fontSize 12}} "Duplicate"]
+         [:button {:on-click delete-doc!
+                   :style {:background "transparent" :border "1px solid #3a2230" :color "#ff6b6b"
+                           :padding "5px 10px" :borderRadius 6 :cursor "pointer" :fontSize 12}} "Delete"]]
+        [lint-panel]
+        [:div {:style {:display "flex" :gap 24 :alignItems "flex-start" :marginTop 12}}
+         [panel-svg (get-in doc [:lexicon :panels])]
+         (when result
+           [:div
+            [:div {:style {:fontSize 11 :color "#5e6b82" :marginBottom 6}}
+             "generated · " (:source result) " · seed " (:seed result)]
+            [:img {:src (data-uri result) :width 260
+                   :style {:borderRadius 6 :border "1px solid #1e2230"}}]])
+         ;; the composed full-page render (mangakaGeneratePage / loadPageRender)
+         (when-let [src (page-render-src page-render)]
+           [:div
+            [:div {:style {:fontSize 11 :color "#5e6b82" :marginBottom 6}} "composed page"]
+            [:img {:src src :width 240
+                   :style {:borderRadius 6 :border "1px solid #1e2230" :background "#fff"}}]])]
+        [renders-gallery]]
+       [:div {:style {:color "#5e6b82" :marginTop 80 :textAlign "center"}}
+        "Select or create a page to begin."])]))
+
+(defn gen-form []
+  (let [{:keys [gen busy?]} @state
+        upd (fn [k] #(swap! state assoc-in [:gen k] (.. % -target -value)))]
+    [:div {:style {:display "flex" :flexDirection "column" :gap 8}}
+     [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase"}} "Generate panel"]
+     [:textarea {:value (:prompt gen) :on-change (upd :prompt) :rows 3
+                 :placeholder "prompt"
+                 :style {:background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                         :borderRadius 6 :padding 8 :resize "vertical"}}]
+     [:input {:value (:tags gen) :on-change (upd :tags) :placeholder "tags, comma separated"
+              :style {:background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                      :borderRadius 6 :padding 8}}]
+     [:input {:value (:seed gen) :on-change (upd :seed) :placeholder "seed" :type "number"
+              :style {:background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                      :borderRadius 6 :padding 8}}]
+     ;; optional: render a specific stored storyboard panel (doc-aware) — the
+     ;; prompt is composed from that panel; leave blank for a free-form render
+     [:input {:value (:panel-index gen) :on-change (upd :panel-index) :type "number"
+              :placeholder "panel # (doc-aware, optional)"
+              :style {:background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                      :borderRadius 6 :padding 8}}]
+     [:button {:on-click gen-panel! :disabled busy?
+               :style {:background (if busy? "#2a3142" "#2b6fff") :border "none" :color "#fff"
+                       :padding "8px 10px" :borderRadius 8 :cursor (if busy? "default" "pointer")}}
+      (if busy? "rendering…" "Render")]]))
+
+(defn chat-box []
+  (let [{:keys [chat chat-input]} @state]
+    [:div {:style {:display "flex" :flexDirection "column" :gap 8 :marginTop 24 :flex 1 :minHeight 0}}
+     [:div {:style {:fontSize 11 :color "#5e6b82" :textTransform "uppercase"}} "Assistant"]
+     [:div {:style {:flex 1 :overflow "auto" :display "flex" :flexDirection "column" :gap 6
+                    :background "#11141c" :border "1px solid #1e2230" :borderRadius 6 :padding 8}}
+      (for [[i m] (map-indexed vector chat)]
+        ^{:key i}
+        [:div {:style {:fontSize 12 :color (if (= "user" (:role m)) "#e7e9ee" "#8aa0c0")}}
+         [:b (str (:role m) ": ")] (:content m)])]
+     [:div {:style {:display "flex" :gap 6}}
+      [:input {:value chat-input
+               :on-change #(swap! state assoc :chat-input (.. % -target -value))
+               :on-key-down #(when (= "Enter" (.-key %)) (send-chat!))
+               :placeholder "ask the mangaka assistant…"
+               :style {:flex 1 :background "#11141c" :border "1px solid #1e2230" :color "#e7e9ee"
+                       :borderRadius 6 :padding 8}}]
+      [:button {:on-click send-chat!
+                :style {:background "#2a3142" :border "none" :color "#fff"
+                        :padding "8px 12px" :borderRadius 8 :cursor "pointer"}} "Send"]]]))
+
+(defn rightbar []
+  [:div {:style {:width 320 :borderLeft "1px solid #1e2230" :padding 16
+                 :display "flex" :flexDirection "column"}}
+   [gen-form]
+   [chat-box]])
+
+(defn app []
+  [:div {:style {:display "flex" :height "100vh"}}
+   [sidebar]
+   [:div {:style {:flex 1 :display "flex" :flexDirection "column"}}
+    [:div {:style {:flex 1 :display "flex" :minHeight 0}}
+     [canvas]
+     [rightbar]]
+    [:div {:style {:borderTop "1px solid #1e2230" :padding "6px 16px" :fontSize 12 :color "#5e6b82"}}
+     (or (not-empty (:status @state)) "ready") " · mangaka.gftd.ai (clj)"]]])
+
+(defn ^:export init []
+  (refresh-docs!)
+  (refresh-characters!)
+  (refresh-scenes!)
+  (rdom/render [app] (.getElementById js/document "app")))

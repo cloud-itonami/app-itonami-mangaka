@@ -1,0 +1,17 @@
+{
+  "name": "mangaka-clj-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "mangaka.gftd.ai ClojureScript Studio UI (shadow-cljs + reagent)",
+  "scripts": {
+    "watch": "amu compile --target wasm32-browser app",
+    "release": "amu compile --target wasm32-browser app"
+  },
+  "devDependencies": {
+    "shadow-cljs": "^2.28.20"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

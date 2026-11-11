@@ -1,0 +1,116 @@
+{
+  "_note": "10 koma-wari archetypes in the ai.gftd.mangaka.page record shape. Coords are integer permille (‰, 0-1000) of the full board; gaze.* are panel-local permille. Each page demonstrates a distinct layout × tempo × 引き/寄り × bleed × gaze pattern. Render with komawari_blueprint_pdf.py.",
+  "pages": [
+    {
+      "pageNum": 1, "pageTitle": "P01 4コマ 起承転結 / yonkoma gag (beat)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "beat", "opensOn": "yori", "climaxPanelOrder": 4, "readingPath": [1, 2, 3, 4] },
+      "panels": [
+        { "order": 1, "x": 17, "y": 17, "w": 966, "h": 231, "bleed": [], "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 45 }, "gaze": { "focusX": 500, "focusY": 450, "regionX": 120, "regionY": 180, "regionW": 760, "regionH": 560, "entryX": 850, "entryY": 200, "exitX": 500, "exitY": 940, "impression": "calm" } },
+        { "order": 2, "x": 17, "y": 262, "w": 966, "h": 231, "bleed": [], "shot": { "scale": "MCU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 }, "gaze": { "focusX": 480, "focusY": 440, "regionX": 140, "regionY": 180, "regionW": 720, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 940, "impression": "tension" } },
+        { "order": 3, "x": 17, "y": 507, "w": 966, "h": 231, "bleed": [], "shot": { "scale": "WS", "framing": "hiki", "angle": "high", "move": "pull-back", "emphasis": 60 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 80, "regionY": 160, "regionW": 840, "regionH": 600, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 940, "impression": "awe" } },
+        { "order": 4, "x": 17, "y": 752, "w": 966, "h": 231, "bleed": [], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 58 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 260, "regionY": 180, "regionW": 480, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 700, "impression": "comedic" } }
+      ]
+    },
+    {
+      "pageNum": 2, "pageTitle": "P02 引き→寄り階段 / establishing push-in ladder (accel)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 55, "gutterPermille": 13 },
+      "rhythm": { "tempo": "accel", "opensOn": "hiki", "climaxPanelOrder": 4, "readingPath": [1, 2, 3, 4] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 420, "bleed": ["top", "left", "right"], "shot": { "scale": "WS", "framing": "hiki", "angle": "eye", "move": "pull-back", "emphasis": 80 }, "gaze": { "focusX": 500, "focusY": 380, "regionX": 80, "regionY": 100, "regionW": 840, "regionH": 760, "entryX": 870, "entryY": 150, "exitX": 500, "exitY": 920, "impression": "awe" } },
+        { "order": 2, "x": 17, "y": 440, "w": 966, "h": 171, "bleed": [], "shot": { "scale": "LS", "framing": "hiki", "angle": "eye", "move": "push-in", "emphasis": 55 }, "gaze": { "focusX": 500, "focusY": 480, "regionX": 120, "regionY": 200, "regionW": 760, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 940, "impression": "tension" } },
+        { "order": 3, "x": 17, "y": 625, "w": 966, "h": 171, "bleed": [], "shot": { "scale": "MCU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 60 }, "gaze": { "focusX": 500, "focusY": 480, "regionX": 220, "regionY": 200, "regionW": 560, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 940, "impression": "tension" } },
+        { "order": 4, "x": 17, "y": 810, "w": 966, "h": 171, "bleed": [], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 72 }, "gaze": { "focusX": 500, "focusY": 480, "regionX": 320, "regionY": 220, "regionW": 360, "regionH": 540, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 720, "impression": "dread" } }
+      ]
+    },
+    {
+      "pageNum": 3, "pageTitle": "P03 リアクション連打 / reaction volley (sustain)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 11 },
+      "rhythm": { "tempo": "sustain", "opensOn": "yori", "climaxPanelOrder": 5, "readingPath": [1, 2, 3, 4, 5] },
+      "panels": [
+        { "order": 1, "x": 17, "y": 17, "w": 966, "h": 183, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 }, "gaze": { "focusX": 320, "focusY": 460, "regionX": 100, "regionY": 200, "regionW": 520, "regionH": 560, "entryX": 880, "entryY": 200, "exitX": 120, "exitY": 820, "impression": "calm" } },
+        { "order": 2, "x": 17, "y": 212, "w": 966, "h": 183, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 }, "gaze": { "focusX": 680, "focusY": 460, "regionX": 380, "regionY": 200, "regionW": 520, "regionH": 560, "entryX": 120, "entryY": 200, "exitX": 880, "exitY": 820, "impression": "tension" } },
+        { "order": 3, "x": 17, "y": 407, "w": 966, "h": 183, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 }, "gaze": { "focusX": 320, "focusY": 460, "regionX": 100, "regionY": 200, "regionW": 520, "regionH": 560, "entryX": 880, "entryY": 200, "exitX": 120, "exitY": 820, "impression": "calm" } },
+        { "order": 4, "x": 17, "y": 602, "w": 966, "h": 183, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 46 }, "gaze": { "focusX": 680, "focusY": 460, "regionX": 380, "regionY": 200, "regionW": 520, "regionH": 560, "entryX": 120, "entryY": 200, "exitX": 880, "exitY": 820, "impression": "tension" } },
+        { "order": 5, "x": 17, "y": 797, "w": 966, "h": 183, "bleed": [], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 58 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 300, "regionY": 200, "regionW": 400, "regionH": 560, "entryX": 120, "entryY": 200, "exitX": 500, "exitY": 760, "impression": "impact" } }
+      ]
+    },
+    {
+      "pageNum": 4, "pageTitle": "P04 全面引き＋インセット寄り / spotlight inset overlay (hold)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "hold", "opensOn": "hiki", "climaxPanelOrder": 1, "readingPath": [1, 2] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 1000, "bleed": ["top", "right", "bottom", "left"], "shot": { "scale": "WS", "framing": "hiki", "angle": "birds-eye", "move": "pull-back", "emphasis": 72 }, "gaze": { "focusX": 560, "focusY": 380, "regionX": 80, "regionY": 80, "regionW": 840, "regionH": 760, "entryX": 900, "entryY": 120, "exitX": 250, "exitY": 760, "impression": "awe" } },
+        { "order": 2, "x": 70, "y": 630, "w": 320, "h": 320, "bleed": [], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 62 }, "gaze": { "focusX": 500, "focusY": 440, "regionX": 240, "regionY": 220, "regionW": 520, "regionH": 540, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 700, "impression": "dread" } }
+      ]
+    },
+    {
+      "pageNum": 5, "pageTitle": "P05 見せ場スプラッシュ＋角コマ / splash + corner koma (hold)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "hold", "opensOn": "hiki", "climaxPanelOrder": 1, "readingPath": [1, 2, 3] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 760, "bleed": ["top", "left", "right"], "shot": { "scale": "WS", "framing": "hiki", "angle": "low", "move": "pull-back", "emphasis": 100 }, "gaze": { "focusX": 500, "focusY": 420, "regionX": 60, "regionY": 80, "regionW": 880, "regionH": 660, "entryX": 880, "entryY": 120, "exitX": 720, "exitY": 880, "impression": "impact" } },
+        { "order": 2, "x": 508, "y": 775, "w": 475, "h": 208, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 50 }, "gaze": { "focusX": 500, "focusY": 480, "regionX": 200, "regionY": 200, "regionW": 600, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 70, "exitY": 520, "impression": "tension" } },
+        { "order": 3, "x": 17, "y": 775, "w": 475, "h": 208, "bleed": ["bottom", "left"], "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 520, "focusY": 460, "regionX": 160, "regionY": 200, "regionW": 680, "regionH": 560, "entryX": 940, "entryY": 480, "exitX": 500, "exitY": 920, "impression": "melancholy" } }
+      ]
+    },
+    {
+      "pageNum": 6, "pageTitle": "P06 アクション破砕 / action shard burst (accel)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 55, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "accel", "opensOn": "yori", "climaxPanelOrder": 6, "readingPath": [1, 2, 3, 4, 5, 6] },
+      "panels": [
+        { "order": 1, "x": 560, "y": 17, "w": 423, "h": 233, "bleed": ["top", "right"], "shot": { "scale": "ECU", "framing": "yori", "angle": "low", "move": "push-in", "emphasis": 72 }, "gaze": { "focusX": 520, "focusY": 420, "regionX": 200, "regionY": 150, "regionW": 600, "regionH": 600, "entryX": 880, "entryY": 140, "exitX": 80, "exitY": 600, "impression": "impact" } },
+        { "order": 2, "x": 17, "y": 17, "w": 523, "h": 233, "bleed": ["top", "left"], "shot": { "scale": "CU", "framing": "yori", "angle": "dutch", "move": "static", "emphasis": 58 }, "gaze": { "focusX": 480, "focusY": 440, "regionX": 180, "regionY": 160, "regionW": 640, "regionH": 600, "entryX": 920, "entryY": 200, "exitX": 480, "exitY": 920, "impression": "ominous" } },
+        { "order": 3, "x": 680, "y": 264, "w": 303, "h": 256, "bleed": [], "shot": { "scale": "insert", "framing": "yori", "angle": "high", "move": "static", "emphasis": 44 }, "gaze": { "focusX": 500, "focusY": 500, "regionX": 250, "regionY": 250, "regionW": 500, "regionH": 500, "entryX": 880, "entryY": 200, "exitX": 120, "exitY": 600, "impression": "tension" } },
+        { "order": 4, "x": 355, "y": 264, "w": 311, "h": 256, "bleed": [], "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "pan-left", "emphasis": 50 }, "gaze": { "focusX": 500, "focusY": 480, "regionX": 150, "regionY": 200, "regionW": 700, "regionH": 560, "entryX": 880, "entryY": 300, "exitX": 120, "exitY": 600, "impression": "speed" } },
+        { "order": 5, "x": 17, "y": 264, "w": 324, "h": 256, "bleed": [], "shot": { "scale": "insert", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 44 }, "gaze": { "focusX": 500, "focusY": 500, "regionX": 250, "regionY": 250, "regionW": 500, "regionH": 500, "entryX": 880, "entryY": 300, "exitX": 500, "exitY": 940, "impression": "tension" } },
+        { "order": 6, "x": 17, "y": 534, "w": 966, "h": 449, "bleed": ["bottom", "left", "right"], "shot": { "scale": "WS", "framing": "hiki", "angle": "worms-eye", "move": "pull-back", "emphasis": 95 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 60, "regionY": 100, "regionW": 880, "regionH": 760, "entryX": 920, "entryY": 120, "exitX": 120, "exitY": 820, "impression": "impact" } }
+      ]
+    },
+    {
+      "pageNum": 7, "pageTitle": "P07 縦落下カスケード / vertical fall cascade (accel)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "accel", "opensOn": "hiki", "climaxPanelOrder": 4, "readingPath": [1, 2, 3, 4] },
+      "panels": [
+        { "order": 1, "x": 752, "y": 0, "w": 231, "h": 1000, "bleed": ["top"], "shot": { "scale": "MS", "framing": "neutral", "angle": "high", "move": "tilt-down", "emphasis": 55 }, "gaze": { "focusX": 500, "focusY": 250, "regionX": 150, "regionY": 60, "regionW": 700, "regionH": 880, "entryX": 500, "entryY": 40, "exitX": 500, "exitY": 950, "impression": "speed" } },
+        { "order": 2, "x": 507, "y": 17, "w": 231, "h": 966, "bleed": [], "shot": { "scale": "MCU", "framing": "yori", "angle": "eye", "move": "tilt-down", "emphasis": 56 }, "gaze": { "focusX": 500, "focusY": 450, "regionX": 150, "regionY": 100, "regionW": 700, "regionH": 800, "entryX": 500, "entryY": 40, "exitX": 500, "exitY": 950, "impression": "dread" } },
+        { "order": 3, "x": 262, "y": 17, "w": 231, "h": 966, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "low", "move": "tilt-down", "emphasis": 60 }, "gaze": { "focusX": 500, "focusY": 600, "regionX": 150, "regionY": 100, "regionW": 700, "regionH": 800, "entryX": 500, "entryY": 40, "exitX": 500, "exitY": 950, "impression": "dread" } },
+        { "order": 4, "x": 17, "y": 0, "w": 231, "h": 1000, "bleed": ["bottom"], "shot": { "scale": "ECU", "framing": "yori", "angle": "worms-eye", "move": "push-in", "emphasis": 74 }, "gaze": { "focusX": 500, "focusY": 760, "regionX": 200, "regionY": 200, "regionW": 600, "regionH": 760, "entryX": 500, "entryY": 40, "exitX": 500, "exitY": 980, "impression": "impact" } }
+      ]
+    },
+    {
+      "pageNum": 8, "pageTitle": "P08 パノラマ＋三連 / panorama vista + triptych (release)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 40, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "release", "opensOn": "hiki", "climaxPanelOrder": 1, "readingPath": [1, 2, 3, 4] },
+      "panels": [
+        { "order": 1, "x": 0, "y": 0, "w": 1000, "h": 520, "bleed": ["top", "left", "right"], "shot": { "scale": "WS", "framing": "hiki", "angle": "eye", "move": "pull-back", "emphasis": 85 }, "gaze": { "focusX": 500, "focusY": 360, "regionX": 60, "regionY": 100, "regionW": 880, "regionH": 700, "entryX": 880, "entryY": 150, "exitX": 720, "exitY": 880, "impression": "awe" } },
+        { "order": 2, "x": 669, "y": 540, "w": 314, "h": 443, "bleed": [], "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 150, "regionY": 200, "regionW": 700, "regionH": 560, "entryX": 500, "entryY": 60, "exitX": 70, "exitY": 500, "impression": "calm" } },
+        { "order": 3, "x": 343, "y": 540, "w": 312, "h": 443, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "static", "emphasis": 50 }, "gaze": { "focusX": 500, "focusY": 440, "regionX": 200, "regionY": 200, "regionW": 600, "regionH": 560, "entryX": 920, "entryY": 460, "exitX": 70, "exitY": 500, "impression": "melancholy" } },
+        { "order": 4, "x": 17, "y": 540, "w": 312, "h": 443, "bleed": ["left"], "shot": { "scale": "MS", "framing": "neutral", "angle": "eye", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 520, "focusY": 460, "regionX": 160, "regionY": 200, "regionW": 700, "regionH": 560, "entryX": 920, "entryY": 460, "exitX": 500, "exitY": 920, "impression": "calm" } }
+      ]
+    },
+    {
+      "pageNum": 9, "pageTitle": "P09 切り返し会話 / OTS shot-reverse (sustain)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 55, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "sustain", "opensOn": "yori", "climaxPanelOrder": 5, "readingPath": [1, 2, 3, 4, 5, 6] },
+      "panels": [
+        { "order": 1, "x": 508, "y": 17, "w": 475, "h": 312, "bleed": [], "shot": { "scale": "OTS", "framing": "yori", "angle": "OTS", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 420, "focusY": 440, "regionX": 120, "regionY": 180, "regionW": 600, "regionH": 600, "entryX": 880, "entryY": 200, "exitX": 80, "exitY": 520, "impression": "tension" } },
+        { "order": 2, "x": 17, "y": 17, "w": 477, "h": 312, "bleed": [], "shot": { "scale": "OTS", "framing": "yori", "angle": "OTS", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 600, "focusY": 440, "regionX": 280, "regionY": 180, "regionW": 600, "regionH": 600, "entryX": 920, "entryY": 460, "exitX": 480, "exitY": 940, "impression": "calm" } },
+        { "order": 3, "x": 508, "y": 343, "w": 475, "h": 312, "bleed": [], "shot": { "scale": "OTS", "framing": "yori", "angle": "OTS", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 420, "focusY": 440, "regionX": 120, "regionY": 180, "regionW": 600, "regionH": 600, "entryX": 500, "entryY": 60, "exitX": 80, "exitY": 520, "impression": "tension" } },
+        { "order": 4, "x": 17, "y": 343, "w": 477, "h": 312, "bleed": [], "shot": { "scale": "OTS", "framing": "yori", "angle": "OTS", "move": "static", "emphasis": 48 }, "gaze": { "focusX": 600, "focusY": 440, "regionX": 280, "regionY": 180, "regionW": 600, "regionH": 600, "entryX": 920, "entryY": 460, "exitX": 480, "exitY": 940, "impression": "tension" } },
+        { "order": 5, "x": 508, "y": 669, "w": 475, "h": 312, "bleed": [], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 60 }, "gaze": { "focusX": 460, "focusY": 440, "regionX": 200, "regionY": 180, "regionW": 600, "regionH": 600, "entryX": 500, "entryY": 60, "exitX": 80, "exitY": 520, "impression": "dread" } },
+        { "order": 6, "x": 17, "y": 669, "w": 477, "h": 312, "bleed": [], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 64 }, "gaze": { "focusX": 540, "focusY": 440, "regionX": 220, "regionY": 180, "regionW": 560, "regionH": 600, "entryX": 920, "entryY": 460, "exitX": 500, "exitY": 920, "impression": "impact" } }
+      ]
+    },
+    {
+      "pageNum": 10, "pageTitle": "P10 クライマックス大割り / climax big-split (beat)",
+      "printGeometry": { "trimSize": "b5", "bleedPermille": 17, "safeTop": 40, "safeRight": 55, "safeBottom": 40, "safeLeft": 40, "gutterPermille": 13 },
+      "rhythm": { "tempo": "beat", "opensOn": "hiki", "climaxPanelOrder": 3, "readingPath": [1, 2, 3] },
+      "panels": [
+        { "order": 1, "x": 651, "y": 0, "w": 332, "h": 577, "bleed": ["top", "right"], "shot": { "scale": "CU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 58 }, "gaze": { "focusX": 500, "focusY": 380, "regionX": 200, "regionY": 120, "regionW": 600, "regionH": 700, "entryX": 880, "entryY": 120, "exitX": 80, "exitY": 600, "impression": "tension" } },
+        { "order": 2, "x": 17, "y": 0, "w": 620, "h": 577, "bleed": ["top", "left"], "shot": { "scale": "WS", "framing": "hiki", "angle": "low", "move": "pull-back", "emphasis": 90 }, "gaze": { "focusX": 520, "focusY": 420, "regionX": 80, "regionY": 100, "regionW": 840, "regionH": 700, "entryX": 940, "entryY": 300, "exitX": 500, "exitY": 920, "impression": "awe" } },
+        { "order": 3, "x": 17, "y": 591, "w": 966, "h": 392, "bleed": ["bottom", "left", "right"], "shot": { "scale": "ECU", "framing": "yori", "angle": "eye", "move": "push-in", "emphasis": 98 }, "gaze": { "focusX": 500, "focusY": 460, "regionX": 280, "regionY": 160, "regionW": 440, "regionH": 660, "entryX": 500, "entryY": 60, "exitX": 500, "exitY": 760, "impression": "impact" } }
+      ]
+    }
+  ]
+}

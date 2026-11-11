@@ -1,0 +1,81 @@
+(ns mangaka.models
+  "Model registry — mangaka 側の生成/学習モデル正本 (ADR-2607164200)。
+
+  murakumo fleet の infer.edn (:hf/repo 規約 — HuggingFace repo id が
+  モデル出自の正本) をミラーした最小サブセットに、自前 character-LoRA の
+  ライフサイクル・スロットを足したもの。純 EDN データ + 参照 fn のみ
+  (portable .cljc、I/O なし) — 学習の実行状態は store の :model/* datoms
+  (train_character_lora の register step) が持ち、ここは「どのモデルが
+  存在しうるか」の静的正本。
+
+  LoRA スロットの :model/status はここでは常に :planned (静的宣言)。
+  trained になった時点で :model/lora-cid (DataLad+B2 の kotoba CID —
+  重みバイナリは git に入れない、skill large-binary-datalad) が store 側
+  entity に載り、生成 spec へ :character-lora-cid として渡る
+  (ADR-2607155500 Phase 1 の Higgsfield character-id 相当)。"
+  (:require [kotoba.lang.text :as str]))
+
+(def registry
+  {"animagine-xl-4.0"
+   {:model/id         "animagine-xl-4.0"
+    :model/kind       :base
+    :model/engine     :comfy
+    :hf/repo          "cagliostrolab/animagine-xl-4.0"      ; murakumo infer.edn と同値
+    :model/checkpoint "animagine-xl-4.0.safetensors"        ; gad/dan 常駐 (RUNBOOK.md)
+    :model/note       "SDXL アニメ系 finetune — mangaka 既定 checkpoint (comfy.cljc default-ckpt)"}
+
+   ;; 自前 character-LoRA スロット。学習データが実在するのは shiropico の
+   ;; 2 キャラのみ (ghosthacker-shiropico-assets character-refs、shiro 17 /
+   ;; pico 18 枚 @1024x1024 — ADR-2607155500 が「LoRA に理想サイズ」と確認済み)。
+   ;; halfgram/zankyo/yamainu は参照セット未整備 (R2 公開パネルからの組み立てが
+   ;; 先行タスク) なのでまだスロットを起こさない。
+   "lora-ghosthacker-shiro"
+   {:model/id        "lora-ghosthacker-shiro"
+    :model/kind      :character-lora
+    :model/base      "animagine-xl-4.0"
+    :model/character "shiro"
+    :model/work      "ghosthacker-shiropico"
+    :model/dataset   "ghosthacker-shiropico-assets/character-refs/shiro"
+    :model/status    :planned}
+
+   "lora-ghosthacker-pico"
+   {:model/id        "lora-ghosthacker-pico"
+    :model/kind      :character-lora
+    :model/base      "animagine-xl-4.0"
+    :model/character "pico"
+    :model/work      "ghosthacker-shiropico"
+    :model/dataset   "ghosthacker-shiropico-assets/character-refs/pico"
+    :model/status    :planned}})
+
+(defn model
+  "Registry entry by model id, or nil."
+  [id]
+  (get registry id))
+
+(defn hf-repo
+  "HuggingFace repo id backing `model-id` (base models), or nil."
+  [model-id]
+  (:hf/repo (model model-id)))
+
+(defn checkpoint
+  "ComfyUI checkpoint filename for `model-id` (with fallback: `<id>.safetensors`)."
+  [model-id]
+  (or (:model/checkpoint (model model-id))
+      (when (seq (str model-id)) (str model-id ".safetensors"))))
+
+(defn character-lora
+  "The character-LoRA slot for cast member `character` (name, case-insensitive),
+  or nil when no slot is declared (= no training data staged for that cast)."
+  [character]
+  (when (seq (str character))
+    (let [c (str/lower (str character))]
+      (some (fn [[_ m]]
+              (when (and (= :character-lora (:model/kind m))
+                         (= c (:model/character m)))
+                m))
+            registry))))
+
+(defn base-of
+  "Base model entry for a LoRA slot (or the entry itself when already a base)."
+  [entry]
+  (if (= :base (:model/kind entry)) entry (model (:model/base entry))))

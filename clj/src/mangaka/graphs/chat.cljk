@@ -1,0 +1,438 @@
+(ns mangaka.graphs.chat
+  "agent_chat — the conversational graph, a langgraph-clj ReAct agent over
+  Claude. Checkpointed per thread so conversations resume (the Python
+  app's Postgres-checkpointed agent_chat, now on a Datomic-API conn).
+
+  The agent is given tools that read the app's own state (stats, list docs,
+  find-by-character), so with a real model it can answer grounded questions
+  by calling them. Offline (mock model) it degrades to a plain reply."
+  (:require [langgraph.graph :as g]
+            [langgraph.prebuilt :as prebuilt]
+            [langchain.message :as msg]
+            [langchain.tool :as tool]
+            [mangaka.checkpoint :as chk]
+            [mangaka.domain :as domain]
+            [mangaka.llm :as llm]
+            [mangaka.store :as store]))
+
+(def system-prompt
+  "You are mangaka.gftd.ai — an assistant that plans, builds and QAs manga
+  storyboards. Be concise and concrete, and operate the project through the
+  provided tools instead of guessing:
+  - Ground answers in real data: stats, list_documents, get_document (a page's
+    panels), get_page_render (its composed page image), cast, list_scenes,
+    find_documents_by_character / find_documents_by_scene.
+  - Design the building blocks first: generate_character (a named cast member) and
+    generate_scene (a background) — then panels can reference them by name / scene id.
+  - Start a page with create_document (empty) or duplicate_document (clone an
+    existing layout). Inspect a page with get_document before editing it.
+  - Build and revise panels with add_panel / update_panel (rect [x y w h] page
+    position, shot, focal characters, scene background, tags, dialogue) /
+    remove_panel / reorder_panels; render a single panel with generate_panel, or
+    the whole composed page with generate_page (the final output). For panels that
+    matter, prefer the quality loops: generate_panel_quality (multi-candidate +
+    rubric critique + refine) or coscientist_panel (population + Elo + evolve —
+    the most thorough; use for hero panels).
+  - After editing, run lint_document; fix errors first (they break rendering —
+    the result's :renderable is false and :errors > 0), then the warnings. For a
+    rendered panel you can also vision_score it to critique the image itself.
+  Refer to characters by name and scenes by id (from list_scenes).")
+
+(defn- build-panel
+  "Builds a storyboard panel map from the flat fields the model emits (rect,
+  shot, focal names, tags, scene id, dialogue). Focal names are canonicalized
+  against the existing cast (so a chat-authored panel reuses :character/Nei
+  rather than minting a casing variant), and dialogue becomes a speech bubble.
+  Shared by the add_panel and update_panel tools."
+  [store {:keys [rect shot focal tags scene dialogue]}]
+  (let [->ref #(or (store/resolve-character-ref store %) (domain/character-ref %))]
+    (cond-> {}
+      ;; rect = [x y w h] in 0..1 page coords; valid-panel! rejects a bad one
+      (seq rect)           (assoc :panel/rect (vec rect))
+      shot                 (assoc :panel/shot shot)
+      (seq focal)          (assoc :panel/focal (mapv ->ref focal))
+      (seq tags)           (assoc :panel/tags (vec tags))
+      (seq (str scene))    (assoc :panel/scene scene)
+      (seq (str dialogue)) (assoc :panel/bubbles [{:bubble/text dialogue}]))))
+
+(def ^:private panel-field-schema
+  {:rect     {:type "array" :items {:type "number"}
+              :description "panel position [x y w h] in 0..1 page coords"}
+   :shot     {:type "string"}
+   :focal    {:type "array" :items {:type "string"}}
+   :tags     {:type "array" :items {:type "string"}}
+   :scene    {:type "string"}
+   :dialogue {:type "string"}})
+
+(defn- read-tools
+  "Read-only grounding tools over the durable store — always present."
+  [store]
+  [(tool/tool {:name "stats" :description "Counts of documents, characters, scenes and renders."
+                       :schema {:type "object" :properties {}}
+                       :fn (fn [_] (pr-str (store/stats store)))})
+           (tool/tool {:name "list_documents" :description "List storyboard documents (id, title, page)."
+                       :schema {:type "object" :properties {}}
+                       :fn (fn [_] (pr-str (store/list-documents store)))})
+           (tool/tool {:name "cast"
+                       :description "The story's cast and how they relate: {:nodes [{:id :name}] :edges [{:from :to :rel}]}. Use to answer who is in the story and how characters are connected."
+                       :schema {:type "object" :properties {}}
+                       :fn (fn [_] (pr-str (store/character-graph store)))})
+           (tool/tool {:name "list_scenes"
+                       :description "List the available background scenes (id, name) a panel can be set in."
+                       :schema {:type "object" :properties {}}
+                       :fn (fn [_] (pr-str (store/list-scenes store)))})
+           (tool/tool {:name "find_documents_by_character"
+                       :description "Find storyboard documents featuring a character, e.g. \"Nei\"."
+                       :schema {:type "object"
+                                :properties {:character {:type "string"}}
+                                :required ["character"]}
+                       :fn (fn [{:keys [character]}]
+                             ;; resolve case-insensitively so the model's casing
+                             ;; ("nei") still matches the stored ref (:character/Nei)
+                             (let [ref (or (store/resolve-character-ref store character)
+                                           (domain/character-ref character))]
+                               (pr-str (store/documents-with-character store ref))))})
+           (tool/tool {:name "find_documents_by_scene"
+                       :description "Find storyboard documents set in a scene, by its scene id (from list_scenes)."
+                       :schema {:type "object"
+                                :properties {:scene {:type "string"}}
+                                :required ["scene"]}
+                       :fn (fn [{:keys [scene]}]
+                             (pr-str (store/documents-with-scene store scene)))})
+           (tool/tool {:name "get_document"
+                       :description (str "Show a storyboard document's current panels (index, shot, focal, "
+                                         "scene, tags, dialogue) so you can decide what to edit/remove/reorder. "
+                                         "Provide doc_id.")
+                       :schema {:type "object"
+                                :properties {:doc_id {:type "string"}}
+                                :required ["doc_id"]}
+                       :fn (fn [{:keys [doc_id]}]
+                             (if-let [doc (store/load-document store doc_id)]
+                               (pr-str (mapv (fn [p]
+                                               (cond-> {:index (:index p)}
+                                                 (:shot p)         (assoc :shot (:shot p))
+                                                 (seq (:focal p))  (assoc :focal (:focal p))
+                                                 (:scene p)        (assoc :scene (:scene p))
+                                                 (seq (:tags p))   (assoc :tags (:tags p))
+                                                 (seq (:bubbles p)) (assoc :dialogue (mapv :text (:bubbles p)))))
+                                             (:panels (domain/export-lexicon (:page doc)))))
+                               (pr-str {:error (str "no document: " doc_id)})))})
+           (tool/tool {:name "get_page_render"
+                       :description (str "Get the composed full-page render for a document (from "
+                                         "generate_page), with its image url — or nil if it hasn't been "
+                                         "rendered yet. Provide doc_id.")
+                       :schema {:type "object"
+                                :properties {:doc_id {:type "string"}}
+                                :required ["doc_id"]}
+                       :fn (fn [{:keys [doc_id]}]
+                             (pr-str (some-> (store/load-page-render store (domain/page-render-id doc_id))
+                                             domain/with-image-url
+                                             (select-keys [:page-render/id :page-render/doc-id :image-url]))))})])
+
+(defn- action-tools
+  "App-operating tools, each gated on its action being wired into `actions`
+  (an (input, _)→result fn delegating to the corresponding graph handler)."
+  [store actions]
+  (cond-> []
+    (:create-document actions)
+    (conj (tool/tool {:name "create_document"
+                      :description (str "Create a new, empty storyboard document (page) so panels can be "
+                                        "added to it. Provide a title; the id is derived from it (or pass an "
+                                        "explicit id). Won't overwrite an existing document.")
+                      :schema {:type "object"
+                               :properties {:title {:type "string"} :id {:type "string"}}
+                               :required ["title"]}
+                      :fn (fn [{:keys [title id]}]
+                            (let [doc-id (if (seq (str id)) id (str "doc-" (domain/slug title)))]
+                              (if (store/load-document store doc-id)
+                                (pr-str {:id doc-id :created false :note "a document with this id already exists"})
+                                (do ((:create-document actions)
+                                     {:id doc-id :page {:page/number 1 :page/title title :page/panels []}} nil)
+                                    (pr-str {:id doc-id :title title :created true})))))}))
+
+    (:duplicate-document actions)
+    (conj (tool/tool {:name "duplicate_document"
+                      :description (str "Clone an existing storyboard page under a new id — reuse its "
+                                        "layout for the next page. Provide doc_id (source); optional new_id "
+                                        "and page_number. Won't overwrite an existing target.")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"}
+                                            :new_id {:type "string"}
+                                            :page_number {:type "integer"}}
+                               :required ["doc_id"]}
+                      :fn (fn [{:keys [doc_id new_id page_number]}]
+                            (-> ((:duplicate-document actions)
+                                 (cond-> {:id doc_id}
+                                   (seq (str new_id)) (assoc :new-id new_id)
+                                   page_number        (assoc :page-number page_number)) nil)
+                                (select-keys [:id :new-id :ok])
+                                pr-str))}))
+
+    (:generate-character actions)
+    (conj (tool/tool {:name "generate_character"
+                      :description (str "Design a reusable cast member (generates a reference image and "
+                                        "registers the character so panels can feature it). Provide name "
+                                        "and optional tags.")
+                      :schema {:type "object"
+                               :properties {:name {:type "string"}
+                                            :tags {:type "array" :items {:type "string"}}}
+                               :required ["name"]}
+                      :fn (fn [{:keys [name tags]}]
+                            (-> ((:generate-character actions)
+                                 (cond-> {:name name} (seq tags) (assoc :tags (vec tags))) nil)
+                                (select-keys [:character-id :name :source])
+                                pr-str))}))
+
+    (:generate-scene actions)
+    (conj (tool/tool {:name "generate_scene"
+                      :description (str "Design a background scene (generates a reference image and registers "
+                                        "the scene so panels can be set in it). Provide a prompt describing "
+                                        "the setting.")
+                      :schema {:type "object"
+                               :properties {:prompt {:type "string"}}
+                               :required ["prompt"]}
+                      :fn (fn [{:keys [prompt]}]
+                            (-> ((:generate-scene actions) {:prompt prompt} nil)
+                                (select-keys [:scene-id :source])
+                                pr-str))}))
+
+    (:generate-panel actions)
+    (conj (tool/tool {:name "generate_panel"
+                      :description "Generate a manga panel image from a text prompt."
+                      :schema {:type "object"
+                               :properties {:prompt {:type "string"}}
+                               :required ["prompt"]}
+                      :fn (fn [{:keys [prompt]}]
+                            (-> ((:generate-panel actions) {:prompt prompt} nil)
+                                (select-keys [:panel-id :image-url :source])
+                                pr-str))}))
+
+    (:generate-panel-quality actions)
+    (conj (tool/tool {:name "generate_panel_quality"
+                      :description (str "Generate a panel with the multi-candidate quality loop "
+                                        "(ADR-2607164200): several seed candidates per round, 8-axis "
+                                        "rubric vision critique, refine-or-persist gate. Slower than "
+                                        "generate_panel; returns the best candidate with its score. "
+                                        "Pass character to use its trained LoRA (if any).")
+                      :schema {:type "object"
+                               :properties {:prompt {:type "string"}
+                                            :character {:type "string"}
+                                            :candidates {:type "integer"}
+                                            :max_rounds {:type "integer"}}
+                               :required ["prompt"]}
+                      :fn (fn [{:keys [prompt character candidates max_rounds]}]
+                            (let [r ((:generate-panel-quality actions)
+                                     (cond-> {:prompt prompt}
+                                       (seq (str character)) (assoc :character character)
+                                       candidates (assoc :candidates candidates)
+                                       max_rounds (assoc :max-rounds max_rounds))
+                                     nil)]
+                              (pr-str {:panel-id (:panel-id r)
+                                       :score (:score (:best r))
+                                       :image-url (:image-url (:best r))
+                                       :rounds (:round-count r)
+                                       :converged? (:converged? r)})))}))
+
+    (:coscientist-panel actions)
+    (conj (tool/tool {:name "coscientist_panel"
+                      :description (str "Highest-quality panel generation — the co-scientist loop "
+                                        "(Generate→Reflect→Rank(Elo)→Evolve→Meta): a population of "
+                                        "shot-grammar directions, Elo-ranked by measured critique, "
+                                        "evolved via mutation+crossover across generations. The most "
+                                        "thorough (and slowest) option; use for hero panels.")
+                      :schema {:type "object"
+                               :properties {:prompt {:type "string"}
+                                            :character {:type "string"}
+                                            :population {:type "integer"}
+                                            :max_generations {:type "integer"}
+                                            :kaizen_from {:type "string"
+                                                          :description "panel id whose jump-QA issues seed the improvement directives"}
+                                            :judge {:type "boolean"
+                                                    :description "re-judge the winner with jump-QA so the next kaizen run can seed from it"}}
+                               :required ["prompt"]}
+                      :fn (fn [{:keys [prompt character population max_generations kaizen_from judge]}]
+                            (let [r ((:coscientist-panel actions)
+                                     (cond-> {:prompt prompt}
+                                       (seq (str character)) (assoc :character character)
+                                       population (assoc :population population)
+                                       max_generations (assoc :max-generations max_generations)
+                                       (seq (str kaizen_from)) (assoc :kaizen-from-panel kaizen_from)
+                                       judge (assoc :judge? true))
+                                     nil)]
+                              (pr-str (cond-> {:panel-id (:panel-id r)
+                                               :score (:score (:best r))
+                                               :direction (:direction (:best r))
+                                               :image-url (:image-url (:best r))
+                                               :generations (:generation-count r)
+                                               :converged? (:converged? r)}
+                                        (:kaizen r) (assoc :kaizen-directives
+                                                           (get-in r [:kaizen :directives]))
+                                        (:jump-qa r) (assoc :jump-qa-total
+                                                            (get-in r [:jump-qa :total]))))))}))
+
+    (:generate-page actions)
+    (conj (tool/tool {:name "generate_page"
+                      :description (str "Render the full composed manga-page image for a storyboard document "
+                                        "— it reads the page's title, cast, shots and scene backgrounds. "
+                                        "Provide doc_id; this is the final output once the page is built.")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"}}
+                               :required ["doc_id"]}
+                      :fn (fn [{:keys [doc_id]}]
+                            (-> ((:generate-page actions) {:doc-id doc_id} nil)
+                                (select-keys [:page-render-id :doc-id :image-url :source])
+                                pr-str))}))
+
+    (:add-panel actions)
+    (conj (tool/tool {:name "add_panel"
+                      :description (str "Append a panel to a storyboard document so the user can build "
+                                        "it conversationally. Provide doc_id and optional shot "
+                                        "(e.g. \"wide\"), focal (character names appearing in the panel), "
+                                        "tags, scene (a scene id from list_scenes for the background), "
+                                        "and dialogue (a line of speech-bubble text for the panel).")
+                      :schema {:type "object"
+                               :properties (assoc panel-field-schema :doc_id {:type "string"})
+                               :required ["doc_id"]}
+                      :fn (fn [{:keys [doc_id] :as input}]
+                            (-> ((:add-panel actions) {:doc-id doc_id :panel (build-panel store input)} nil)
+                                (select-keys [:doc-id :panel-index :total])
+                                pr-str))}))
+
+    (:update-panel actions)
+    (conj (tool/tool {:name "update_panel"
+                      :description (str "Revise an existing panel in place (merge patch): change its "
+                                        "shot, focal, tags, scene or dialogue. Provide doc_id and "
+                                        "panel_index (0-based); only the fields you pass are changed.")
+                      :schema {:type "object"
+                               :properties (assoc panel-field-schema
+                                                  :doc_id {:type "string"}
+                                                  :panel_index {:type "integer"})
+                               :required ["doc_id" "panel_index"]}
+                      :fn (fn [{:keys [doc_id panel_index] :as input}]
+                            (-> ((:update-panel actions)
+                                 {:doc-id doc_id :panel-index panel_index :panel (build-panel store input)} nil)
+                                (select-keys [:doc-id :panel-index :panel])
+                                pr-str))}))
+
+    (:remove-panel actions)
+    (conj (tool/tool {:name "remove_panel"
+                      :description (str "Remove the panel at panel_index (0-based) from a storyboard; "
+                                        "the remaining panels are reindexed contiguously.")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"} :panel_index {:type "integer"}}
+                               :required ["doc_id" "panel_index"]}
+                      :fn (fn [{:keys [doc_id panel_index]}]
+                            (-> ((:remove-panel actions) {:doc-id doc_id :panel-index panel_index} nil)
+                                (select-keys [:doc-id :removed :total])
+                                pr-str))}))
+
+    (:reorder-panels actions)
+    (conj (tool/tool {:name "reorder_panels"
+                      :description (str "Reorder a storyboard's panels. Provide order, a permutation of "
+                                        "the current 0-based panel indices in the new sequence (e.g. [2 0 1]).")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"}
+                                            :order {:type "array" :items {:type "integer"}}}
+                               :required ["doc_id" "order"]}
+                      :fn (fn [{:keys [doc_id order]}]
+                            (-> ((:reorder-panels actions) {:doc-id doc_id :order (vec order)} nil)
+                                (select-keys [:doc-id :order :total])
+                                pr-str))}))
+
+    (:lint actions)
+    (conj (tool/tool {:name "lint_document"
+                      :description (str "Check a storyboard document for structural problems "
+                                        "(missing rect, unknown focal character, duplicate panel "
+                                        "index, empty page). Use after editing to confirm it's sound.")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"}}
+                               :required ["doc_id"]}
+                      :fn (fn [{:keys [doc_id]}]
+                            (-> ((:lint actions) {:doc-id doc_id} nil)
+                                (select-keys [:doc-id :ok :renderable :errors :warnings :issues])
+                                pr-str))}))
+
+    (:vision-score actions)
+    (conj (tool/tool {:name "vision_score"
+                      :description (str "Visually critique a rendered panel's image against its prompt "
+                                        "(visual QA, complements the structural lint). Provide panel_id "
+                                        "from a generate_panel result.")
+                      :schema {:type "object"
+                               :properties {:panel_id {:type "string"}}
+                               :required ["panel_id"]}
+                      :fn (fn [{:keys [panel_id]}]
+                            (-> ((:vision-score actions) {:panel-id panel_id} nil)
+                                (select-keys [:panel-id :score :critique :llm-applied])
+                                pr-str))}))
+
+    (:analyze-expression actions)
+    (conj (tool/tool {:name "analyze_expression"
+                      :description (str "Apply the manga-expression patterns (HUNTER×HUNTER 由来) to a "
+                                        "storyboard: per character × line register × emotion, set each "
+                                        "bubble's shape, text weight (文字の薄さ) & size (大きさ), font "
+                                        "role, and the panel's background tone (集中線/フラッシュ/ビネット/"
+                                        "群衆シルエット). Deterministic — no image generation. Run after "
+                                        "authoring; character archetypes are read from the cast's enrichment.")
+                      :schema {:type "object"
+                               :properties {:doc_id {:type "string"}}
+                               :required ["doc_id"]}
+                      :fn (fn [{:keys [doc_id]}]
+                            (-> ((:analyze-expression actions) {:id doc_id} nil)
+                                (select-keys [:id :analysis :cast :persisted])
+                                pr-str))}))))
+
+(defn- tools
+  "The agent's full toolset: the read tools plus whichever action tools are wired."
+  [store actions]
+  (into (read-tools store) (action-tools store actions)))
+
+(defn make
+  "Builds the compiled chat agent. `scratch-conn` backs the checkpointer; the
+  tools read `store`. opts: {:model … :actions {:generate-panel :add-panel :lint}
+  :recursion-limit n} — model is injectable (defaults to live/mock Claude);
+  actions let the agent design/operate/QA the app. `recursion-limit` bounds the
+  ReAct loop's supersteps (≈ 2 per tool call); the default 60 (≈ 29 tool calls
+  per turn) accommodates multi-step authoring — a full page with several
+  characters/scenes/panels then a lint — instead of the prebuilt default of 25."
+  ([store scratch-conn] (make store scratch-conn {}))
+  ([store scratch-conn {:keys [model actions recursion-limit]
+                        :or {model (llm/chat-model) recursion-limit 60}}]
+   (prebuilt/create-react-agent
+    {:model model
+     :tools (tools store actions)
+     :system system-prompt
+     :compile-opts {:checkpointer (chk/latest-checkpointer scratch-conn)
+                    :recursion-limit recursion-limit}})))
+
+(defn- ->messages [input]
+  (cond
+    (:messages input) (mapv (fn [m] {:role (keyword (or (:role m) "user"))
+                                     :content (:content m)})
+                            (:messages input))
+    (:message input)  [(msg/user (:message input))]
+    :else             [(msg/user (str input))]))
+
+(defn handler
+  "(input, thread-id) → {:reply str :messages [...]}. Closes over a compiled
+  agent. A `thread-id` (from the request, or input's :thread-id) continues a
+  checkpointed conversation; with no thread-id the turn is stateless (nil →
+  the checkpointer is skipped). Crucially we do NOT fall back to a shared
+  \"default\" thread, which would bleed every thread-less request into one
+  ever-growing conversation."
+  [agent]
+  (fn [input thread-id]
+    (let [tid (or thread-id (:thread-id input))
+          out (fn [msgs reply] {:reply reply
+                                :messages (mapv #(select-keys % [:role :content]) msgs)})]
+      (try
+        (let [final (g/invoke agent {:messages (->messages input)} {:thread-id tid})]
+          (out (:messages final) (msg/text (msg/last-message (:messages final)))))
+        ;; if the agent over-works and hits the ReAct step limit, degrade to a
+        ;; graceful reply with the work-so-far rather than 500ing the turn.
+        ;; langgraph's recursion-limit ex-info carries {:limit … :state …}; key
+        ;; on that structure, not the message text (which could be reworded).
+        (catch clojure.lang.ExceptionInfo e
+          (if (contains? (ex-data e) :limit)
+            (out (get-in (ex-data e) [:state :messages] [])
+                 "I reached the step limit before finishing — try breaking this into smaller requests.")
+            (throw e)))))))

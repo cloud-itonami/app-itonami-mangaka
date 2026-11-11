@@ -1,0 +1,61 @@
+(ns mangaka.graphs.import-ghosthacker
+  "importGhosthacker — ingest the bundled GhostHacker `asset_graph.json` (the
+  Python import_ghosthacker graph). Its characters become :character/*
+  entities (rich metadata → the :character/enrichment EDN blob) and its
+  scenes become :scene/* entities, so the cast/sets are immediately
+  browsable (listCharacters/listScenes) and usable by the generation graphs.
+
+  Input: {:asset-graph <map>} to ingest an inline graph (tests / cljs), else
+  on the JVM it reads `GHOSTHACKER_ASSET_GRAPH` or the bundled file. Ids are
+  `char-<id>` / `scene-<id>`, the same id-space as generated assets — so a
+  later generate_character for the same name upserts the imported entity."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.graphs.util :as util]
+            [mangaka.store :as store]
+            #?(:clj [jsonista.core :as j])))
+
+(def ^:private char-fields
+  [:age :gender :hair_color :eye_color :skin_tone :uniform :home_outfit
+   :personality :catchphrase :relationships :home_scene_id :preferred_bubble_id])
+
+(defn- import-characters! [store characters]
+  (->> (vals characters)
+       (mapv (fn [c]
+               (let [id (str "char-" (or (:id c) (-> (:name c) str str/lower)))]
+                 (store/save-character! store
+                                        {:id id :name (:name c) :prompt (:text_desc c)
+                                         :enrichment (pr-str (select-keys c char-fields))})
+                 id)))))
+
+(defn- import-scenes! [store scenes]
+  (->> (vals scenes)
+       (mapv (fn [s]
+               (let [id (str "scene-" (:id s))]
+                 (store/save-scene! store {:id id :name (:name s) :prompt (:text_desc s)})
+                 id)))))
+
+#?(:clj
+   (defn- read-asset-graph []
+     ;; data/ は DataLad dataset gftdcojp/mangaka-data へ分離済み（ADR-2607023000）。
+     ;; 既定は west sibling checkout。実体は `west annex-get mangaka-data` で取得。
+     (let [candidates [(System/getenv "GHOSTHACKER_ASSET_GRAPH")
+                       "../../mangaka-data/ghosthacker/resources/asset_graph.json"
+                       "../data/ghosthacker/resources/asset_graph.json"]]
+       (when-let [path (some (fn [p]
+                               (when (and p (.exists (java.io.File. ^String p))) p))
+                             candidates)]
+         (j/read-value (slurp path) j/keyword-keys-object-mapper)))))
+
+(defn make [store]
+  (util/single-node
+   :import
+   (fn [{:keys [input]}]
+     (let [ag (or (:asset-graph input) #?(:clj (read-asset-graph) :cljs nil))]
+       (when-not (map? ag)
+         (throw (ex-info "no asset graph (provide :asset-graph, or a readable GHOSTHACKER_ASSET_GRAPH file)"
+                         {:type :bad-input})))
+       {:source "ghosthacker"
+        :characters (import-characters! store (:characters ag))
+        :scenes (import-scenes! store (:scenes ag))}))))
+
+(def handler util/result-handler)

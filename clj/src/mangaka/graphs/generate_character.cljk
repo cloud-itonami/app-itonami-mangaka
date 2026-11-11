@@ -1,0 +1,33 @@
+(ns mangaka.graphs.generate-character
+  "mangaka_generate_character — generate a reusable cast member's reference
+  image. A plan→render→persist generation graph (see mangaka.graphs.gen)
+  persisting a :character/* entity; requires a :name."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.domain :as domain]
+            [mangaka.graphs.gen :as gen]
+            [mangaka.store :as store]))
+
+(defn- plan [{:keys [name prompt tags negative seed width height model]}]
+  (let [base (or prompt (str "character reference sheet, " name ", full body, neutral pose"))
+        full (->> [base (when (seq tags) (str/join ", " tags))]
+                  (remove nil?) (str/join ", "))]
+    {:prompt full
+     :negative (or negative "lowres, bad anatomy, extra limbs, worst quality")
+     :seed (or seed 0) :width (or width 832) :height (or height 1216) :model model}))
+
+(defn- persist [store input spec render]
+  (let [cid (or (:character-id input) (str "char-" (domain/slug (:name input))))]
+    (store/save-character! store {:id cid :name (:name input)
+                                  :prompt (:prompt spec) :seed (:seed spec) :model (:model spec)
+                                  :image-key (:image-key render)
+                                  :image-b64 (when-not (:image-key render) (:image-b64 render))
+                                  :image-mime (:mime render)})
+    {:character-id cid :name (:name input) :image-b64 (:image-b64 render)
+     :image-key (:image-key render) :image-url (:image-url render)
+     :mime (:mime render) :source (:source render) :seed (:seed spec) :run-id (:run-id render)}))
+
+(def ^:private opts {:require [:name]})
+
+(defn make [store blobs] (gen/build store blobs {:plan plan :persist persist}))
+(defn handler [compiled] (gen/handler compiled opts))
+(defn stream-handler [compiled] (gen/stream-handler compiled opts))

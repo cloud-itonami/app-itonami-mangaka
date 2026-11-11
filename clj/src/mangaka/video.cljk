@@ -1,0 +1,158 @@
+(ns mangaka.video
+  "Panel generation via seedance video -> frame sampling, as an alternative
+  to mangaka.comfy's txt2img path (this pipeline does NOT start from an
+  image; a panel is a still pulled back out of a generated clip).
+
+  Two host-fn steps, same never-throws-degrades-to-a-stub discipline as
+  mangaka.comfy / comfyui.gateway:
+
+    generate-video! -- submits a text-to-video job to cloud-murakumo's
+      :seedance engine (ADR-2607170500; per-model candidate behind
+      cloud-murakumo's self-hosted-first :video default, selected here by
+      requesting model \"seedance-2.0\" explicitly) and blocks until done.
+      cloud-murakumo.executor/execute does the submit+poll+download
+      internally (~30min ceiling for :mp4, see that repo's
+      await-seedance-output) -- no separate job/poll state machine needed
+      here, unlike animeka's api.murakumo.cloud nbb client (that client
+      exists because animeka's production-loop.cljs is a separate nbb
+      process with no JVM deps; mangaka's graph server already depends on
+      gftdcojp/cloud-murakumo directly, the same way mangaka.comfy's
+      render-via-murakumo does for images).
+
+    sample-frames! -- ffprobe's the downloaded clip's real duration (never
+      trusts the requested duration -- a generated clip's actual length can
+      differ) and pulls N evenly-spaced stills back out via ffmpeg, using
+      kotoba-lang/douga's pure argv builders (shared with ai-gftd-dougaka's
+      dougaka.pipeline; frame-sampling is the mirror-image operation of
+      douga.ffmpeg's still-to-video assembly, so it lives there rather than
+      being hand-rolled a second time in this repo).
+
+  With no SEEDANCE_API_KEY/MURAKUMO_BACKEND_TOKEN, an unreachable backend,
+  or no ffmpeg/ffprobe on PATH, both steps degrade to a single placeholder
+  SVG frame (mirrors comfyui.gateway's stub-render) -- the graph still
+  completes end-to-end offline, it just never fabricates a real render."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [cloud-murakumo.engine :as murakumo])
+            #?(:clj [cloud-murakumo.executor :as murakumo-exec])
+            #?(:clj [cloud-murakumo.worker :as murakumo-worker])
+            #?(:clj [douga.ffmpeg :as ff])
+            #?(:clj [clojure.java.io :as io])
+            #?(:clj [clojure.java.shell :as shell])))
+
+(def default-model "seedance-2.0")
+(def default-duration-sec 4)
+(def default-frame-count 5)
+
+(def motion-tail
+  "Appended to every panel-from-video prompt -- keeps the clip anchored to
+  ONE readable, panel-worthy composition instead of a scene change or camera
+  cut mid-clip (mirrors ai-gftd-animeka's own animeka.murakumo-video
+  video-motion-tail; same rationale, a manga panel needs a single frame to
+  be worth sampling, not a montage)."
+  "single continuous shot, no scene change, no camera cut, consistent character and composition throughout")
+
+(defn compose-video-prompt [prompt]
+  (str/join ", " (remove str/blank? [prompt motion-tail])))
+
+;; ── video generation (JVM: cloud-murakumo :seedance engine) ────────────────
+
+#?(:clj
+   (defn- placeholder-frame-svg!
+     "A tiny inline SVG standing in for a sampled frame (mirrors
+     comfyui.gateway's placeholder-b64) -- written to `dir`, path returned."
+     [dir prompt]
+     (let [f (io/file dir "stub-frame.svg")
+           p (str prompt)]
+       (spit f (str "<svg xmlns='http://www.w3.org/2000/svg' width='832' height='1216'>"
+                    "<rect width='100%' height='100%' fill='#1b1d24'/>"
+                    "<text x='16' y='40' fill='#8aa0c0' font-size='14'>"
+                    "mangaka panel-from-video (stub, no seedance clip)</text>"
+                    "<text x='16' y='70' fill='#5e6b82' font-size='11'>"
+                    (subs p 0 (min 60 (count p))) "</text></svg>"))
+       (.getPath f))))
+
+#?(:clj
+   (defn generate-video!
+     "spec: {:prompt :model :duration-sec :size}. Never throws -- returns
+     {:video-file path-or-nil :source \"murakumo-seedance\"|\"stub\" :model
+     :gpu-seconds? :error?}."
+     [{:keys [prompt model duration-sec size]}]
+     (let [model (or model default-model)
+           token (murakumo-worker/backend-token :seedance {})]
+       (if (str/blank? (str token))
+         {:video-file nil :source "stub" :model model
+          :error "no SEEDANCE_API_KEY / MURAKUMO_BACKEND_TOKEN -- video generation skipped"}
+         (try
+           (let [job {:gen.job/engine :seedance
+                      :gen.job/model model
+                      :gen.job/input {:prompt (compose-video-prompt prompt) :refs []
+                                      :params (cond-> {}
+                                                duration-sec (assoc :seconds duration-sec)
+                                                size (assoc :size size))}}
+                 inv (assoc-in (murakumo/invocation job) [:backend :token] token)
+                 {:keys [outputs gpu-seconds]} (murakumo-exec/execute inv)]
+             (if-let [file (first outputs)]
+               {:video-file file :source "murakumo-seedance" :model model :gpu-seconds gpu-seconds}
+               {:video-file nil :source "stub" :model model
+                :error "seedance job completed with no video output"}))
+           (catch Exception e
+             {:video-file nil :source "stub" :model model :error (.getMessage e)}))))))
+
+;; ── frame sampling (JVM: ffprobe + ffmpeg via douga.ffmpeg argv) ───────────
+
+#?(:clj
+   (defn- read-b64 [file]
+     (.encodeToString (java.util.Base64/getEncoder)
+                      (java.nio.file.Files/readAllBytes (.toPath (io/file file))))))
+
+#?(:clj
+   (defn- probe-duration-sec
+     "Real duration of the downloaded clip, or nil (missing ffprobe /
+     unparseable output) -- never trusts the *requested* duration, a
+     generated clip's actual length can differ."
+     [video-path]
+     (try
+       (let [{:keys [exit out]} (apply shell/sh (ff/ffprobe-duration-cmd video-path))]
+         (when (zero? exit) (parse-double (str/trim out))))
+       (catch Exception _ nil))))
+
+#?(:clj
+   (defn- extract-frame! [video-path timestamp-sec out-path]
+     (let [{:keys [exit err]} (apply shell/sh (ff/extract-frame-cmd video-path timestamp-sec out-path))]
+       (when-not (zero? exit)
+         (throw (ex-info "ffmpeg frame extraction failed" {:timestamp timestamp-sec :err err}))))))
+
+#?(:clj
+   (defn sample-frames!
+     "video-file -> up to `n` candidate frames [{:image-b64 :mime :time-ms}],
+     newest/most-central first is NOT implied -- callers (the critique step)
+     treat them as an unordered candidate set. video-file nil (stub video),
+     an unprobable clip, or no ffmpeg/ffprobe on PATH all degrade to ONE
+     placeholder SVG frame instead of throwing -- the graph still completes,
+     it just never fabricates a real sample."
+     [{:keys [video-file prompt n] :or {n default-frame-count}}]
+     (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                         "mangaka-video-frames-"
+                         (make-array java.nio.file.attribute.FileAttribute 0)))]
+       (try
+         (let [duration (and video-file (probe-duration-sec video-file))]
+           (if duration
+             (let [timestamps (ff/sample-timestamps duration n)
+                   frames (vec (keep-indexed
+                                (fn [i t]
+                                  (try
+                                    (let [out (io/file dir (str "frame-" i ".png"))]
+                                      (extract-frame! video-file t (.getPath out))
+                                      {:image-b64 (read-b64 out) :mime "image/png"
+                                       :time-ms (long (* t 1000))})
+                                    (catch Exception _ nil)))
+                                timestamps))]
+               (if (seq frames)
+                 frames
+                 [{:image-b64 (read-b64 (placeholder-frame-svg! dir prompt))
+                   :mime "image/svg+xml" :time-ms 0}]))
+             [{:image-b64 (read-b64 (placeholder-frame-svg! dir prompt))
+               :mime "image/svg+xml" :time-ms 0}]))
+         (finally
+           (doseq [f (.listFiles dir)] (.delete f))
+           (.delete dir))))))

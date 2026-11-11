@@ -1,0 +1,133 @@
+(ns compose-arc00
+  "Ghost Hacker #00 (arc0-0) 全6ページの genko 合成 — scenario-first。
+  各ページ: scenarios/scenario-gh-arc0-0-pNN.edn の beats(セリフ/register/
+  SFX/layout)+ arc0-0/pNN/ の抜きコマ + per-panel picks(frame/face-bbox/
+  corner)を v16 組版(layout-bubbles / caption / stub tails)へ流す。"
+  (:require [kami.mangaka.page :as page-compose]
+            [kami.mangaka.expression :as expr]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]))
+
+(def scratch
+  "作業ディレクトリ (scenarios/ と arc0-0/<page>/ の抜きコマ、出力 PNG を置く)。
+  MANGAKA_SCRATCH 環境変数で指定する。"
+  (let [d (or (System/getenv "MANGAKA_SCRATCH")
+              (throw (ex-info "MANGAKA_SCRATCH not set" {})))]
+    (if (.endsWith ^String d "/") d (str d "/"))))
+
+(def patterns (expr/load-patterns))
+(def cast* {"Yuto" :gentle "Ren" :stoic "Nei" :gentle "Akira" :energetic "Saki" :strategist})
+
+(defn style-for [{:keys [speaker register expression]}]
+  (let [arch (expr/resolve-archetype cast* speaker patterns)]
+    (expr/resolve-style patterns {:archetype arch :register register
+                                  :expression expression :intensity 0.0})))
+
+;; per-page frame picks + placement inputs, keyed by panel id.
+;; :file per panel; dialogue placement tuning merged onto the beat's line.
+(def picks
+  {"p00" {:frames {0 "t1.50.png" 1 "t3.60.png" 2 "t6.05.png" 3 "t8.50.png"}
+          :place {2 {:corner :tr :face-bbox [0.25 0.2 0.45 0.7]
+                     :scale 0.5 :target-height 0.5 :min-aspect 1.2}}
+          :narration {3 "Ghost Hacker #00『パスワードは覚えるな』"}}
+   "p01" {:frames {0 "t1.15.png" 1 "t3.95.png" 2 "t6.40.png" 3 "t9.20.png"}
+          :place {0 {:corner :tr :face-bbox [0.08 0.1 0.3 0.55]
+                     :scale 0.55 :target-height 0.5 :min-aspect 1.2}
+                  1 {:corner :tl :face-bbox [0.05 0.18 0.8 0.95]
+                     :scale 0.4 :target-height 0.13 :min-aspect 0.1}
+                  2 {:corner :tl :scale 0.5 :target-height 0.3 :max-width 0.5}}}
+   "p02" {:frames {0 "t1.15.png" 1 "t2.90.png" 2 "t4.65.png" 3 "t6.75.png" 4 "t8.85.png"}
+          :place {0 {:corner :tl :face-bbox [0.35 0.25 0.6 0.6] :scale 0.5}
+                  1 {:corner :tr :face-bbox [0.3 0.1 0.6 0.55] :scale 0.45}
+                  2 {:corner :tl :face-bbox [0.4 0.2 0.7 0.7] :scale 0.5}
+                  3 {:corner :tr :face-bbox [0.3 0.15 0.6 0.65] :scale 0.5}
+                  4 {:corner :tr :scale 0.42 :target-height 0.3 :max-width 0.4}}}
+   "p03" {:frames {0 "t0.80.png" 1 "t2.55.png" 2 "t4.65.png" 3 "t6.40.png" 4 "t9.20.png"}
+          :place {0 {:corner :tl :face-bbox [0.3 0.1 0.7 0.8] :scale 0.55}
+                  1 {:corner :tl :face-bbox [0.6 0.35 0.75 0.65] :scale 0.45}
+                  2 {:corner :tl :face-bbox [0.3 0.1 0.7 0.6] :scale 0.55}
+                  3 {:corner :tr :face-bbox [0.25 0.15 0.55 0.7] :scale 0.45}
+                  4 {:corner :tl :face-bbox [0.45 0.35 0.55 0.6] :scale 0.45
+                     :target-height 0.4}}}
+   "p04" {:frames {0 "t1.15.png" 1 "t3.25.png" 2 "t5.00.png" 3 "t8.85.png"}
+          :place {0 {:corner :tl :face-bbox [0.15 0.05 0.85 0.75] :below-face? true
+                     :scale 0.45 :target-height 0.18 :min-aspect 0.1}
+                  2 {:sfx-pos [0.62 0.55]}
+                  1 {:corner :tl :face-bbox [0.4 0.35 0.6 0.7] :scale 0.5}
+                  3 {:corner :tl :face-bbox [0.25 0.15 0.75 0.95]
+                     :scale 0.45 :target-height 0.12 :min-aspect 0.1}}}
+   "p05" {:frames {0 "t1.15.png" 1 "t3.25.png" 2 "t6.05.png" 3 "t7.45.png" 4 "t9.55.png"}
+          :place {0 {:corner :tl :face-bbox [0.35 0.05 0.6 0.35] :scale 0.45
+                     :target-height 0.5 :max-width 0.3}
+                  1 {:corner :tl :face-bbox [0.05 0.15 0.95 0.95]
+                     :scale 0.4 :target-height 0.14 :min-aspect 0.1}
+                  2 {:corner :tl :face-bbox [0.55 0.3 0.75 0.7] :scale 0.5}
+                  3 {:corner :tl :face-bbox [0.25 0.05 0.75 0.65] :scale 0.4
+                     :max-width 0.18 :sfx-pos [0.18 0.85]}
+                  4 {:corner :tl :face-bbox [0.35 0.25 0.6 0.6] :scale 0.45
+                     :target-height 0.5 :max-width 0.32}}}})
+
+(defn compose-page [pnum]
+  (let [scenario (edn/read-string (slurp (str scratch "scenarios/scenario-gh-arc0-0-" pnum ".edn")))
+        {:keys [frames place narration]} (get picks pnum)
+        layout (get-in scenario [:scene/page :layout])
+        rect-by-id (into {} (map (fn [r] [(:id r) r])
+                                 (page-compose/panel-pixel-sizes {:panels layout})))
+        beats (:scene/beats scenario)
+        beat-by-panel (into {} (for [b beats p (:panels b)] [p b]))
+        panels+scores
+        (mapv
+         (fn [{:keys [id size]}]
+           (let [idx (Integer/parseInt (subs id 6))
+                 {:keys [w h]} (get rect-by-id id)
+                 beat (get beat-by-panel idx)
+                 pl (get place idx)
+                 line (:line beat)
+                 spec (when line
+                        (let [style (style-for beat)]
+                          (-> {:text line :speaker (:speaker beat)
+                               :corner (:corner pl) :face-bbox (:face-bbox pl)
+                               :below-face? (:below-face? pl)
+                               :target-height (:target-height pl)
+                               :min-aspect (:min-aspect pl)
+                               :max-width (:max-width pl)
+                               :scale (or (:scale pl) (:scale style))
+                               :weight (:weight style) :font-role (:font-role style)
+                               :caption? (= :narration (:register beat))}
+                              (cond-> (:bubble style) (assoc :bubble (:bubble style))))))
+                 {:keys [dialogue warnings]}
+                 (if spec
+                   (page-compose/layout-bubbles {:panel-w w :panel-h h} [spec])
+                   {:dialogue [] :warnings []})
+                 score-input (mapv (fn [d] {:bubble-rect (:rect d) :face-bbox (:face-bbox d)
+                                            :corner (when-not (:chained? d) (:corner d))
+                                            :prev-rect (:prev-rect d) :fits? (:fits? d)
+                                            :below-face? (:below-face? d)
+                                            :tail-target (:tail-target d)})
+                                   dialogue)
+                 clean (mapv #(dissoc % :rect :corner :face-bbox :chained? :prev-rect
+                                      :below-face? :target-height :min-aspect :max-width
+                                      :speaker :caption?)
+                             dialogue)]
+             {:panel (cond-> {:id id :size size :dialogue clean}
+                       (:sfx beat) (assoc :sfx [(cond-> {:text (:sfx beat) :scale 0.8 :font-role :brush}
+                                                  (:sfx-pos pl) (assoc :pos (:sfx-pos pl)))])
+                       (get narration idx) (assoc :narration (get narration idx)
+                                                  :narration-style {:weight :bold :scale 0.9}))
+              :score (when (seq score-input) (page-compose/panel-placement-score score-input))
+              :warnings warnings}))
+         layout)
+        img-of (fn [id] (io/file (str scratch "arc0-0/" pnum "/"
+                                      (get frames (Integer/parseInt (subs id 6))))))
+        out (str scratch "genko-gh-arc0-0-" pnum ".png")]
+    (println (format "\n== %s ==" pnum))
+    (doseq [{:keys [panel score warnings]} panels+scores]
+      (println (format "  %-9s score=%s%s" (:id panel)
+                       (if (:score score) (format "%.3f" (double (:score score))) "-")
+                       (if (seq warnings) (str "  !!WARN " (pr-str warnings)) ""))))
+    (page-compose/compose-page! {:panels (mapv :panel panels+scores)} img-of out
+                                :monochrome? true)
+    (println "  wrote" out)))
+
+(doseq [p ["p00" "p01" "p02" "p03" "p04" "p05"]]
+  (compose-page p))

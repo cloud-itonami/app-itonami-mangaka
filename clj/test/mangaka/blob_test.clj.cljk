@@ -1,0 +1,101 @@
+(ns mangaka.blob-test
+  "Content-addressed blob store + the generation offload: a generated image is
+  stored as a short blob key on the datom (not megabytes of inline base64),
+  fetchable by key, with identical images deduping."
+  (:require [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [mangaka.blob :as blob]
+            [mangaka.store :as store]
+            [mangaka.runtime :as rt]
+            [mangaka.graphs.registry :as reg]))
+
+(deftest blob-round-trip-and-dedup
+  (let [b (blob/mem-blobs)
+        k1 (blob/put! b "QUJD" "image/png")
+        k2 (blob/put! b "QUJD" "image/png")        ; identical → same content key
+        k3 (blob/put! b "WFla" "image/png")]
+    (is (= k1 k2) "content-addressed: identical bytes dedup to one key")
+    (is (not= k1 k3))
+    (is (str/starts-with? k1 "sha256-"))
+    (is (= {:b64 "QUJD" :mime "image/png"} (blob/fetch b k1)))
+    (is (nil? (blob/fetch b "sha256-missing")))))
+
+(deftest fs-blobs-round-trip-and-persistence
+  (testing "filesystem backend round-trips, dedups, and survives a new instance"
+    (let [dir (str (System/getProperty "java.io.tmpdir") "/mangaka-blob-test-"
+                   (System/nanoTime))
+          b1  (blob/fs-blobs dir)
+          k   (blob/put! b1 "QUJD" "image/png")
+          k2  (blob/put! b1 "QUJD" "image/png")]
+      (is (= k k2) "content-addressed dedup")
+      (is (.exists (java.io.File. dir k)) "bytes written to disk")
+      (is (= {:b64 "QUJD" :mime "image/png"} (blob/fetch b1 k)))
+      ;; a *new* backend over the same dir still sees it (persistence)
+      (is (= "QUJD" (:b64 (blob/fetch (blob/fs-blobs dir) k))))
+      (is (nil? (blob/fetch b1 "sha256-missing")))
+      ;; cleanup
+      (doseq [f (.listFiles (java.io.File. dir))] (.delete f))
+      (.delete (java.io.File. dir)))))
+
+(deftest generation-offloads-image-to-blob
+  (testing "with a blob store, the panel datom holds a key (not inline base64)"
+    (let [store (store/mem-store)
+          blobs (blob/mem-blobs)
+          r (reg/build store (rt/scratch-conn) blobs)
+          h (get-in r ["ai.gftd.mangaka.mangakaGeneratePanel" :handler])
+          res (h {:prompt "neon city" :seed 1} nil)
+          stored (store/load-panel store (:panel-id res))]
+      (is (string? (:image-key res)) "result carries the blob key")
+      (is (= (str "/blob/" (:image-key res)) (:image-url res)))
+      (is (string? (:image-b64 res)) "result still returns the image for immediate use")
+      ;; the durable datom holds the key, NOT the inline base64 (no bloat)
+      (is (= (:image-key res) (:panel/image-key stored)))
+      (is (nil? (:panel/image-b64 stored)) "no inline base64 in the datom")
+      ;; the blob is fetchable by key
+      (is (= (:image-b64 res) (:b64 (blob/fetch blobs (:image-key res))))))))
+
+(deftest vision-score-fetches-image-via-blob
+  (testing "with images offloaded to blobs, visionScorePanel fetches by key"
+    (let [store (store/mem-store)
+          blobs (blob/mem-blobs)
+          r (reg/build store (rt/scratch-conn) blobs)
+          gen ((get-in r ["ai.gftd.mangaka.mangakaGeneratePanel" :handler]) {:prompt "neon" :seed 1} nil)
+          stored (store/load-panel store (:panel-id gen))]
+      (is (string? (:panel/image-key stored)))
+      (is (nil? (:panel/image-b64 stored)) "image lives in the blob store, not the datom")
+      ;; vision has no inline image — it must resolve the blob key to score
+      (let [res ((get-in r ["ai.gftd.mangaka.visionScorePanel" :handler]) {:panel-id (:panel-id gen)} nil)]
+        (is (= (:panel-id gen) (:panel-id res)))
+        (is (map? (:critique res)))))))
+
+(deftest list-renders-includes-blob-image-url
+  (testing "listRenders entries carry :image-url for blob-backed renders (gallery view)"
+    (let [store (store/mem-store)
+          blobs (blob/mem-blobs)
+          r (reg/build store (rt/scratch-conn) blobs)]
+      ((get-in r ["ai.gftd.mangaka.saveDocument" :handler])
+       {:id "lr" :page {:page/number 1 :page/panels [{:panel/index 0 :panel/shot "wide"}]}} nil)
+      ((get-in r ["ai.gftd.mangaka.mangakaGeneratePanel" :handler]) {:doc-id "lr" :panel-index 0} nil)
+      (let [entry (first (:renders ((get-in r ["ai.gftd.mangaka.listRenders" :handler]) {:doc-id "lr"} nil)))]
+        (is (= "panel-lr-0" (:id entry)))
+        (is (str/starts-with? (:image-url entry) "/blob/sha256-"))))))
+
+(deftest load-character-includes-blob-image-url
+  (testing "loadCharacter on a blob-backed character returns a fetchable :image-url"
+    (let [store (store/mem-store)
+          blobs (blob/mem-blobs)
+          r (reg/build store (rt/scratch-conn) blobs)
+          gen ((get-in r ["ai.gftd.mangaka.mangakaGenerateCharacter" :handler]) {:name "Nei" :seed 1} nil)
+          loaded ((get-in r ["ai.gftd.mangaka.loadCharacter" :handler]) {:id (:character-id gen)} nil)]
+      (is (string? (:character/image-key loaded)))
+      (is (= (str "/blob/" (:character/image-key loaded)) (:image-url loaded))))))
+
+(deftest generation-without-blobs-falls-back-to-inline
+  (testing "no blob store → inline base64 in the datom (backward compatible)"
+    (let [store (store/mem-store)
+          r (reg/build store (rt/scratch-conn))      ; 2-arg → blobs nil
+          h (get-in r ["ai.gftd.mangaka.mangakaGeneratePanel" :handler])
+          res (h {:prompt "x" :seed 1} nil)
+          stored (store/load-panel store (:panel-id res))]
+      (is (nil? (:image-key res)))
+      (is (string? (:panel/image-b64 stored)) "inline base64 fallback"))))

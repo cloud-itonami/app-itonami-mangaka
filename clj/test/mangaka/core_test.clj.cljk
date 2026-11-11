@@ -1,0 +1,1318 @@
+(ns mangaka.core-test
+  "End-to-end tests for the vertical slice on the in-memory backend:
+  store round-trip, comfy render (stub), and every registry graph handler."
+  (:require [clojure.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [clojure.edn :as edn]
+            [clojure.set :as set]
+            [langchain.db :as ldb]
+            [langchain.model :as model]
+            [langchain.message :as msg]
+            [mangaka.graphs.chat :as chat]
+            [mangaka.graphs.documents :as docs]
+            [mangaka.graphs.lint-document :as lint]
+            [mangaka.graphs.generate-character :as character]
+            [mangaka.graphs.generate-scene :as scene]
+            [mangaka.graphs.generate-page :as page]
+            [mangaka.graphs.vision-score :as vision]
+            [mangaka.preview :as preview]
+            [mangaka.seed :as seed]
+            [mangaka.store :as store]
+            [mangaka.domain :as domain]
+            [mangaka.comfy :as comfy]
+            [mangaka.llm :as llm]
+            [mangaka.runtime :as rt]
+            [mangaka.graphs.registry :as reg]))
+
+(defn- mock-saying [text] (model/mock-model (fn [_ _] (msg/ai text))))
+
+(deftest chat-checkpointer-is-bounded
+  (testing "many turns on a thread keep exactly one checkpoint datom (latest-only)"
+    (let [conn (rt/scratch-conn)
+          chat-h (chat/handler (chat/make (store/mem-store) conn))
+          n-ckpts #(count (ldb/q '[:find [?e ...] :where [?e :ckpt/thread "c"]] (ldb/db conn)))]
+      (dotimes [_ 5] (chat-h {:message "hello"} "c"))
+      (is (= 1 (n-ckpts)) "checkpoints don't accumulate across turns"))))
+
+(deftest chat-agent-tool-loop
+  (testing "the chat agent invokes a tool and feeds the result back (ReAct loop)"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "d" :page {:page/number 1 :page/panels []}})
+          ;; scripted model: first turn → call the `stats` tool; once a tool
+          ;; result is present → final answer.
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "there is 1 document")
+                     (msg/ai "" {:tool-calls [{:id "t1" :name "stats" :input {}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model})
+          final ((chat/handler agent) {:message "how many docs?"} "t-tools")
+          roles (map :role (:messages final))]
+      (is (some #{:tool} roles) "a tool was executed in the loop")
+      (is (= "there is 1 document" (:reply final)) "final answer after the tool result"))))
+
+(deftest chat-agent-tolerates-tool-failure
+  (testing "a tool that throws surfaces as an error tool-result; the conversation continues (no 500)"
+    ;; the 6 mutation actions throw :bad-input on bad input (missing doc, bad
+    ;; index). The agent must feed that back to the model as an error tool
+    ;; message and keep going — not crash the whole turn.
+    (let [store (store/mem-store)
+          ;; update_panel on a non-existent doc → the graph throws :bad-input
+          update-panel (docs/handler (docs/make-update-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if-let [tm (some #(when (= :tool (:role %)) %) messages)]
+                     (msg/ai (if (:error? tm) "that didn't work" "ok"))
+                     (msg/ai "" {:tool-calls [{:id "e1" :name "update_panel"
+                                               :input {:doc_id "ghost" :panel_index 0 :shot "wide"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:update-panel update-panel}})
+          final ((chat/handler agent) {:message "change panel 0 of ghost"} "t-fail")]
+      (is (some #{:tool} (map :role (:messages final))) "the failed tool still produced a :tool message")
+      (is (= "that didn't work" (:reply final))
+          "the error reached the model as an error tool-result and it replied — the turn didn't 500"))))
+
+(deftest chat-agent-can-position-panels
+  (testing "add_panel can set a rect so the agent can lay out (and author lint-clean) panels"
+    (let [store (store/mem-store)
+          _ (store/save-character! store {:id "char-nei" :name "Nei"})  ; so focal isn't unknown
+          _ (store/save-document! store {:id "lay" :page {:page/number 1 :page/panels []}})
+          add-panel (docs/handler (docs/make-add-panel store))
+          lint (lint/handler (lint/make store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "placed it")
+                     (msg/ai "" {:tool-calls [{:id "p1" :name "add_panel"
+                                               :input {:doc_id "lay" :shot "wide"
+                                                       :focal ["Nei"] :rect [0.05 0.05 0.9 0.4]}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:add-panel add-panel}})
+          _ ((chat/handler agent) {:message "add a wide panel of Nei at the top"} "t-pos")
+          panel (first (:page/panels (:page (store/load-document store "lay"))))]
+      (is (= [0.05 0.05 0.9 0.4] (:panel/rect panel)) "the rect was set on the panel")
+      ;; with a rect + a known character, the panel now lints clean (no :missing-rect)
+      (let [issues (:issues (lint {:doc-id "lay"} nil))]
+        (is (empty? issues) (str "a positioned, cast-referencing panel lints clean; got: " issues))))))
+
+(deftest chat-agent-authors-clean-storyboard-end-to-end
+  (testing "the agent chains create → design → position → QA into a lint-clean page"
+    ;; integration of the headline workflow: every step's id/ref derivation must
+    ;; line up (slug id, char-<name>, :character/<Name> focal, lint cross-ref).
+    (let [store (store/mem-store)
+          actions {:create-document    (docs/handler (docs/make-save store))
+                   :generate-character (character/handler (character/make store nil))
+                   :add-panel          (docs/handler (docs/make-add-panel store))
+                   :lint               (lint/handler (lint/make store))}
+          model (model/mock-model
+                 (fn [messages _]
+                   (case (count (filter #(= :tool (:role %)) messages))
+                     0 (msg/ai "" {:tool-calls [{:id "1" :name "create_document" :input {:title "Chapter 1" :id "ch1"}}]})
+                     1 (msg/ai "" {:tool-calls [{:id "2" :name "generate_character" :input {:name "Rei"}}]})
+                     2 (msg/ai "" {:tool-calls [{:id "3" :name "add_panel"
+                                                 :input {:doc_id "ch1" :shot "wide" :focal ["Rei"]
+                                                         :rect [0.05 0.05 0.9 0.4]}}]})
+                     3 (msg/ai "" {:tool-calls [{:id "4" :name "lint_document" :input {:doc_id "ch1"}}]})
+                     (msg/ai "Built Chapter 1: a wide panel of Rei. Lints clean."))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions actions})
+          final ((chat/handler agent) {:message "start chapter 1 with a wide panel of Rei"} "t-e2e")]
+      (is (= 4 (count (filter #(= :tool (:role %)) (:messages final)))) "all four tools ran in sequence")
+      (is (some? (store/load-character store "char-rei")) "the character was designed (char-<slug>)")
+      (let [panel (first (:page/panels (:page (store/load-document store "ch1"))))]
+        (is (= [":character/Rei"] (:panel/focal panel)) "the panel references the designed character")
+        (is (= [0.05 0.05 0.9 0.4] (:panel/rect panel)) "and is positioned"))
+      ;; generate_character→char-rei, focal→:character/Rei, lint maps :character/Rei→char-rei:
+      ;; all the derivations agree, so the authored page passes its own QA.
+      (is (empty? (:issues ((lint/handler (lint/make store)) {:doc-id "ch1"} nil)))
+          "the end-to-end authored storyboard lints clean"))))
+
+(deftest chat-agent-allows-multi-step-turns
+  (testing "a long multi-step authoring turn (many tool calls) completes — not capped at the prebuilt 25"
+    ;; 14 tool calls ≈ 29 supersteps > the langgraph default recursion-limit of
+    ;; 25, so this would throw under the default; the chat agent raises it to 60.
+    (let [store (store/mem-store)
+          model (model/mock-model
+                 (fn [messages _]
+                   (let [n (count (filter #(= :tool (:role %)) messages))]
+                     (if (< n 14)
+                       (msg/ai "" {:tool-calls [{:id (str "t" n) :name "stats" :input {}}]})
+                       (msg/ai "done after 14 steps")))))
+          agent (chat/make store (rt/scratch-conn) {:model model})
+          final ((chat/handler agent) {:message "do a lot of work"} "t-long")]
+      (is (= 14 (count (filter #(= :tool (:role %)) (:messages final)))) "all 14 tool calls ran")
+      (is (= "done after 14 steps" (:reply final)) "the turn completed instead of hitting the limit"))))
+
+(deftest chat-agent-degrades-on-recursion-limit
+  (testing "an agent that never stops calling tools hits the limit but replies gracefully (no 500)"
+    (let [store (store/mem-store)
+          ;; a model that ALWAYS calls a tool → never terminates → hits the limit
+          model (model/mock-model
+                 (fn [_ _] (msg/ai "" {:tool-calls [{:id "x" :name "stats" :input {}}]})))
+          ;; small limit so the test is fast; the handler must catch, not throw
+          agent (chat/make store (rt/scratch-conn) {:model model :recursion-limit 6})
+          final ((chat/handler agent) {:message "loop forever"} "t-limit")]
+      (is (string? (:reply final)) "a reply is returned, not an exception")
+      (is (str/includes? (:reply final) "step limit") "the reply explains the limit was hit")
+      (is (vector? (:messages final)) "the work-so-far messages are still returned"))))
+
+(deftest chat-agent-propagates-non-limit-errors
+  (testing "the graceful catch is selective — a genuine error is NOT swallowed as 'step limit'"
+    ;; keying on the :limit ex-data (not the message string) means other
+    ;; ExceptionInfos propagate, so real failures aren't masked as graceful.
+    (let [store (store/mem-store)
+          model (model/mock-model (fn [_ _] (throw (ex-info "boom" {:type :other}))))
+          agent (chat/make store (rt/scratch-conn) {:model model})]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   ((chat/handler agent) {:message "hi"} "t-err"))))))
+
+(deftest chat-agent-can-generate
+  (testing "the agent can act: a generate_panel tool actually renders a panel"
+    (let [store (store/mem-store)
+          rendered (atom false)
+          ;; the action delegates to a panel-gen-like fn that records + returns
+          gen-action (fn [input _] (reset! rendered true)
+                       {:panel-id "p-via-chat" :image-url "/blob/x" :source "stub"})
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "panel created")
+                     (msg/ai "" {:tool-calls [{:id "g1" :name "generate_panel"
+                                               :input {:prompt "a cat"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:generate-panel gen-action}})
+          final ((chat/handler agent) {:message "draw a cat"} "t-gen")]
+      (is (true? @rendered) "the generate-panel action was invoked")
+      (is (some #{:tool} (map :role (:messages final))))
+      (is (= "panel created" (:reply final))))))
+
+(deftest chat-agent-builds-storyboard
+  (testing "the agent can operate the app: an add_panel action appends a panel to a stored doc"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "sbx" :page {:page/number 1 :page/panels []}})
+          add-panel (docs/handler (docs/make-add-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "added a wide shot of Nei")
+                     (msg/ai "" {:tool-calls [{:id "a1" :name "add_panel"
+                                               :input {:doc_id "sbx" :shot "wide" :focal ["Nei"]}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:add-panel add-panel}})
+          final ((chat/handler agent) {:message "add a wide shot of Nei"} "t-add")
+          panels (:page/panels (:page (store/load-document store "sbx")))]
+      (is (some #{:tool} (map :role (:messages final))) "the add_panel action ran")
+      (is (= 1 (count panels)) "a panel was appended to the storyboard")
+      (is (= "wide" (:panel/shot (first panels))))
+      (is (= [":character/Nei"] (:panel/focal (first panels))) "focal name normalized to a ref")
+      (is (= "added a wide shot of Nei" (:reply final)))))
+  (testing "add_panel canonicalizes a focal name to the existing cast's ref (no casing fragmentation)"
+    (let [store (store/mem-store)
+          ;; an existing panel already references the canonical :character/Nei
+          _ (store/save-document! store {:id "sc" :page {:page/number 1 :page/panels
+                                                         [{:panel/index 0 :panel/focal [":character/Nei"]}]}})
+          add-panel (docs/handler (docs/make-add-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "done")
+                     ;; the model supplies a lowercase "nei" — must not fragment the cast
+                     (msg/ai "" {:tool-calls [{:id "a2" :name "add_panel"
+                                               :input {:doc_id "sc" :focal ["nei"]}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:add-panel add-panel}})
+          _ ((chat/handler agent) {:message "add a panel with nei"} "t-canon")
+          panels (:page/panels (:page (store/load-document store "sc")))]
+      (is (= 2 (count panels)))
+      (is (= [":character/Nei"] (:panel/focal (second panels)))
+          "lowercase \"nei\" canonicalized to the stored :character/Nei, not :character/nei")
+      ;; the whole document is still one coherent character, queryable as one
+      (is (= ["sc"] (store/documents-with-character store ":character/Nei")))))
+  (testing "add_panel can set a panel's background scene (agent is scene-aware)"
+    (let [store (store/mem-store)
+          _ (store/save-scene! store {:id "scene-rooftop" :name "Rooftop"})
+          _ (store/save-document! store {:id "sd" :page {:page/number 1 :page/panels []}})
+          add-panel (docs/handler (docs/make-add-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "done")
+                     (msg/ai "" {:tool-calls [{:id "a3" :name "add_panel"
+                                               :input {:doc_id "sd" :shot "wide" :scene "scene-rooftop"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:add-panel add-panel}})
+          _ ((chat/handler agent) {:message "add a wide panel set on the rooftop"} "t-scene")
+          panel (first (:page/panels (:page (store/load-document store "sd"))))]
+      (is (= "scene-rooftop" (:panel/scene panel)) "the scene was set on the panel")
+      ;; and it's queryable — the panel's document is found by scene
+      (is (= ["sd"] (store/documents-with-scene store "scene-rooftop")))))
+  (testing "add_panel can write dialogue (a speech bubble) onto the panel"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "se" :page {:page/number 1 :page/panels []}})
+          add-panel (docs/handler (docs/make-add-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "done")
+                     (msg/ai "" {:tool-calls [{:id "a4" :name "add_panel"
+                                               :input {:doc_id "se" :focal ["Nei"] :dialogue "起動する"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:add-panel add-panel}})
+          _ ((chat/handler agent) {:message "add a panel where Nei says 起動する"} "t-dlg")
+          panel (first (:page/panels (:page (store/load-document store "se"))))]
+      (is (= "起動する" (-> panel :panel/bubbles first :bubble/text))
+          "the dialogue round-trips as a reconstructed speech bubble"))))
+
+(deftest chat-agent-can-revise
+  (testing "the agent can revise a panel it built: update_panel merges a patch in place"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "sf" :page {:page/number 1 :page/panels
+                                                        [{:panel/index 0 :panel/shot "wide"
+                                                          :panel/focal [":character/Nei"]}]}})
+          update-panel (docs/handler (docs/make-update-panel store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "tightened the shot")
+                     (msg/ai "" {:tool-calls [{:id "u1" :name "update_panel"
+                                               :input {:doc_id "sf" :panel_index 0 :shot "close-up"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:update-panel update-panel}})
+          _ ((chat/handler agent) {:message "make panel 0 a close-up"} "t-rev")
+          panel (first (:page/panels (:page (store/load-document store "sf"))))]
+      (is (= "close-up" (:panel/shot panel)) "the shot was changed")
+      (is (= [":character/Nei"] (:panel/focal panel)) "the merge preserved the existing focal"))))
+
+(deftest seeded-sample-document-lints-clean
+  (testing "the out-of-box demo seed is well-formed — it passes lint with no issues"
+    ;; the seed is what every user sees first; a missing rect / out-of-bounds rect
+    ;; / focal ref to an absent character would be an immediate embarrassment.
+    (let [store (store/mem-store)
+          r (reg/build store (rt/scratch-conn))
+          h (fn [nsid] (get-in r [nsid :handler]))]
+      ;; provide the cast + scenes the sample page references
+      ((h "ai.gftd.mangaka.importGhosthacker")
+       {:asset-graph {:characters {:Yuto  {:id "yuto"  :name "Yuto"}
+                                   :Nei   {:id "nei"   :name "Nei"}
+                                   :Ren   {:id "ren"   :name "Ren"}
+                                   :Akira {:id "akira" :name "Akira"}}
+                      :scenes {:YB {:id "yuto-bedroom" :name "Yuto's bedroom"}
+                               :NR {:id "neis-room"    :name "Nei's room"}
+                               :RR {:id "rens-room"    :name "Ren's room"}
+                               :CL {:id "classroom"    :name "Classroom"}}}} nil)
+      ((h "ai.gftd.mangaka.saveDocument") seed/sample-document nil)
+      (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id (:id seed/sample-document)} nil)]
+        (is (true? (:ok res)) (str "seed should lint clean; issues: " (:issues res)))
+        (is (= 0 (:count res))))
+      ;; the seed now exercises scene linkage too (queryable, shown in preview)
+      (is (contains? (set (store/documents-with-scene store "scene-rens-room")) (:id seed/sample-document))
+          "a seed panel is set in scene-rens-room"))))
+
+(deftest seed-references-match-the-bundled-asset-graph
+  (testing "the seed's character/scene refs resolve against the ACTUAL bundled import — no divergence"
+    ;; the inline lints-clean test hand-matches the import; this one imports the
+    ;; real shipped asset_graph, so a renamed/removed bundled scene or character
+    ;; that the seed still references is caught (the production seed would break).
+    (when (.exists (java.io.File. "../data/ghosthacker/resources/asset_graph.json"))
+      (let [store (store/mem-store)
+            r (reg/build store (rt/scratch-conn))
+            h (fn [nsid] (get-in r [nsid :handler]))]
+        ((h "ai.gftd.mangaka.importGhosthacker") {} nil)              ; bundled cast + scenes
+        ((h "ai.gftd.mangaka.saveDocument") seed/sample-document nil)
+        (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id (:id seed/sample-document)} nil)]
+          (is (true? (:ok res))
+              (str "seed refs must match the bundled import; issues: " (:issues res))))))))
+
+(deftest system-prompt-mentions-every-tool
+  (testing "the agent's guidance names every tool it can use — guards prompt drift"
+    ;; would have caught generate_character/generate_scene being added without a
+    ;; prompt update; keeps the system prompt in step with the toolset.
+    (let [f (fn [_ _] {})
+          all-actions {:create-document f :duplicate-document f :generate-character f
+                       :generate-scene f :generate-panel f :add-panel f :update-panel f
+                       :remove-panel f :reorder-panels f :lint f}
+          tool-names (map :name (#'chat/tools (store/mem-store) all-actions))]
+      (doseq [n tool-names]
+        (is (str/includes? chat/system-prompt n)
+            (str "system prompt should mention the " n " tool"))))))
+
+(deftest chat-tools-reflect-available-actions
+  (testing "read tools are always present; each wired action adds exactly its tool"
+    ;; the agent assembles 11 tools via cond-> on the actions map — guard that
+    ;; wiring directly so a dropped/mis-gated tool fails the build.
+    (let [store (store/mem-store)
+          names (fn [actions] (set (map :name (#'chat/tools store actions))))
+          read-only #{"stats" "list_documents" "cast" "list_scenes"
+                      "find_documents_by_character" "find_documents_by_scene"
+                      "get_document" "get_page_render"}]
+      (is (= read-only (names {})) "with no actions, only the read tools exist")
+      (let [f (fn [_ _] {})]
+        (is (= (into read-only ["generate_panel"]) (names {:generate-panel f}))
+            "an action adds exactly its tool, nothing else")
+        (is (= (into read-only ["create_document" "duplicate_document" "generate_character"
+                                "generate_scene" "generate_panel" "generate_page" "add_panel"
+                                "update_panel" "remove_panel" "reorder_panels" "lint_document"
+                                "vision_score"])
+               (names {:create-document f :duplicate-document f :generate-character f :generate-scene f
+                       :generate-panel f :generate-page f :add-panel f :update-panel f :remove-panel f
+                       :reorder-panels f :lint f :vision-score f}))
+            "the full action set yields all 20 tools (8 read + 12 actions)")))))
+
+(deftest chat-agent-can-render-the-page
+  (testing "the agent can render the final composed page (generate_page) — the end of the loop"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "fin" :page {:page/number 1 :page/title "Finale"
+                                                          :page/panels [{:panel/index 0 :panel/shot "wide"
+                                                                         :panel/rect [0 0 1 1]}]}})
+          rendered (atom nil)
+          page-action (fn [input _] (reset! rendered (:doc-id input))
+                        ((page/handler (page/make store nil)) input nil))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "rendered the page")
+                     (msg/ai "" {:tool-calls [{:id "g1" :name "generate_page" :input {:doc_id "fin"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:generate-page page-action}})
+          _ ((chat/handler agent) {:message "render the finished page"} "t-page")]
+      (is (= "fin" @rendered) "the page-render action was invoked for the document")
+      (is (some? (store/load-page-render store "page-fin")) "a page render was persisted"))))
+
+(deftest chat-agent-can-design-cast-and-scenes
+  (testing "the agent can create the building blocks it references: generate_character / generate_scene"
+    (let [store (store/mem-store)
+          actions {:generate-character (character/handler (character/make store nil))
+                   :generate-scene (scene/handler (scene/make store nil))}
+          run! (fn [tool-call]
+                 (let [model (model/mock-model
+                              (fn [messages _]
+                                (if (some #(= :tool (:role %)) messages)
+                                  (msg/ai "done")
+                                  (msg/ai "" {:tool-calls [tool-call]}))))]
+                   ((chat/handler (chat/make store (rt/scratch-conn) {:model model :actions actions}))
+                    {:message "design"} nil)))]
+      (run! {:id "c1" :name "generate_character" :input {:name "Rei" :tags ["1girl"]}})
+      (is (= "Rei" (:character/name (store/load-character store "char-rei"))) "character registered")
+      (run! {:id "s1" :name "generate_scene" :input {:prompt "moonlit shrine"}})
+      (is (some #(= "moonlit shrine" (:scene/prompt (store/load-scene store (:id %))))
+                (store/list-scenes store))
+          "scene registered"))))
+
+(deftest chat-agent-can-duplicate-document
+  (testing "the agent can clone a page's layout for the next page (duplicate_document)"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "pg1" :page {:page/number 1 :page/panels
+                                                        [{:panel/index 0 :panel/shot "wide"}]}})
+          dup (docs/handler (docs/make-duplicate store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "made page 2 from page 1")
+                     (msg/ai "" {:tool-calls [{:id "d1" :name "duplicate_document"
+                                               :input {:doc_id "pg1" :new_id "pg2" :page_number 2}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:duplicate-document dup}})
+          _ ((chat/handler agent) {:message "make page 2 like page 1"} "t-dup")
+          clone (store/load-document store "pg2")]
+      (is (some? clone) "the clone was created")
+      (is (= 2 (:page-number clone)) "renumbered")
+      (is (= "wide" (-> clone :page :page/panels first :panel/shot)) "layout copied"))))
+
+(deftest chat-agent-can-retrieve-page-render
+  (testing "get_page_render lets the agent fetch a document's composed page image"
+    (let [store (store/mem-store)
+          _ (store/save-page-render! store {:id "page-ch" :doc-id "ch" :image-key "sha256-zzz"})
+          seen (atom nil)
+          model (model/mock-model
+                 (fn [messages _]
+                   (if-let [tm (some #(when (= :tool (:role %)) %) messages)]
+                     (do (reset! seen (:content tm)) (msg/ai "here is the page"))
+                     (msg/ai "" {:tool-calls [{:id "p1" :name "get_page_render" :input {:doc_id "ch"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model})
+          _ ((chat/handler agent) {:message "show the rendered page of ch"} "t-pr")]
+      (is (string? @seen))
+      (is (str/includes? @seen "/blob/sha256-zzz") "the tool returned the page render's image url"))))
+
+(deftest chat-agent-can-inspect-document
+  (testing "get_document lets the agent see a document's panels before editing"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "insp" :page {:page/number 1 :page/panels
+                                                         [{:panel/index 0 :panel/shot "wide"
+                                                           :panel/focal [":character/Nei"]
+                                                           :panel/bubbles [{:bubble/text "起動"}]}]}})
+          seen (atom nil)
+          model (model/mock-model
+                 (fn [messages _]
+                   (if-let [tm (some #(when (= :tool (:role %)) %) messages)]
+                     (do (reset! seen (:content tm)) (msg/ai "panel 0 is a wide shot of Nei saying 起動"))
+                     (msg/ai "" {:tool-calls [{:id "g1" :name "get_document" :input {:doc_id "insp"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model})
+          _ ((chat/handler agent) {:message "what's in document insp?"} "t-insp")]
+      ;; the tool returned the panel structure the model can ground edits on
+      (is (string? @seen))
+      (is (str/includes? @seen "wide") "shot is shown")
+      (is (str/includes? @seen "Nei") "focal is shown")
+      (is (str/includes? @seen "起動") "dialogue is shown"))))
+
+(deftest chat-agent-can-create-document
+  (testing "the agent can start a new storyboard from scratch (create_document)"
+    (let [store (store/mem-store)
+          save (docs/handler (docs/make-save store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "created the page")
+                     (msg/ai "" {:tool-calls [{:id "c1" :name "create_document"
+                                               :input {:title "Chapter 1"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:create-document save}})
+          _ ((chat/handler agent) {:message "start a new page called Chapter 1"} "t-new")]
+      ;; the id is derived from the title via domain/slug
+      (is (some? (store/load-document store "doc-chapter-1")) "an empty doc was created")
+      (is (= "Chapter 1" (:title (store/load-document store "doc-chapter-1"))))
+      (is (= [] (:page/panels (:page (store/load-document store "doc-chapter-1"))))))))
+
+(deftest chat-agent-can-remove-and-reorder
+  (testing "the agent's editing toolkit: remove_panel and reorder_panels operate the storyboard"
+    (let [store (store/mem-store)
+          _ (store/save-document! store {:id "sg" :page {:page/number 1 :page/panels
+                                                        [{:panel/index 0 :panel/shot "a"}
+                                                         {:panel/index 1 :panel/shot "b"}
+                                                         {:panel/index 2 :panel/shot "c"}]}})
+          actions {:remove-panel (docs/handler (docs/make-remove-panel store))
+                   :reorder-panels (docs/handler (docs/make-reorder-panels store))}
+          run! (fn [tool-call]
+                 (let [model (model/mock-model
+                              (fn [messages _]
+                                (if (some #(= :tool (:role %)) messages)
+                                  (msg/ai "done")
+                                  (msg/ai "" {:tool-calls [tool-call]}))))]
+                   ((chat/handler (chat/make store (rt/scratch-conn) {:model model :actions actions}))
+                    {:message "edit"} nil)))]
+      ;; remove the middle panel → [a c], reindexed 0,1
+      (run! {:id "r1" :name "remove_panel" :input {:doc_id "sg" :panel_index 1}})
+      (is (= ["a" "c"] (mapv :panel/shot (:page/panels (:page (store/load-document store "sg"))))))
+      ;; reorder [a c] → [c a]
+      (run! {:id "r2" :name "reorder_panels" :input {:doc_id "sg" :order [1 0]}})
+      (let [panels (:page/panels (:page (store/load-document store "sg")))]
+        (is (= ["c" "a"] (mapv :panel/shot panels)) "panels reordered via chat")
+        (is (= [0 1] (mapv :panel/index panels)) "reindexed contiguously")))))
+
+(deftest chat-agent-can-vision-score
+  (testing "the agent can visually QA a rendered panel (vision_score; stub offline)"
+    (let [store (store/mem-store)
+          _ (store/save-panel! store {:id "panel-z" :doc-id "z" :index 0 :prompt "neon city"
+                                      :image-b64 "QUJD" :image-mime "image/png"})
+          vision (vision/handler (vision/make store nil))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if (some #(= :tool (:role %)) messages)
+                     (msg/ai "scored it")
+                     (msg/ai "" {:tool-calls [{:id "v1" :name "vision_score" :input {:panel_id "panel-z"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:vision-score vision}})
+          final ((chat/handler agent) {:message "score panel-z"} "t-vis")]
+      (is (some #{:tool} (map :role (:messages final))) "the vision_score tool ran")
+      ;; the critique is persisted on the panel as datoms (offline → a stub critique)
+      (is (some? (:panel/critique (store/load-panel store "panel-z"))) "a critique was stored on the panel"))))
+
+(deftest chat-agent-can-lint
+  (testing "the agent can QA its work: a lint_document tool surfaces structural issues"
+    (let [store (store/mem-store)
+          ;; a panel with no rect → lint flags :missing-rect
+          _ (store/save-document! store {:id "qa" :page {:page/number 1 :page/panels
+                                                        [{:panel/index 0 :panel/shot "wide"}]}})
+          lint (lint/handler (lint/make store))
+          model (model/mock-model
+                 (fn [messages _]
+                   (if-let [tm (some #(when (= :tool (:role %)) %) messages)]
+                     (msg/ai (if (str/includes? (str (:content tm)) "missing-rect")
+                               "panel 0 is missing a rect" "looks fine"))
+                     (msg/ai "" {:tool-calls [{:id "l1" :name "lint_document"
+                                               :input {:doc_id "qa"}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model :actions {:lint lint}})
+          final ((chat/handler agent) {:message "is document qa ok?"} "t-lint")]
+      (is (some #{:tool} (map :role (:messages final))) "the lint tool ran")
+      (is (= "panel 0 is missing a rect" (:reply final))
+          "the lint issues (incl. :missing-rect) reached the model"))))
+
+(deftest chat-agent-grounds-on-cast
+  (testing "the agent calls the `cast` tool and the relationship graph reaches the tool message"
+    (let [store (store/mem-store)
+          ;; importGhosthacker-style seed: a character whose enrichment carries relationships
+          _ (store/save-character! store {:id "char-nei" :name "Nei"
+                                          :enrichment (pr-str {:relationships {:Ren "best friend"}})})
+          _ (store/save-character! store {:id "char-ren" :name "Ren"})
+          model (model/mock-model
+                 (fn [messages _]
+                   (if-let [tm (some #(when (= :tool (:role %)) %) messages)]
+                     (msg/ai (if (str/includes? (str (:content tm)) "best friend")
+                               "Nei and Ren are best friends" "no relationships"))
+                     (msg/ai "" {:tool-calls [{:id "c1" :name "cast" :input {}}]}))))
+          agent (chat/make store (rt/scratch-conn) {:model model})
+          final ((chat/handler agent) {:message "who is in the story?"} "t-cast")]
+      (is (some #{:tool} (map :role (:messages final))) "the cast tool ran")
+      (is (= "Nei and Ren are best friends" (:reply final))
+          "the cast graph (with the Nei→Ren edge) was fed back to the model"))))
+
+(deftest complete-json-parsing
+  (testing "parses a JSON object reply"
+    (is (= {:role "hero" :age 14}
+           (llm/complete-json "sys" "u" (mock-saying "{\"role\":\"hero\",\"age\":14}")))))
+  (testing "parses a fenced JSON reply"
+    (is (= {:role "villain"}
+           (llm/complete-json "sys" "u" (mock-saying "```json\n{\"role\":\"villain\"}\n```")))))
+  (testing "falls back to EDN, and returns nil for non-map replies"
+    (is (= {:k 1} (llm/complete-json "sys" "u" (mock-saying "{:k 1}"))))
+    (is (nil? (llm/complete-json "sys" "u" (mock-saying "just prose, no object")))))
+  (testing "a real reply containing an :llm key still parses to a non-nil map"
+    ;; the enrich/vision graphs now decide :llm-applied from (some? result),
+    ;; not from the absence of an :llm key — this reply would have misfired
+    ;; under the old heuristic.
+    (let [m (llm/complete-json "sys" "u" (mock-saying "{\"llm\":\"claude\",\"role\":\"hero\"}"))]
+      (is (some? m))
+      (is (contains? m :llm)))))
+
+(def sample-page
+  {:page/number 1 :page/title "Arc01"
+   :page/panels [{:panel/index 0 :panel/shot "wide" :panel/rect [0.05 0.05 0.9 0.4]
+                  :panel/focal [":character/Nei"] :panel/tags ["neon"]
+                  :panel/bubbles [{:bubble/text "起動" :bubble/shape "speech"}]}]})
+
+(deftest store-roundtrip
+  (testing "save → list → load round-trips a storyboard document"
+    (let [st (store/mem-store)]
+      (store/save-document! st {:id "d1" :title "Arc01" :page sample-page})
+      (is (= [{:id "d1" :title "Arc01" :page-number 1}] (store/list-documents st)))
+      (let [doc (store/load-document st "d1")]
+        (is (= sample-page (:page doc)))
+        (is (= 1 (get-in (domain/export-lexicon (:page doc)) [:pageNumber]))))))
+  (testing "a rich storyboard (sfx, multiple bubbles, multi-focal) round-trips deterministically"
+    (let [st (store/mem-store)
+          page {:page/number 7 :page/title "Climax" :page/layout "splash"
+                :page/base-tags ["monochrome" "screentone"] :page/negative-tags ["color"]
+                :page/panels
+                [{:panel/index 0 :panel/shot "wide" :panel/tone "tense" :panel/rect [0.0 0.0 1.0 0.6]
+                  :panel/focal [":character/Ace" ":character/Nami" ":character/Zoro"]  ; sorted
+                  :panel/tags ["action" "rain"]
+                  :panel/bubbles [{:bubble/text "逃げろ！" :bubble/shape "spike"}
+                                  {:bubble/text "…" :bubble/shape "thought" :bubble/anchor "tr"}]
+                  :panel/sfx [{:sfx/text "ドォン" :sfx/pos [0.5 0.5] :sfx/scale 2.0}]}
+                 {:panel/index 1 :panel/shot "close" :panel/focal [":character/Ace"]}]}]
+      (store/save-document! st {:id "rich" :page page})
+      (is (= page (:page (store/load-document st "rich"))) "exact round-trip")
+      (is (= (:page (store/load-document st "rich"))
+             (:page (store/load-document st "rich"))) "deterministic")
+      ;; unsorted focal input is normalized to sorted on load
+      (store/save-document! st {:id "u" :page {:page/number 1
+                                               :page/panels [{:panel/index 0
+                                                              :panel/focal [":character/Z" ":character/A"]}]}})
+      (is (= [":character/A" ":character/Z"]
+             (get-in (:page (store/load-document st "u")) [:page/panels 0 :panel/focal])))))
+  (testing "storyboard is decomposed into datoms — queryable by character"
+    (let [st (store/mem-store)]
+      (store/save-document! st {:id "d1" :page sample-page})  ; focal :character/Nei
+      (store/save-document! st {:id "d2" :page {:page/number 2 :page/panels
+                                               [{:panel/index 0 :panel/focal [":character/Ren"]}]}})
+      (is (= ["d1"] (store/documents-with-character st ":character/Nei")))
+      (is (= ["d2"] (store/documents-with-character st ":character/Ren")))
+      (is (= [] (store/documents-with-character st ":character/Ghost")))))
+  (testing "re-saving a document atomically replaces its whole entity graph"
+    (let [st (store/mem-store)
+          ;; count every storyboard entity (doc + panels + bubbles/sfx) for the id
+          stb-count #(count (store/-q st [:find '[?e ...] :where ['?e :stb/doc "d1"]]))]
+      (store/save-document! st {:id "d1" :page sample-page})  ; 1 doc + 1 panel + 1 bubble = 3
+      (is (= 3 (stb-count)))
+      (store/save-document! st {:id "d1" :page {:page/number 1 :page/panels []}})
+      (is (= 1 (stb-count)) "old panel + bubble retracted, only the doc remains")
+      (is (= [] (:page/panels (:page (store/load-document st "d1")))))
+      (is (= [] (store/documents-with-character st ":character/Nei")))))
+  (testing "delete-document! hard-deletes the whole component graph (idempotent)"
+    (let [st (store/mem-store)
+          stb-count #(count (store/-q st [:find '[?e ...] :where ['?e :stb/doc "d1"]]))]
+      (store/save-document! st {:id "d1" :page sample-page})  ; doc + panel + bubble = 3
+      (store/save-document! st {:id "keep" :page {:page/number 9 :page/panels []}})
+      (is (= 3 (stb-count)))
+      (is (= {:id "d1" :deleted true :renders-removed 0} (store/delete-document! st "d1")))
+      (is (= 0 (stb-count)) "doc + panels + bubbles all retracted, no orphans")
+      (is (nil? (store/load-document st "d1")))
+      (is (= [] (store/documents-with-character st ":character/Nei")) "no longer queryable")
+      (is (some #{"keep"} (map :id (store/list-documents st))) "other documents untouched")
+      ;; idempotent: deleting an absent doc is not an error
+      (is (= {:id "d1" :deleted false :renders-removed 0} (store/delete-document! st "d1")))))
+  (testing "deleting a document also cleans up its render outputs — panels AND page render (no orphans)"
+    (let [st (store/mem-store)]
+      (store/save-document! st {:id "rd" :page {:page/number 1 :page/panels [{:panel/index 0 :panel/rect [0 0 1 1]}]}})
+      (store/save-panel! st {:id "panel-rd-0" :doc-id "rd" :index 0 :prompt "x" :image-b64 "QUJD"})
+      (store/save-page-render! st {:id "page-rd" :doc-id "rd" :image-b64 "QUJD"})
+      (is (= 1 (count (store/renders-for-document st "rd"))) "a panel render exists")
+      (is (some? (store/load-page-render st "page-rd")) "a page render exists")
+      (let [r (store/delete-document! st "rd")]
+        (is (true? (:deleted r)))
+        (is (= 2 (:renders-removed r)) "both the panel render and the page render were removed"))
+      (is (= [] (store/renders-for-document st "rd")) "no orphaned panel renders remain")
+      (is (nil? (store/load-panel st "panel-rd-0")))
+      (is (nil? (store/load-page-render st "page-rd")) "no orphaned page render remains"))))
+
+(deftest panel-index-coerced-from-string
+  (testing "a JSON string :panel/index is coerced to an integer (loadDocument sort can't throw)"
+    ;; mixing a string index with addPanel's integer indices would throw in the
+    ;; reconstruction sort (sort-by :panel/index over String + Long).
+    (let [st (store/mem-store)]
+      (store/save-document! st {:id "pix" :page {:page/number 1 :page/panels
+                                                 [{:panel/index "2" :panel/shot "c"}    ; JSON strings,
+                                                  {:panel/index "0" :panel/shot "a"}    ; out of order
+                                                  {:panel/index "1" :panel/shot "b"}]}})
+      (let [panels (:page/panels (:page (store/load-document st "pix")))]   ; must not throw
+        (is (every? integer? (map :panel/index panels)) "indices coerced to integers")
+        (is (= [0 1 2] (mapv :panel/index panels)) "sorted numerically, not lexicographically")
+        (is (= ["a" "b" "c"] (mapv :panel/shot panels)) "panels ordered by the coerced index")))))
+
+(deftest page-render-blob-image-is-retrievable
+  (testing "a blob-offloaded page render's image is reachable (load-page-render pulls :image-key)"
+    ;; generate_page stores :page-render/image-key when a blob store is wired;
+    ;; load-page-render must pull it or the rendered page image is lost.
+    (let [store (store/mem-store)]
+      (store/save-page-render! store {:id "page-x" :doc-id "x"
+                                      :image-key "sha256-abc" :image-mime "image/png"})
+      (let [pr (store/load-page-render store "page-x")]
+        (is (= "sha256-abc" (:page-render/image-key pr)) "the blob key is pulled")
+        (is (= "/blob/sha256-abc" (:image-url (domain/with-image-url pr)))
+            "→ a directly-fetchable image-url")))))
+
+(deftest list-documents-tolerates-non-numeric-page-number
+  (testing "a string page-number (from a JSON save/duplicate) doesn't break the listDocuments sort"
+    ;; mixed String/Long page-numbers would throw in (sort-by :page-number);
+    ;; the coercion keeps listDocuments (a core UI endpoint) from 500ing.
+    (let [st (store/mem-store)]
+      (store/save-document! st {:id "a" :page {:page/number 3 :page/panels []}})
+      (store/save-document! st {:id "b" :page {:page/number "1" :page/panels []}})  ; JSON string
+      (store/save-document! st {:id "c" :page {:page/number 2 :page/panels []}})
+      (let [docs (store/list-documents st)]                                          ; must not throw
+        (is (= 3 (count docs)))
+        ;; ordered by the coerced number: "1" < 2 < 3
+        (is (= ["b" "c" "a"] (mapv :id docs)))))))
+
+(deftest export-lexicon-derived-view
+  (testing "the ai.gftd.mangaka.storyboard wire view derives from the reconstructed page"
+    ;; export-lexicon is the AT-Proto-style federation surface (returned by
+    ;; loadDocument as :lexicon). It transforms internal datom shape → wire:
+    ;; namespaced keys → camelCase, :character/X focal refs → bare names,
+    ;; bubble/sfx sub-entities inlined. Guard those transforms end-to-end.
+    (let [st (store/mem-store)
+          page {:page/number 7 :page/title "Climax" :page/layout "splash"
+                :page/base-tags ["monochrome"] :page/negative-tags ["color"]
+                :page/panels
+                [{:panel/index 0 :panel/shot "wide" :panel/tone "tense"
+                  :panel/rect [0.0 0.0 1.0 0.6]
+                  :panel/focal [":character/Ace" ":character/Nami"]
+                  :panel/tags ["action"]
+                  :panel/bubbles [{:bubble/text "逃げろ！" :bubble/shape "spike"
+                                   :bubble/font-size 18}]
+                  :panel/sfx [{:sfx/text "ドォン" :sfx/pos [0.5 0.5] :sfx/scale 2.0}]}]}
+          _   (store/save-document! st {:id "lex" :page page})
+          lex (domain/export-lexicon (:page (store/load-document st "lex")))]
+      (is (= "ai.gftd.mangaka.storyboard" (:$type lex)) "lexicon $type")
+      (is (= 7 (:pageNumber lex)))
+      (is (= "Climax" (:pageTitle lex)))
+      (is (= ["monochrome"] (:baseTags lex)))
+      (is (= ["color"] (:negativeTags lex)))
+      (let [p (first (:panels lex))]
+        (is (= ["Ace" "Nami"] (:focal p)) ":character/X refs → bare names")
+        (is (= "wide" (:shot p)))
+        (is (= ["action"] (:tags p)))
+        (let [b (first (:bubbles p))]
+          (is (= "逃げろ！" (:text b)))
+          (is (= 18 (:fontSize b)) "bubble/font-size → camelCase fontSize"))
+        (is (= "ドォン" (:text (first (:sfx p))))))))
+  (testing "loadDocument attaches the derived :lexicon to its result"
+    (let [st (store/mem-store)
+          r  (reg/build st (rt/scratch-conn))
+          h  (fn [nsid] (get-in r [nsid :handler]))]
+      ((h "ai.gftd.mangaka.saveDocument") {:id "ld" :page sample-page} nil)
+      (let [res ((h "ai.gftd.mangaka.loadDocument") {:id "ld"} nil)]
+        (is (= "ai.gftd.mangaka.storyboard" (get-in res [:lexicon :$type])))
+        (is (= ["Nei"] (-> res :lexicon :panels first :focal)) "wire view reflects the stored cast")))))
+
+(deftest preview-svg-escapes-user-text
+  (testing "user-controlled storyboard text is XML-escaped in the served SVG"
+    ;; page->svg output is served as image/svg+xml to browsers; an unescaped
+    ;; & or < in a title / bubble would break the SVG (and is an injection
+    ;; surface). Guard the escaping so a refactor can't silently drop it.
+    (let [svg (preview/page->svg
+               {:page/number 1 :page/title "Tom & Jerry <vol.1>"
+                :page/panels [{:panel/index 0 :panel/rect [0.1 0.1 0.8 0.3]
+                               :panel/shot "wide & low" :panel/scene "scene-rooftop"
+                               :panel/bubbles [{:bubble/text "a < b & c"}]}]})]
+      (is (str/starts-with? svg "<svg"))
+      (is (str/includes? svg "Tom &amp; Jerry &lt;vol.1&gt;") "title escaped")
+      (is (str/includes? svg "wide &amp; low") "shot escaped")
+      (is (str/includes? svg "@scene-rooftop") "the panel's linked scene is shown")
+      (is (str/includes? svg "a &lt; b &amp; c") "bubble text escaped")
+      ;; the raw, unescaped forms must not leak through as markup
+      (is (not (str/includes? svg "Tom & Jerry")) "raw ampersand not present")
+      (is (not (str/includes? svg "<vol.1>")) "raw angle brackets not present"))))
+
+(deftest comfy-render-stub
+  (testing "panel workflow runs through the engine and yields an image"
+    (let [r (comfy/render-panel (rt/scratch-conn) {:prompt "neon city" :seed 1})]
+      (is (string? (:image-b64 r)))
+      (is (= "stub" (:source r)))            ; no gateway configured in tests
+      (is (some? (:run-id r))))))
+
+(deftest manifest-matches-registry
+  (testing "langgraph.edn (the doc manifest) lists exactly the registry's NSIDs"
+    ;; guards against doc drift: adding a graph to the registry but forgetting
+    ;; the manifest (or vice-versa) now fails the build instead of silently
+    ;; shipping a stale catalog.
+    (let [manifest (-> (slurp "langgraph.edn") edn/read-string :graphs keys set)
+          live     (set (reg/nsids (reg/build (store/mem-store) (rt/scratch-conn))))]
+      (is (= live manifest)
+          (str "manifest/registry mismatch"
+               "\n  only in registry: " (sort (set/difference live manifest))
+               "\n  only in manifest: " (sort (set/difference manifest live)))))))
+
+(deftest registry-handlers
+  (let [store (store/mem-store)
+        r (reg/build store (rt/scratch-conn))
+        h (fn [nsid] (get-in r [nsid :handler]))]
+
+    (testing "health"
+      (is (= "ok" (:status ((h "ai.gftd.mangaka.health") {} nil)))))
+
+    (testing "document CRUD via graphs"
+      (is (:ok ((h "ai.gftd.mangaka.saveDocument")
+                {:id "d2" :title "P2" :page sample-page} nil)))
+      (is (= 1 (count (:documents ((h "ai.gftd.mangaka.listDocuments") {} nil)))))
+      (is (= sample-page (:page ((h "ai.gftd.mangaka.loadDocument") {:id "d2"} nil)))))
+
+    (testing "duplicateDocument clones a page's layout under a new id (with optional renumber)"
+      ((h "ai.gftd.mangaka.saveDocument") {:id "p1" :page sample-page} nil)  ; page/number 1, focal Nei
+      (let [res ((h "ai.gftd.mangaka.duplicateDocument") {:id "p1" :new-id "p2" :page-number 2} nil)]
+        (is (= {:id "p1" :new-id "p2" :ok true} res))
+        (let [orig (:page (store/load-document store "p1"))
+              clone (:page (store/load-document store "p2"))]
+          (is (= 1 (:page/number orig)) "source untouched")
+          (is (= 2 (:page/number clone)) "clone renumbered")
+          (is (= (:page/panels orig) (:page/panels clone)) "panels copied faithfully"))
+        ;; the clone is an independent datom graph (queryable by character)
+        (let [with-nei (set (store/documents-with-character store ":character/Nei"))]
+          (is (contains? with-nei "p1"))
+          (is (contains? with-nei "p2") "the clone's panels are independently queryable")))
+      ;; default new-id is <id>-copy
+      (is (= "p1-copy" (:new-id ((h "ai.gftd.mangaka.duplicateDocument") {:id "p1"} nil))))
+      ;; won't overwrite an existing target, and a missing source → 400
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.duplicateDocument") {:id "p1" :new-id "p2"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.duplicateDocument") {:id "ghost" :new-id "x"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "deleteDocument removes a document (idempotent; missing input → 400)"
+      ((h "ai.gftd.mangaka.saveDocument") {:id "todelete" :page {:page/number 1 :page/panels []}} nil)
+      (is (some? (store/load-document store "todelete")))
+      (is (= {:id "todelete" :deleted true :renders-removed 0} ((h "ai.gftd.mangaka.deleteDocument") {:id "todelete"} nil)))
+      (is (nil? (store/load-document store "todelete")) "load returns nil after delete")
+      (is (= {:id "todelete" :deleted false :renders-removed 0} ((h "ai.gftd.mangaka.deleteDocument") {:id "todelete"} nil))
+          "re-deleting is idempotent")
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.deleteDocument") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "generate_panel renders + persists a panel"
+      (let [res ((h "ai.gftd.mangaka.mangakaGeneratePanel")
+                 {:prompt "ghost hacker" :tags ["1girl"] :seed 7 :doc-id "d2"} nil)]
+        (is (string? (:panel-id res)))
+        (is (string? (:image-b64 res)))
+        (is (= sample-page (:page (store/load-document store "d2"))) "doc untouched")
+        (is (some? (store/-pull store '[:panel/id] [:panel/id (:panel-id res)])))))
+
+    (testing "chat returns an assistant reply (mock without API key)"
+      (let [res ((h "ai.gftd.mangaka.chat") {:message "hi"} "t-test")]
+        (is (string? (:reply res)))
+        (is (= :assistant (-> res :messages last :role)))))
+
+    (testing "thread-less chats are isolated; a shared thread-id continues the conversation"
+      (let [chat (h "ai.gftd.mangaka.chat")]
+        ;; no thread-id → each turn is stateless: exactly its own 2 messages,
+        ;; no bleed from prior thread-less calls (the old shared-\"default\" bug)
+        (chat {:message "alpha"} nil)
+        (is (= 2 (count (:messages (chat {:message "beta"} nil)))))
+        ;; same thread-id → history accumulates across turns
+        (chat {:message "one"} "conv-1")
+        (is (= 4 (count (:messages (chat {:message "two"} "conv-1")))))
+        ;; a different thread is unaffected by conv-1
+        (is (= 2 (count (:messages (chat {:message "solo"} "conv-2")))))))
+
+    (testing "malformed input is rejected with :bad-input (400), not a 500"
+      (doseq [[nsid input] [["ai.gftd.mangaka.saveDocument" {:id "bad1" :page 5}]
+                            ["ai.gftd.mangaka.saveDocument" {:id "bad2" :page {:page/panels 5}}]
+                            ["ai.gftd.mangaka.saveDocument" {:id "bad3" :page {:page/panels ["not-a-map"]}}]
+                            ;; malformed panel FIELDS (would silently corrupt the datom graph):
+                            ;; a string focal → (vec "Nei") = [\N \e \i]; non-map bubbles → 500
+                            ["ai.gftd.mangaka.saveDocument" {:id "bad4" :page {:page/panels [{:panel/index 0 :panel/focal "Nei"}]}}]
+                            ["ai.gftd.mangaka.saveDocument" {:id "bad5" :page {:page/panels [{:panel/index 0 :panel/bubbles "hi"}]}}]
+                            ["ai.gftd.mangaka.saveDocument" {:id "bad6" :page {:page/panels [{:panel/index 0 :panel/rect [0 0 1]}]}}]]]
+        (is (= :bad-input
+               (try ((h nsid) input nil) :no-throw
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+            (str nsid " " input)))
+      ;; the rejected docs left no trace in the store (validation threw before transact)
+      (doseq [bad ["bad4" "bad5" "bad6"]]
+        (is (nil? (store/load-document store bad)) (str bad " was not persisted")))
+      ;; a valid empty/normal page still saves
+      (is (:ok ((h "ai.gftd.mangaka.saveDocument") {:id "ok1" :page {:page/panels []}} nil)))
+      ;; edit ops reject a non-map panel patch …
+      ((h "ai.gftd.mangaka.saveDocument") {:id "ep" :page {:page/panels [{:panel/index 0}]}} nil)
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.updatePanel") {:doc-id "ep" :panel-index 0 :panel "x"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      ;; … and the same field-type guards as the save boundary (string focal would corrupt)
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.updatePanel") {:doc-id "ep" :panel-index 0 :panel {:panel/focal "Nei"}} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.addPanel") {:doc-id "ep" :panel {:panel/bubbles "hi"}} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "updatePanel / addPanel edit a stored storyboard in place"
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "ed" :page {:page/number 1 :page/panels
+                        [{:panel/index 0 :panel/shot "wide" :panel/focal [":character/Nei"]}
+                         {:panel/index 1 :panel/shot "close"}]}} nil)
+      ;; update panel 0's shot, leaving its focal + panel 1 untouched
+      (let [r ((h "ai.gftd.mangaka.updatePanel")
+               {:doc-id "ed" :panel-index 0 :panel {:panel/shot "extreme close-up"}} nil)
+            page (:page (store/load-document store "ed"))]
+        (is (= "extreme close-up" (get-in r [:panel :panel/shot])))
+        (is (= "extreme close-up" (get-in page [:page/panels 0 :panel/shot])))
+        (is (= [":character/Nei"] (get-in page [:page/panels 0 :panel/focal])) "merge preserves other keys")
+        (is (= "close" (get-in page [:page/panels 1 :panel/shot])) "other panels untouched"))
+      ;; add a third panel
+      (let [r ((h "ai.gftd.mangaka.addPanel") {:doc-id "ed" :panel {:panel/shot "splash"}} nil)]
+        (is (= 2 (:panel-index r)))
+        (is (= 3 (:total r)))
+        (is (= 3 (count (:page/panels (:page (store/load-document store "ed")))))))
+      ;; remove the middle panel → remaining reindexed contiguously
+      (let [r ((h "ai.gftd.mangaka.removePanel") {:doc-id "ed" :panel-index 1} nil)
+            panels (:page/panels (:page (store/load-document store "ed")))]
+        (is (= 2 (:total r)))
+        (is (= 2 (count panels)))
+        (is (= ["extreme close-up" "splash"] (mapv :panel/shot panels)) "middle panel gone")
+        (is (= [0 1] (mapv :panel/index panels)) "indices reindexed contiguous"))
+      ;; reorder the 2 remaining panels [extreme close-up, splash] → [splash, extreme close-up]
+      (let [r ((h "ai.gftd.mangaka.reorderPanels") {:doc-id "ed" :order [1 0]} nil)
+            panels (:page/panels (:page (store/load-document store "ed")))]
+        (is (= [1 0] (:order r)))
+        (is (= ["splash" "extreme close-up"] (mapv :panel/shot panels)) "panels reordered")
+        (is (= [0 1] (mapv :panel/index panels)) "reindexed to new positions"))
+      ;; invalid order (not a permutation) → :bad-input
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.reorderPanels") {:doc-id "ed" :order [0 0]} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      ;; out-of-range / missing doc → :bad-input
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.updatePanel") {:doc-id "ed" :panel-index 9 :panel {}} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.addPanel") {:doc-id "ghost" :panel {}} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "doc-aware generate_panel composes the prompt from a stored panel"
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "sb" :page {:page/number 1 :page/base-tags ["monochrome"]
+                        :page/panels [{:panel/index 0 :panel/shot "wide angle"
+                                       :panel/focal [":character/Nei"] :panel/tags ["rain"]}]}} nil)
+      (let [res ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:doc-id "sb" :panel-index 0} nil)]
+        (is (= "panel-sb-0" (:panel-id res)))
+        (is (= "sb" (:doc-id res)))
+        ;; the persisted prompt is built from the storyboard panel, not free-form
+        (let [p (store/-pull store '[:panel/prompt :panel/doc-id] [:panel/id "panel-sb-0"])]
+          (is (= "sb" (:panel/doc-id p)))
+          (doseq [frag ["wide angle" "Nei" "rain" "monochrome"]]
+            (is (str/includes? (:panel/prompt p) frag) (str "prompt has " frag))))))
+
+    (testing "a panel's linked :panel/scene drives the doc-aware render prompt"
+      ;; scenes were previously orphaned (created but never used in generation);
+      ;; a panel that references one now composes that scene's prompt in.
+      (let [sid (:scene-id ((h "ai.gftd.mangaka.mangakaGenerateScene")
+                            {:prompt "rainy neon rooftop at night" :seed 5} nil))]
+        ((h "ai.gftd.mangaka.saveDocument")
+         {:id "scn" :page {:page/number 1
+                           :page/panels [{:panel/index 0 :panel/shot "wide"
+                                          :panel/scene sid :panel/focal [":character/Nei"]}]}} nil)
+        (let [res ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:doc-id "scn" :panel-index 0} nil)
+              p (store/-pull store '[:panel/prompt] [:panel/id (:panel-id res)])
+              scene-prompt (:scene/prompt (store/load-scene store sid))]
+          (is (str/includes? (:panel/prompt p) scene-prompt)
+              "the linked scene's prompt is composed into the render")
+          ;; and the lexicon wire view exposes the link
+          (is (= sid (-> ((h "ai.gftd.mangaka.loadDocument") {:id "scn"} nil)
+                         :lexicon :panels first :scene))))))
+
+    (testing "an invalid :panel/scene (non-string) is rejected at the write boundary"
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.saveDocument")
+                   {:id "badscn" :page {:page/panels [{:panel/index 0 :panel/scene 123}]}} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "doc-aware generate_panel with a bad index is :bad-input"
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:doc-id "sb" :panel-index 9} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "generation uses a throwaway conn per call (no run-history accumulation)"
+      ;; with a shared scratch conn the comfy run-id would climb (1, 2, …);
+      ;; a fresh conn per render keeps it at 1, bounding process-wide memory.
+      (let [a ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:prompt "a" :seed 1} nil)
+            b ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:prompt "b" :seed 2} nil)]
+        (is (= 1 (:run-id a)))
+        (is (= 1 (:run-id b)) "second generation starts a fresh run history")))
+
+    (testing "generation tolerates malformed numeric/model params (coerced, not 500)"
+      (let [res ((h "ai.gftd.mangaka.mangakaGeneratePanel")
+                 {:prompt "x" :seed "abc" :width "big" :model 5} nil)]
+        (is (string? (:image-b64 res)) "rendered despite malformed params")))
+
+    (testing "generate_panel streams a per-node event for each superstep"
+      (let [strm (get-in r ["ai.gftd.mangaka.mangakaGeneratePanel" :stream])
+            events (atom [])
+            result (strm {:prompt "neon" :seed 2} "t-stream"
+                         (fn [ev] (swap! events conj ev)))]
+        (is (= [:plan :render :persist] (mapv :node @events)))
+        (is (= [0 1 2] (mapv :step @events)))
+        (is (string? (:image-b64 result)))))
+
+    (testing "generate_character renders + persists a reusable character"
+      (let [res ((h "ai.gftd.mangaka.mangakaGenerateCharacter")
+                 {:name "Nei" :tags ["1girl"] :seed 9} nil)]
+        (is (= "char-nei" (:character-id res)))
+        (is (string? (:image-b64 res)))
+        (is (= "Nei" (:character/name (store/load-character store "char-nei"))))
+        (is (= [{:id "char-nei" :name "Nei"}] (store/list-characters store)))))
+
+    (testing "generate_scene renders + persists a background"
+      (let [res ((h "ai.gftd.mangaka.mangakaGenerateScene")
+                 {:prompt "rainy neon alley" :seed 1} nil)]
+        (is (string? (:scene-id res)))
+        (is (string? (:image-b64 res)))
+        (is (some? (store/load-scene store (:scene-id res))))))
+
+    (testing "generate_page reads the stored doc to compose + persist a page render"
+      ((h "ai.gftd.mangaka.saveDocument") {:id "pg" :title "Cover" :page sample-page} nil)
+      (let [res ((h "ai.gftd.mangaka.mangakaGeneratePage") {:doc-id "pg"} nil)]
+        (is (= "page-pg" (:page-render-id res)))
+        (is (= "pg" (:doc-id res)))
+        (is (= "pg" (:page-render/doc-id (store/load-page-render store "page-pg"))))))
+
+    (testing "loadPageRender retrieves a document's composed page render (was write-only)"
+      (let [res ((h "ai.gftd.mangaka.loadPageRender") {:doc-id "pg"} nil)]
+        (is (= "page-pg" (:page-render/id res)))
+        (is (= "pg" (:page-render/doc-id res))))
+      (is (nil? ((h "ai.gftd.mangaka.loadPageRender") {:doc-id "never-rendered"} nil)) "nil when not rendered")
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.loadPageRender") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "generate_page composes the page prompt from the cast and linked scenes"
+      (let [sid (:scene-id ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "rainy rooftop at dusk" :seed 4} nil))]
+        ((h "ai.gftd.mangaka.saveDocument")
+         {:id "pgc" :page {:page/number 1 :page/title "Showdown"
+                           :page/panels [{:panel/index 0 :panel/shot "wide"
+                                          :panel/focal [":character/Nei"] :panel/scene sid}]}} nil)
+        ((h "ai.gftd.mangaka.mangakaGeneratePage") {:doc-id "pgc"} nil)
+        (let [prompt (:page-render/prompt (store/load-page-render store "page-pgc"))]
+          (is (str/includes? prompt "Showdown") "page title")
+          (is (str/includes? prompt "Nei") "the cast appearing on the page")
+          (is (str/includes? prompt "rainy rooftop at dusk") "the linked scene's background"))))
+
+    (testing "importGhosthacker ingests the asset graph into characters + scenes"
+      (let [ag {:characters {:Nei {:id "nei" :name "Nei" :text_desc "platinum-blonde hacker girl"
+                                   :personality "calm" :relationships {:Ren "best friend"}}}
+                :scenes {:rens-room {:id "rens-room" :name "Ren's room"
+                                     :text_desc "multi-monitor hacker den"}}}
+            res ((h "ai.gftd.mangaka.importGhosthacker") {:asset-graph ag} nil)]
+        (is (= ["char-nei"] (:characters res)))
+        (is (= ["scene-rens-room"] (:scenes res)))
+        (let [c (store/load-character store "char-nei")]
+          (is (= "Nei" (:character/name c)))
+          (is (= "platinum-blonde hacker girl" (:character/prompt c)))
+          ;; rich metadata round-trips through the enrichment EDN blob
+          (is (= "calm" (:personality (store/-read-string store (:character/enrichment c))))))
+        (is (= "Ren's room" (:scene/name (store/load-scene store "scene-rens-room"))))))
+
+    (testing "importGhosthacker reads the bundled asset_graph when no inline graph is given (the startup-seed source)"
+      (when (.exists (java.io.File. "../data/ghosthacker/resources/asset_graph.json"))
+        (let [res ((h "ai.gftd.mangaka.importGhosthacker") {} nil)]
+          (is (= 5 (count (:characters res))))
+          (is (= 6 (count (:scenes res))))
+          (is (contains? (set (:characters res)) "char-yuto"))
+          (is (= "Yuto Numano" (:character/name (store/load-character store "char-yuto")))))))
+
+    (testing "asset read surface: generate → list → load characters & scenes"
+      ((h "ai.gftd.mangaka.mangakaGenerateCharacter") {:name "Nei" :seed 1} nil)
+      ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "rainy alley" :seed 1} nil)
+      (let [chars ((h "ai.gftd.mangaka.listCharacters") {} nil)]
+        (is (contains? (set (map :id (:characters chars))) "char-nei")))
+      (is (seq (:scenes ((h "ai.gftd.mangaka.listScenes") {} nil))))
+      (let [c ((h "ai.gftd.mangaka.loadCharacter") {:id "char-nei"} nil)]
+        (is (= "Nei" (:character/name c)))
+        (is (string? (:character/image-b64 c)))
+        (is (not (contains? c :db/id)) "internal :db/id is not leaked"))
+      (is (nil? ((h "ai.gftd.mangaka.loadCharacter") {:id "char-missing"} nil)))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.loadScene") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "deleteCharacter / deleteScene prune generated assets (idempotent; missing input → 400)"
+      ((h "ai.gftd.mangaka.mangakaGenerateCharacter") {:name "Junk" :seed 1} nil)
+      (let [sid (:scene-id ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "throwaway bg" :seed 1} nil))]
+        (is (some? (store/load-character store "char-junk")))
+        (is (some? (store/load-scene store sid)))
+        ;; character delete
+        (is (= {:id "char-junk" :deleted true} ((h "ai.gftd.mangaka.deleteCharacter") {:id "char-junk"} nil)))
+        (is (nil? (store/load-character store "char-junk")) "character gone after delete")
+        (is (not (contains? (set (map :id (:characters ((h "ai.gftd.mangaka.listCharacters") {} nil)))) "char-junk")))
+        (is (= {:id "char-junk" :deleted false} ((h "ai.gftd.mangaka.deleteCharacter") {:id "char-junk"} nil))
+            "idempotent")
+        ;; scene delete
+        (is (:deleted ((h "ai.gftd.mangaka.deleteScene") {:id sid} nil)))
+        (is (nil? (store/load-scene store sid)) "scene gone after delete"))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.deleteCharacter") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "listRenders enumerates a document's rendered panels (no image payload)"
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "rd" :page {:page/number 1 :page/panels
+                        [{:panel/index 0 :panel/shot "wide" :panel/focal [":character/Nei"]}]}} nil)
+      ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:doc-id "rd" :panel-index 0} nil)
+      (let [res ((h "ai.gftd.mangaka.listRenders") {:doc-id "rd"} nil)
+            r (first (:renders res))]
+        (is (= "rd" (:doc-id res)))
+        (is (= "panel-rd-0" (:id r)))
+        (is (= 0 (:index r)))
+        (is (not (contains? r :image-b64)) "image payload excluded from listing"))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.listRenders") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "comfyRun rejects a non-map workflow with :bad-input"
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.comfyRun") {:workflow "not-a-map"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "list endpoints paginate (offset/limit/total per the repo convention)"
+      (let [res ((h "ai.gftd.mangaka.listDocuments") {:limit 1} nil)]
+        (is (= 1 (:limit res)))
+        (is (= 0 (:offset res)))
+        (is (int? (:total res)))
+        (is (<= (count (:documents res)) 1) "limit slices the result"))
+      (let [res ((h "ai.gftd.mangaka.listCharacters") {:offset 0 :limit 2} nil)]
+        (is (= 2 (:limit res)))
+        (is (<= (count (:characters res)) 2)))
+      (let [res ((h "ai.gftd.mangaka.listScenes") {} nil)]
+        (is (= 100 (:limit res)) "default limit")
+        (is (int? (:total res))))
+      (testing "bad offset/limit (JSON string, negative, garbage) coerce to safe defaults — never 500"
+        ;; a JSON client may send {"limit":"1"}; "abc"/negative must not crash
+        (let [res ((h "ai.gftd.mangaka.listDocuments") {:limit "1" :offset "0"} nil)]
+          (is (= 1 (:limit res)) "string \"1\" coerced to 1")
+          (is (<= (count (:documents res)) 1)))
+        (let [res ((h "ai.gftd.mangaka.listCharacters") {:limit "abc" :offset -5} nil)]
+          (is (= 100 (:limit res)) "non-numeric limit → default 100")
+          (is (= 0 (:offset res)) "negative offset → clamped to 0"))))
+
+    (testing "analyzeCharacterGraph surfaces the cast relationship graph"
+      ((h "ai.gftd.mangaka.importGhosthacker")
+       {:asset-graph {:characters {:Yuto {:id "yuto" :name "Yuto" :relationships {:Nei "classmate"}}
+                                   :Nei  {:id "nei"  :name "Nei"  :relationships {:Yuto "classmate" :Ren "friend"}}}}} nil)
+      (let [g ((h "ai.gftd.mangaka.analyzeCharacterGraph") {} nil)
+            edges (set (:edges g))]
+        (is (contains? (set (map :name (:nodes g))) "Yuto"))
+        (is (contains? (set (map :name (:nodes g))) "Nei"))
+        (is (contains? edges {:from "Yuto" :to "Nei" :rel "classmate"}))
+        (is (contains? edges {:from "Nei" :to "Ren" :rel "friend"}))))
+
+    (testing "documentsByCharacter queries the storyboard datoms over the graph"
+      ((h "ai.gftd.mangaka.saveDocument") {:id "qd" :page sample-page} nil)  ; focal :character/Nei
+      (let [res ((h "ai.gftd.mangaka.documentsByCharacter") {:character "Nei"} nil)]
+        (is (= ":character/Nei" (:character res)))
+        (is (contains? (set (:documents res)) "qd"))
+        (is (= {:doc-id "qd" :index 0} (first (filter #(= "qd" (:doc-id %)) (:panels res))))))
+      ;; case-insensitive: lowercase "nei" and full-ref forms resolve to the
+      ;; canonical stored focal ref :character/Nei (the model's casing varies)
+      (doseq [arg ["nei" "NEI" ":character/nei"]]
+        (let [res ((h "ai.gftd.mangaka.documentsByCharacter") {:character arg} nil)]
+          (is (= ":character/Nei" (:character res)) (str arg " resolves to canonical ref"))
+          (is (contains? (set (:documents res)) "qd") (str arg " finds the document"))))
+      (let [res ((h "ai.gftd.mangaka.documentsByCharacter") {:character ":character/Ghost"} nil)]
+        (is (= [] (:documents res)))))
+
+    (testing "documentsByScene queries which documents are set in a scene"
+      (let [sid (:scene-id ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "scene-query bg" :seed 1} nil))]
+        ((h "ai.gftd.mangaka.saveDocument")
+         {:id "sceneq" :page {:page/panels [{:panel/index 0 :panel/rect [0 0 1 1] :panel/scene sid}]}} nil)
+        (let [res ((h "ai.gftd.mangaka.documentsByScene") {:scene sid} nil)]
+          (is (= sid (:scene res)))
+          (is (contains? (set (:documents res)) "sceneq"))
+          (is (= {:doc-id "sceneq" :index 0} (first (filter #(= "sceneq" (:doc-id %)) (:panels res))))
+              "panel-level results mirror documentsByCharacter"))
+        (is (= [] (:documents ((h "ai.gftd.mangaka.documentsByScene") {:scene "scene-nonexistent"} nil))))
+        (is (= :bad-input
+               (try ((h "ai.gftd.mangaka.documentsByScene") {} nil) :no-throw
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))
+
+    (testing "stats returns Datalog-powered entity counts (delta-checked; shared store)"
+      (let [before ((h "ai.gftd.mangaka.stats") {} nil)]
+        ((h "ai.gftd.mangaka.saveDocument") {:id "stats-doc-xyz" :page {:page/number 1 :page/panels []}} nil)
+        ((h "ai.gftd.mangaka.mangakaGenerateCharacter") {:name "StatsHeroXyz" :seed 1} nil)
+        ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "stats alley xyz" :seed 1} nil)
+        (let [after ((h "ai.gftd.mangaka.stats") {} nil)]
+          (is (= (inc (:documents before)) (:documents after)))
+          (is (= (inc (:characters before)) (:characters after)))
+          (is (= (inc (:scenes before)) (:scenes after)))
+          (is (contains? after :renders))
+          (is (contains? after :page-renders)))))
+
+    (testing "previewSvg renders a stored storyboard to an SVG string"
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "pv" :page {:page/number 1 :page/title "Pv"
+                        :page/panels [{:panel/index 0 :panel/rect [0.05 0.05 0.9 0.4] :panel/shot "wide"}]}} nil)
+      (let [res ((h "ai.gftd.mangaka.previewSvg") {:doc-id "pv"} nil)]
+        (is (= "pv" (:doc-id res)))
+        (is (str/starts-with? (:svg res) "<svg"))
+        (is (str/includes? (:svg res) "wide")))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.previewSvg") {:doc-id "nope"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "kamiRenderFrame renders a stored storyboard through the KAMI clj engine"
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "kf" :page {:page/number 1 :page/panels
+                        [{:panel/index 0 :panel/rect [0.05 0.05 0.9 0.4]}]}} nil)
+      (let [frame ((h "ai.gftd.mangaka.kamiRenderFrame") {:doc-id "kf"} nil)]
+        (is (some? (:frame/camera frame)))
+        (is (pos? (count (get-in frame [:frame/passes 0 :pass/draws])))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.kamiRenderFrame") {:doc-id "nope"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "comfy_run executes an arbitrary workflow through the engine"
+      (let [wf {"a" {:class_type "PrimitiveInt" :inputs {:value 2}}
+                "b" {:class_type "Add" :inputs {:a ["a" 0] :b 40}}
+                "out" {:class_type "Preview" :inputs {:value ["b" 0]}}}
+            res ((h "ai.gftd.mangaka.comfyRun") {:workflow wf} nil)]
+        (is (= [42] (get-in res [:results "out"])))
+        (is (some? (:run-id res)))))
+
+    (testing "visionScorePanel critiques a rendered panel + stores the verdict"
+      (let [p ((h "ai.gftd.mangaka.mangakaGeneratePanel") {:prompt "neon" :seed 1} nil)
+            res ((h "ai.gftd.mangaka.visionScorePanel") {:panel-id (:panel-id p)} nil)]
+        (is (= (:panel-id p) (:panel-id res)))
+        (is (map? (:critique res)))
+        (is (false? (:llm-applied res)))            ; offline mock → stub critique
+        ;; critique persisted on the panel as datoms, image preserved
+        (let [stored (store/load-panel store (:panel-id p))]
+          (is (string? (:panel/image-b64 stored)))
+          (is (map? (store/-read-string store (:panel/critique stored)))))))
+
+    (testing "visionScorePanel on a missing panel is :bad-input"
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.visionScorePanel") {:panel-id "nope"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "enrichScene enriches a stored scene (stub offline) and errors on a missing scene"
+      ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "rainy neon alley" :seed 3} nil)
+      (let [sid (-> ((h "ai.gftd.mangaka.listScenes") {} nil) :scenes first :id)
+            res ((h "ai.gftd.mangaka.enrichScene") {:id sid} nil)]
+        (is (= sid (:scene-id res)))
+        (is (map? (:enrichment res)))
+        (is (false? (:llm-applied res)))            ; offline mock → stub
+        (is (map? (store/-read-string store (:scene/enrichment (store/load-scene store sid))))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.enrichScene") {:id "scene-missing"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "enrich_characters runs the LLM path and persists (stub offline)"
+      (let [res ((h "ai.gftd.mangaka.enrichCharacters")
+                 {:name "Kage" :description "stealthy netrunner" :tags ["hood"]} nil)]
+        (is (= "char-kage" (:character-id res)))
+        (is (map? (:enrichment res)))
+        (is (false? (:llm-applied res)))            ; mock model → stub enrichment offline
+        (let [stored (store/load-character store "char-kage")]
+          (is (= "Kage" (:character/name stored)))
+          (is (map? (store/-read-string store (:character/enrichment stored)))))))
+
+    (testing "lintDocument flags structural storyboard problems (deterministic QA)"
+      ;; the seeded GhostHacker cast (char-nei …) is present in this shared store,
+      ;; so a focal ref to a real character is clean while a typo'd one is flagged.
+      ((h "ai.gftd.mangaka.importGhosthacker") {} nil)
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "lintok" :page {:page/number 1 :page/panels
+                            [{:panel/index 0 :panel/rect [0 0 1 1] :panel/focal [":character/Nei"]}]}} nil)
+      (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintok"} nil)]
+        (is (true? (:ok res)) "a well-formed doc with a known character is clean")
+        (is (= 0 (:count res))))
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "lintbad" :page {:page/number 1 :page/panels
+                             [{:panel/index 0 :panel/focal [":character/Nobody"]}  ; no rect + unknown char
+                              {:panel/index 0 :panel/rect [0 0 1 1]}]}} nil)       ; duplicate index
+      (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintbad"} nil)
+            codes (set (map :code (:issues res)))]
+        (is (false? (:ok res)))
+        (is (contains? codes :missing-rect))
+        (is (contains? codes :unknown-character))
+        (is (contains? codes :duplicate-index))
+        ;; severity breakdown: duplicate-index is the lone error; missing-rect +
+        ;; unknown-character are warnings — so the page is not :renderable.
+        (is (= 1 (:errors res)) "one error (duplicate-index)")
+        (is (= 2 (:warnings res)) "two warnings (missing-rect, unknown-character)")
+        (is (= 3 (:count res)))
+        (is (false? (:renderable res)) "an error means it won't render correctly"))
+      ;; a panel referencing a non-existent scene is flagged (and a real one is clean)
+      (let [sid (:scene-id ((h "ai.gftd.mangaka.mangakaGenerateScene") {:prompt "real bg" :seed 2} nil))]
+        ((h "ai.gftd.mangaka.saveDocument")
+         {:id "lintscn" :page {:page/panels [{:panel/index 0 :panel/rect [0 0 1 1] :panel/scene sid}
+                                             {:panel/index 1 :panel/rect [0 0 1 1] :panel/scene "scene-ghost"}]}} nil)
+        (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintscn"} nil)
+              scene-issues (filter #(= :unknown-scene (:code %)) (:issues res))]
+          (is (= 1 (count scene-issues)) "only the bogus scene ref is flagged")
+          (is (= 1 (:panel (first scene-issues))) "on the panel that references it")))
+      ;; a panel whose rect runs off the page is flagged; an in-bounds one is clean
+      ((h "ai.gftd.mangaka.saveDocument")
+       {:id "lintrect" :page {:page/panels [{:panel/index 0 :panel/rect [0.05 0.05 0.9 0.4]}   ; in bounds
+                                            {:panel/index 1 :panel/rect [0.5 0.5 0.9 0.9]}]}} nil) ; x+w=1.4, off page
+      (let [issues (:issues ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintrect"} nil))
+            oob (filter #(= :rect-out-of-bounds (:code %)) issues)]
+        (is (= 1 (count oob)) "only the overflowing panel is flagged")
+        (is (= 1 (:panel (first oob))))
+        ;; severities reflect rendering impact: off-page = error, no-rect = warn
+        (is (= :error (:severity (first oob))) "out-of-bounds (renders clipped) is an error"))
+      ((h "ai.gftd.mangaka.saveDocument") {:id "lintnorect" :page {:page/panels [{:panel/index 0}]}} nil)
+      (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintnorect"} nil)
+            mr (->> (:issues res) (filter #(= :missing-rect (:code %))) first)]
+        (is (= :warn (:severity mr)) "missing rect (falls back to default layout) is only a warning")
+        ;; warnings-only → not :ok (has an issue) but still :renderable (no errors)
+        (is (false? (:ok res)))
+        (is (true? (:renderable res)) "a warnings-only doc still renders"))
+      ;; an empty document is a (warn-level) issue, not clean — but still renderable
+      ((h "ai.gftd.mangaka.saveDocument") {:id "lintempty" :page {:page/number 1 :page/panels []}} nil)
+      (let [res ((h "ai.gftd.mangaka.lintDocument") {:doc-id "lintempty"} nil)]
+        (is (= [:empty-page] (mapv :code (:issues res))))
+        (is (false? (:ok res)))
+        (is (true? (:renderable res)) "empty-page is a warning, so the page still renders"))
+      ;; missing doc / missing input → :bad-input
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.lintDocument") {:doc-id "nope"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.lintDocument") {} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "generate_page on a missing doc is :bad-input"
+      (is (= :bad-input
+             (try ((h "ai.gftd.mangaka.mangakaGeneratePage") {:doc-id "nope"} nil) :no-throw
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+
+    (testing "input validation throws :bad-input for missing required keys"
+      (doseq [[nsid input] [["ai.gftd.mangaka.saveDocument" {}]
+                            ["ai.gftd.mangaka.mangakaGeneratePanel" {}]
+                            ["ai.gftd.mangaka.mangakaGenerateCharacter" {}]
+                            ["ai.gftd.mangaka.mangakaGenerateScene" {}]
+                            ["ai.gftd.mangaka.mangakaGeneratePage" {}]
+                            ["ai.gftd.mangaka.comfyRun" {}]
+                            ["ai.gftd.mangaka.enrichCharacters" {}]
+                            ["ai.gftd.mangaka.documentsByCharacter" {}]
+                            ["ai.gftd.mangaka.visionScorePanel" {}]]]
+        (is (= :bad-input
+               (try ((h nsid) input nil) :no-throw
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))))

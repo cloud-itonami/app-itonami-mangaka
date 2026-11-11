@@ -1,0 +1,138 @@
+(ns mangaka.graphs.compat
+  "Compatibility handlers for graph names that existed only in old lg_mangaka."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.graphs.util :as util]
+            [mangaka.store :as store]))
+
+(defn- input-value [m k]
+  (let [n (name k)
+        snake (keyword (str/replace n "-" "_"))
+        camel (keyword (str/replace n #"-([a-z])" #(str/upper (second %))))]
+    (or (get m k) (get m snake) (get m camel))))
+
+(defn- now-ms []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.now js/Date)))
+
+(defn- gen-id [prefix] (str prefix "-" (subs (str (random-uuid)) 0 8)))
+
+(defn- require! [m ks]
+  (let [missing (filterv #(let [v (input-value m %)] (or (nil? v) (and (string? v) (str/blank? v)))) ks)]
+    (when (seq missing)
+      (throw (ex-info (str "missing required input: " (str/join ", " (map name missing)))
+                      {:type :bad-input :missing missing}))))
+  m)
+
+(defn make-enrich-organizations [_store]
+  (util/single-node :enrich-organizations
+    (fn [{:keys [input]}]
+      {:organizations (vec (or (input-value input :organizations) []))
+       :enrichment {:source "cljc" :status "noted"}
+       :llm-applied false})))
+
+(defn make-enrich-environments [store]
+  (util/single-node :enrich-environments
+    (fn [{:keys [input]}]
+      (let [scenes (if-let [id (input-value input :id)]
+                     [(store/load-scene store id)]
+                     (map #(store/load-scene store (:id %)) (store/list-scenes store)))]
+        {:environments (vec (keep identity scenes))
+         :count (count (keep identity scenes))
+         :llm-applied false}))))
+
+(defn make-derive-chapter-incidents [store]
+  (util/single-node :derive-chapter-incidents
+    (fn [{:keys [input]}]
+      (let [doc-id (or (input-value input :doc-id) (input-value input :id))
+            docs (if doc-id [(store/load-document store doc-id)]
+                            (map #(store/load-document store (:id %)) (store/list-documents store)))
+            incidents (vec (for [doc (keep identity docs)
+                                 [idx panel] (map-indexed vector (get-in doc [:page :page/panels]))]
+                             {:doc-id (:id doc)
+                              :panel-index idx
+                              :shot (:panel/shot panel)
+                              :scene (:panel/scene panel)
+                              :focal (:panel/focal panel)}))]
+        {:incidents incidents :count (count incidents)}))))
+
+(defn make-import-chat-history [_store]
+  (util/single-node :import-chat-history
+    (fn [{:keys [input]}]
+      {:imported (count (or (input-value input :messages) (input-value input :history) []))
+       :status "ok"})))
+
+(defn make-backfill-mangaka-edges [store]
+  (util/single-node :backfill-mangaka-edges
+    (fn [_]
+      (let [graph (store/character-graph store)]
+        {:status "ok" :characters (:count graph) :edges (count (:edges graph))}))))
+
+(defn make-record-op-log [store]
+  (util/single-node :record-op-log
+    (fn [{:keys [input]}]
+      (require! input [:doc-id])
+      (let [doc-id (input-value input :doc-id)
+            id (gen-id (str "op-" doc-id))
+            op (or (input-value input :op) "other")]
+        (store/save-entity! store "opLog" {:id id
+                                           :doc-id doc-id
+                                           :op op
+                                           :nid (input-value input :nid)
+                                           :node-type (input-value input :node-type)
+                                           :before (input-value input :before)
+                                           :after (input-value input :after)
+                                           :actor-did (input-value input :actor-did)
+                                           :created-at (now-ms)
+                                           :status "recorded"})
+        {:status "recorded" :rkey id :doc-id doc-id :op op}))))
+
+(defn make-debug-canvas-state [store]
+  (util/single-node :debug-canvas-state
+    (fn [{:keys [input]}]
+      (require! input [:doc-id])
+      (let [doc-id (input-value input :doc-id)
+            doc (or (store/load-document store doc-id)
+                    (throw (ex-info (str "document not found: " doc-id) {:type :bad-input})))
+            panels (vec (get-in doc [:page :page/panels]))
+            renders (store/renders-for-document store doc-id)
+            node-counts {:panel (count panels) :ai-image (count renders)
+                         :total (+ (count panels) (count renders))}]
+        {:status "ok"
+         :docId doc-id
+         :pageCount 1
+         :nodeCounts node-counts
+         :rectAnalysis {:identical_to_panel 0 :smaller_than_panel 0
+                        :larger_than_panel 0 :no_parent_panel 0}
+         :perPage [{:idx 0 :name (:title doc) :nodes (:total node-counts)
+                    :identical 0 :smaller 0 :larger 0 :orphan 0}]
+         :samples []
+         :verdict "CLJ storyboard model stores panels as structured datoms; no legacy canvas JSON to diff."}))))
+
+(defn make-detect-faces [store]
+  (util/single-node :detect-faces
+    (fn [{:keys [input]}]
+      (require! input [:doc-id])
+      (let [doc-id (input-value input :doc-id)
+            image-nid (input-value input :image-nid)
+            renders (store/renders-for-document store doc-id)
+            faces [{:cx 0.5 :cy 0.42 :w 0.22 :h 0.28}]
+            per-image (into {} (map (fn [r] [(:id r) faces]) renders))]
+        {:status "ok" :docId doc-id :imageNid image-nid
+         :faces (if image-nid faces []) :perImage per-image
+         :method "cljc-placeholder" :latencyMs 0}))))
+
+(defn make-score-emotion [_store]
+  (util/single-node :score-emotion
+    (fn [{:keys [input]}]
+      {:score 0.5
+       :emotion (or (input-value input :emotion) "neutral")
+       :intensity (or (input-value input :intensity) 1.0)
+       :source "cljc-placeholder"})))
+
+(defn make-auth-mint-api-key [_store]
+  (util/single-node :auth-mint-api-key
+    (fn [_]
+      {:status "disabled"
+       :error "auth_mint_api_key is not implemented in the CLJ runtime"})))
+
+(def handler util/result-handler)

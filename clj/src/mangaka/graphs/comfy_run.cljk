@@ -1,0 +1,25 @@
+(ns mangaka.graphs.comfy-run
+  "comfy_run — raw comfyui-clj workflow passthrough (the Python comfy_run
+  graph). A client submits an API-format workflow (EDN map of nodes) and
+  gets back the executed outputs + cache/run metadata, exposing the comfy
+  engine directly rather than through the fixed panel/scene workflows.
+
+  Requires :workflow. Send EDN (content-type application/edn) so node-id
+  string keys and keyword inputs survive — JSON would keywordize the ids.
+  A single-node graph (no diffusion-specific plan/persist), so it does not
+  use the generation scaffold."
+  (:require [mangaka.graphs.util :as util]
+            [mangaka.comfy :as comfy]
+            [mangaka.domain :as domain]))
+
+(defn make [_store]
+  (util/single-node
+   :run
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:workflow])
+     (when-not (map? (:workflow input))
+       (throw (ex-info "workflow must be a map of node-id → node" {:type :bad-input})))
+     ;; throwaway conn per run — no process-wide history/cache accumulation
+     (comfy/run (comfy/fresh-scratch) (:workflow input) (or (:opts input) {})))))
+
+(def handler util/result-handler)

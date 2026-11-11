@@ -1,0 +1,130 @@
+(ns mangaka.llm
+  "LLM layer — 自前 fleet (api.murakumo.cloud) 優先、Anthropic は fallback
+  (ADR-2607164200 addendum 2; 元は Claude 単独の facade — extracted 経緯は
+  90-docs/adr/2607011816-ghosthacker-shiropico-standalone-repo.md /
+  2607011900-genapp-clj-mangaka-animeka-commons.md)。既存 `mangaka.llm/...`
+  call sites (`graphs/{chat,enrich_scene,enrich_characters,vision_score,
+  generate_panel_quality,coscientist_panel}.cljc`) は変更不要。
+
+  Provider 解決 (resolve-provider、純関数 — テスト可能):
+    1. MURAKUMO_LLM_URL が設定されていれば **murakumo** — fleet の
+       OpenAI 互換 /v1/chat/completions (langchain.model/openai-model)。
+       本番は `MURAKUMO_LLM_URL=https://api.murakumo.cloud`。backend は
+       llama.cpp (gemma4 マルチモーダル — vision 実測済み 2026-07-16) なので
+       vision-json / vision-score もこの経路で動く。model 名は backend が
+       ロード済みモデルで応答するため `MURAKUMO_LLM_MODEL` (default
+       \"default\") を送る。`MURAKUMO_SERVICE_TOKEN` があれば Bearer。
+    2. なければ ANTHROPIC_API_KEY → Anthropic (従来経路)。
+    3. どちらも無ければ deterministic mock — 全 slice が offline で走る
+       repo 規約は不変。
+
+  langchain-clj 自体は I/O を持たない: アダプタは :http-fn/:json-write/
+  :json-read を注入される (JVM は http-kit + jsonista = langchain.jvm)。"
+  (:require [kotoba.lang.text :as str]
+            [langchain.jvm :as g]
+            [langchain.model :as model]))
+
+(def chat-model-id    #?(:clj (or (System/getenv "MANGAKA_CHAT_MODEL") model/default-model)
+                         :cljs model/default-model))
+(def critique-model-id #?(:clj (or (System/getenv "MANGAKA_CRITIQUE_MODEL") "claude-sonnet-4-6")
+                          :cljs "claude-sonnet-4-6"))
+
+(defn- env [k] #?(:clj (System/getenv k) :cljs nil))
+
+(defn chat-completions-url
+  "Base URL (\"https://api.murakumo.cloud\") → その OpenAI 互換 endpoint。
+  /v1/ を既に含む URL はそのまま (gateway 直指定等)。"
+  [u]
+  (when (seq (str u))
+    (if (str/includes? u "/v1/") u (str u "/v1/chat/completions"))))
+
+(defn resolve-provider
+  "env map → {:provider :murakumo|:anthropic :url :model :api-key} | nil。
+  純関数 — 優先順位 (murakumo 優先) をテストで固定するために分離してある。"
+  [{:strs [MURAKUMO_LLM_URL MURAKUMO_LLM_MODEL MURAKUMO_SERVICE_TOKEN
+           ANTHROPIC_API_KEY]} model-id]
+  (cond
+    (seq (str MURAKUMO_LLM_URL))
+    {:provider :murakumo
+     :url (chat-completions-url MURAKUMO_LLM_URL)
+     :model (or MURAKUMO_LLM_MODEL "default")
+     :api-key MURAKUMO_SERVICE_TOKEN}
+
+    (seq (str ANTHROPIC_API_KEY))
+    {:provider :anthropic :model model-id :api-key ANTHROPIC_API_KEY}))
+
+#?(:clj
+   (defn- provider-config [model-id]
+     (resolve-provider {"MURAKUMO_LLM_URL" (env "MURAKUMO_LLM_URL")
+                        "MURAKUMO_LLM_MODEL" (env "MURAKUMO_LLM_MODEL")
+                        "MURAKUMO_SERVICE_TOKEN" (env "MURAKUMO_SERVICE_TOKEN")
+                        "ANTHROPIC_API_KEY" (env "ANTHROPIC_API_KEY")}
+                       model-id)))
+
+#?(:clj
+   (defn- build-live [model-id]
+     (when-let [{:keys [provider url model api-key]} (provider-config model-id)]
+       (case provider
+         :murakumo (model/openai-model
+                    (cond-> {:url url :model model
+                             :http-fn g/jvm-http-fn
+                             :json-write g/json-write :json-read g/json-read}
+                      (seq (str api-key)) (assoc :api-key api-key)))
+         ;; `:url` is now required to reach Anthropic: langchain's adapter
+         ;; defaults to murakumo, and refuses to forward an `sk-ant-` key to
+         ;; any other host rather than leaking it as a 401.
+         :anthropic (model/anthropic-model
+                     {:url model/anthropic-direct-url
+                      :api-key api-key :model model
+                      :http-fn g/jvm-http-fn
+                      :json-write g/json-write :json-read g/json-read})))))
+
+(defn chat-model
+  "A ChatModel. murakumo (MURAKUMO_LLM_URL) > Anthropic (ANTHROPIC_API_KEY) >
+  deterministic mock。murakumo 経路では `model-id` は送信名にならない
+  (backend がロード済みモデルで応える) — MURAKUMO_LLM_MODEL が送信名。"
+  ([] (chat-model chat-model-id))
+  ([model-id]
+   (g/chat-model
+    model-id
+    #?(:clj (fn [] (build-live model-id))
+       :cljs (fn [] nil)))))
+
+(defn- swallow*
+  "transport/API 例外 → nil (no signal)。docstring の「callers degrade
+  gracefully (nil on failure)」は解析失敗だけでなく **HTTP/API エラーにも**
+  適用される — 一時的な 5xx が数十分の品質ループや復元バッチを途中で殺した
+  実測 (2026-07-17、murakumo llama.cpp の transient error がパネル 4/6 で
+  伝播しクラッシュ) の再発防止。握り潰す代わりに stderr へ1行残す。"
+  [f label]
+  (try (f)
+       (catch #?(:clj Exception :cljs :default) e
+         #?(:clj (binding [*out* *err*]
+                   (println (str "[mangaka.llm] " label " degraded to nil: "
+                                 (ex-message e))))
+            :cljs (js/console.warn "[mangaka.llm]" label "degraded to nil:" (ex-message e)))
+         nil)))
+
+(defn vision-score
+  "Visual critique of a panel image (base64 PNG) — returns the model's text
+  response, or nil on transport/API failure."
+  [prompt image-b64]
+  (swallow* #(g/vision-text (chat-model critique-model-id) prompt image-b64)
+            "vision-score"))
+
+(def parse-structured g/parse-structured)
+
+(defn complete-json
+  "Prompts a chat model for structured output and parses a map from its
+  reply. Callers degrade gracefully (nil on failure — 解析失敗も API エラーも)。
+  The model is injectable (defaults to `(chat-model)`) for testing."
+  ([system user] (complete-json system user (chat-model)))
+  ([system user m] (swallow* #(g/complete-json system user m) "complete-json")))
+
+(defn vision-json
+  "Like `complete-json` but for a panel image: prompts the critique model
+  with `prompt` + the base64 image and parses a structured map (nil when
+  the reply isn't a map — offline mock — or on transport/API failure).
+  Model injectable for tests."
+  ([prompt image-b64] (vision-json prompt image-b64 (chat-model critique-model-id)))
+  ([prompt image-b64 m] (swallow* #(g/vision-json m prompt image-b64) "vision-json")))

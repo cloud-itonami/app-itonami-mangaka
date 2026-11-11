@@ -1,0 +1,9 @@
+{:tasks
+ {server   {:doc "Run the JVM HTTP server (mangaka.server)."
+            :task (shell "kbb -M:dev:run")}
+  test     {:doc "Run the Clojure test suite."
+            :task (shell "kbb -M:dev:test")}
+  watch    {:doc "amu compile --target wasm32-browser the Studio UI."
+            :task (shell "amu compile --target wasm32-browser app")}
+  release  {:doc "amu compile --target wasm32-browser build of the Studio UI."
+            :task (shell "amu compile --target wasm32-browser app")}}}

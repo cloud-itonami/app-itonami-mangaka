@@ -1,0 +1,39 @@
+(ns mangaka.style-registry
+  "Theme-driven style switching for the manga render pipeline, ported from the
+   pruned Python tree (../lg/lg_mangaka/style_registry.py, removed 2026-07-07).
+
+   SSoT data: ../data/style-registry.edn (native EDN — the Python original
+   embedded a mini EDN reader for it; here it is just edn/read-string).
+
+   resolve-style: :default <- :genre->style[genre] <- :work->style[work-rkey]
+   (work override wins); the matching :shot-modifiers entry is appended to
+   :positive. Returns the profile map (keyword keys, :mode as keyword) with
+   :profile = the winning profile key."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [clojure.edn :as edn])))
+
+(defn resolve-style
+  "Resolve the render style profile for a work (by override or genre)."
+  [registry {:keys [work-rkey genre shot]}]
+  (let [k    (or (get (:work->style registry) work-rkey)
+                 (get (:genre->style registry) genre)
+                 (:default registry))
+        prof (assoc (get (:profiles registry) k {}) :profile k)
+        mod  (get (:shot-modifiers registry) (str/lower (or shot "")))]
+    (if (and mod (:positive prof))
+      (update prof :positive #(str % ", " mod))
+      prof)))
+
+#?(:clj
+   (defn load-registry
+     "Read the style registry EDN. With no arg, honours MANGAKA_STYLE_REGISTRY
+      then falls back to the repo-conventional ../data/style-registry.edn /
+      data/style-registry.edn relative to the working directory."
+     ([]
+      (load-registry (or (System/getenv "MANGAKA_STYLE_REGISTRY")
+                         (first (filter #(.exists (java.io.File. ^String %))
+                                        ["../data/style-registry.edn"
+                                         "data/style-registry.edn"]))
+                         "../data/style-registry.edn")))
+     ([path]
+      (edn/read-string (slurp path)))))

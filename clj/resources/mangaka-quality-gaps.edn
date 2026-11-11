@@ -1,0 +1,27 @@
+{:gap/version 2
+ :gap/updated-at "2026-07-20"
+ :gap/authority {:app "gftdcojp/ai-gftd-mangaka"
+                 :data "gftdcojp/mangaka-data"
+                 :page "kotoba-lang/kami-mangaka-page"
+                 :qa "kotoba-lang/kami-mangaka-qa"
+                 :genko "kotoba-lang/kami-genko"
+                 :shell "kotoba-lang/shell"}
+ :gap/items
+ [{:id :visual-score-auto :status :implemented
+   :evidence ["ai.gftd.mangaka.reviewPage" :page18 :persisted-edn-review]}
+  {:id :genko-round-trip :status :implemented
+   :evidence [:page->doc :doc->page :layer-flatten :deterministic-compose]}
+  {:id :psychological-lettering :status :implemented-with-followup
+   :evidence [:authored-position :authored-size :vertical-rtl :tail-target :emotion-style]
+   :followup [:face-box-grounding-accuracy :automatic-collision-optimizer]}
+  {:id :kotoba-shell :status :implemented
+   :evidence [:generate-panel :compose-page :review-page :export-genko]}
+  {:id :ghosthacker-p0-p2 :status :blocked-external
+   :reason :no-image-generation-backend
+   :required-any-of [:COMFYUI_URL :COMFYUI_GATEWAY_URL :MURAKUMO_LLM_URL :OPENAI_API_KEY]
+   :existing-data {:p0 "mangaka-data/ghosthacker/resources/gpt-image-base-scenes/gh-arc0-1-p00"
+                   :p2-partial "mangaka-data/ghosthacker/resources/gpt-image-base-scenes/gh-arc0-1-p02-p0"}}
+  {:id :migration-closeout :status :in-progress
+   :done [:active-60-apps-references-zero :canonical-data-authority]
+   :remaining [:final-old-tree-diff-audit :release-pins :commit-and-push
+               :archive-or-delete-old-tree]}]}

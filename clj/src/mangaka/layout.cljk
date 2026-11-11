@@ -1,0 +1,141 @@
+(ns mangaka.layout
+  "Pure layout/routing ports from the pruned Python tree (../lg, removed 2026-07-07).
+
+   - v10_pipeline_router.py → select-pipeline / select-pipeline-for-preset
+     (per-panel ComfyUI pipeline selection: cu_color / cu_ink / cu_action /
+      cu_color_usd / cu_ink_usd)
+   - v11_page_layout.py     → detect-page-layout-type /
+                              apply-page-layout-override / page-arc-summary
+
+   Panels are JSON-shaped maps (string keys: \"tone\" \"shot\"
+   \"focusedCharacters\" \"panel_pipeline\" \"panelLayout\" \"dialogues\").
+   Unlike the Python original, apply-page-layout-override is non-mutating.
+   Golden fixtures from the Python originals: test/mangaka/py_port_test.clj."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── v10 pipeline router ─────────────────────────────────────────────────────
+
+(defn- lc [s] (str/lower (or s "")))
+
+(defn- any-substr? [s subs] (boolean (some #(str/includes? s %) subs)))
+
+(def ^:private action-tones ["shock" "intense" "impact" "dramatic" "tense" "action"])
+
+(defn select-pipeline
+  "Select the v10 pipeline for a single panel.
+   Priority: explicit \"panel_pipeline\" → tone/shot/focal heuristic → page-default."
+  ([panel] (select-pipeline panel "cu_color"))
+  ([panel page-default]
+   (let [tone      (lc (get panel "tone"))
+         shot      (lc (get panel "shot"))
+         has-focal (boolean (seq (get panel "focusedCharacters")))]
+     (or (get panel "panel_pipeline")
+         (cond
+           (any-substr? tone action-tones) "cu_action"
+           (and (not has-focal) (any-substr? shot ["wide" "establish" "long"])) "cu_color_usd"
+           (and (not has-focal) (any-substr? shot ["extreme close" "insert"])) "cu_color"
+           :else page-default)))))
+
+(def pipeline-presets
+  "Jump genre / preset name → per-slot pipeline defaults."
+  {"ghosthacker"        {:default "cu_ink" :wide "cu_ink_usd" :action "cu_action"}
+   "jump_global_golden" {:default "cu_color" :wide "cu_color_usd" :action "cu_action"}
+   "deathnote"          {:default "cu_ink" :wide "cu_ink_usd" :action "cu_action"}
+   "slice_of_life"      {:default "cu_color" :wide "cu_color" :action "cu_action"}})
+
+(defn select-pipeline-for-preset
+  "Combine preset defaults with per-panel routing."
+  ([panel] (select-pipeline-for-preset panel "ghosthacker"))
+  ([panel preset-name]
+   (let [preset    (get pipeline-presets preset-name (pipeline-presets "jump_global_golden"))
+         tone      (lc (get panel "tone"))
+         shot      (lc (get panel "shot"))
+         has-focal (boolean (seq (get panel "focusedCharacters")))]
+     (or (get panel "panel_pipeline")
+         (cond
+           (any-substr? tone action-tones) (:action preset)
+           (and (not has-focal) (any-substr? shot ["wide" "establish" "long"])) (:wide preset)
+           :else (:default preset))))))
+
+;; ── v11 page-level layout type detection ────────────────────────────────────
+
+(defn detect-page-layout-type
+  "One of \"single_dramatic\" / \"action_sequence\" / \"dialogue_heavy\" /
+   \"standard_grid\" from heuristics over the page's panel list."
+  [panels]
+  (let [n (count panels)]
+    (if (zero? n)
+      "standard_grid"
+      (let [emphs (map #(get-in % ["panelLayout" "gh:emphasis"] "") panels)]
+        (cond
+          (and (<= n 2) (every? #(contains? #{"establish" "punchline" "impact"} %) emphs))
+          "single_dramatic"
+
+          (= n 1)
+          "single_dramatic"
+
+          (let [n-impact (count (filter #(= "impact" (get-in % ["panelLayout" "gh:emphasis"])) panels))
+                n-action (count (filter #(contains? #{"action" "tense" "ominous"} (lc (get % "tone"))) panels))]
+            (and (>= n 5) (>= n-impact 3) (>= n-action 2)))
+          "action_sequence"
+
+          (let [with-dialogue (count (filter (fn [p]
+                                               (let [ds (get p "dialogues")]
+                                                 (and (seq ds) (some #(seq (get % "text")) ds))))
+                                             panels))]
+            (and (>= n 4) (>= with-dialogue (long (* n 0.75)))))
+          "dialogue_heavy"
+
+          :else "standard_grid")))))
+
+(defn- with-layout-defaults
+  "setdefault semantics: existing panelLayout keys win over defaults."
+  [panel defaults]
+  (update panel "panelLayout" #(merge defaults (or % {}))))
+
+(defn apply-page-layout-override
+  "Apply the detected page type to the panels' panelLayout (non-mutating;
+   explicit overrides preserved). Returns the adjusted panel vector."
+  [panels layout-type]
+  (case layout-type
+    "single_dramatic"
+    (mapv #(with-layout-defaults % {"gh:size" "spread" "gh:bleed" "full"
+                                    "gh:row" 1 "gh:colSpan" 6 "gh:rowSpan" 6})
+          panels)
+
+    "action_sequence"
+    (mapv (fn [p]
+            (let [emph (get-in p ["panelLayout" "gh:emphasis"] "")
+                  tone (lc (get p "tone"))]
+              (cond
+                (and (= emph "impact") (contains? #{"action" "tense"} tone))
+                (with-layout-defaults p {"gh:angle" -8 "gh:bleed" "right"})
+
+                (= emph "punchline")
+                (with-layout-defaults p {"gh:bleed" "bottom"})
+
+                :else p)))
+          panels)
+
+    "dialogue_heavy"
+    (mapv (fn [p]
+            (if (= "small" (get-in p ["panelLayout" "gh:size"] "medium"))
+              (assoc-in p ["panelLayout" "gh:size"] "medium")
+              p))
+          panels)
+
+    ;; standard_grid & anything else: no changes
+    (vec panels)))
+
+(defn page-arc-summary
+  "One-line narrative summary of the page for prompt injection."
+  [panels layout-type]
+  (if (empty? panels)
+    ""
+    (let [title  (get (first panels) "pageTitle" "")
+          prefix (case layout-type
+                   "single_dramatic" "Single dramatic page"
+                   "action_sequence" "Action sequence page"
+                   "dialogue_heavy"  "Dialogue scene page"
+                   "Story page")]
+      (if (seq title) (str prefix ": " title) prefix))))

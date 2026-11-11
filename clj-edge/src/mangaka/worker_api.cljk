@@ -1,0 +1,36 @@
+(ns mangaka.worker-api
+  "JS-boundary adapter for the mangaka EDGE Worker (ClojureScript only). Wraps
+  the pure mangaka.core SSoT with js->clj/clj->js. The ns shadow :worker exports."
+  (:require [mangaka.core :as core]))
+
+(defn- ->clj [x] (js->clj x :keywordize-keys true))
+(defn- ->js  [x] (clj->js x))
+
+(defn character->tx-edn   [in] (core/character->tx-edn (->clj in)))
+(defn work->tx-edn        [in] (core/work->tx-edn (->clj in)))
+(defn environment->tx-edn [in] (core/environment->tx-edn (->clj in)))
+(defn chapter->tx-edn     [in] (core/chapter->tx-edn (->clj in)))
+(defn page->tx-edn        [in] (core/page->tx-edn (->clj in)))
+(defn panel->tx-edn       [in] (core/panel->tx-edn (->clj in)))
+(defn character->d1   [owner in] (->js (core/entity->d1 owner (core/build-character (->clj in)))))
+(defn work->d1        [owner in] (->js (core/entity->d1 owner (core/build-work (->clj in)))))
+(defn environment->d1 [owner in] (->js (core/entity->d1 owner (core/build-environment (->clj in)))))
+(defn chapter->d1     [owner in] (->js (core/entity->d1 owner (core/build-chapter (->clj in)))))
+(defn page->d1        [owner in] (->js (core/entity->d1 owner (core/build-page (->clj in)))))
+(defn panel->d1       [owner in] (->js (core/entity->d1 owner (core/build-panel (->clj in)))))
+
+(def q-list-characters core/q-list-characters)
+(def q-list-works core/q-list-works)
+(def q-list-environments core/q-list-environments)
+(defn q-chapters-for-work [work-id] (core/q-chapters-for-work work-id))
+(defn q-pages-for-chapter [chapter-id] (core/q-pages-for-chapter chapter-id))
+(defn q-panels-for-page [page-id] (core/q-panels-for-page page-id))
+(defn lookup-ref [kind id] (core/lookup-ref kind id))
+(def entity-pull-edn core/entity-pull-edn)
+
+(defn shape-pull-rows [rows] (->js (core/shape-pull-rows (->clj rows))))
+(defn pulled-entity [s] (->js (core/pulled-entity s)))
+(defn paginate [items k offset limit] (->js (core/paginate (->clj items) (keyword k) offset limit)))
+(defn gen-rkey [prefix] (core/gen-rkey prefix))
+(defn slug [s] (core/slug s))
+(defn vertex-id [kind rkey] (core/vertex-id kind rkey))

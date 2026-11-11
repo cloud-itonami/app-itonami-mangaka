@@ -1,0 +1,58 @@
+(ns mangaka.graphs.detect-faces
+  "detectFaces — 実装版 (ADR-2607164200 addendum 3)。
+
+  これまで compat.cljc の cljc-placeholder (固定矩形 :method
+  \"cljc-placeholder\") が名前だけ立てていた NSID を、mangaka.perception の
+  VLM 検出 (fleet gemma4) で置き換える。応答 shape は placeholder と互換
+  (:status/:docId/:faces/:perImage/:method) — 既存呼び出し側は壊れない。
+
+  Input: {:panel-id \"panel-…\"} (単一 render) または {:doc-id \"…\"}
+  (その doc の全 render)。検出できた顔は :panel/faces datom (pr-str) として
+  panel entity にも焼き込む — 下流 (吹き出し配置の顔回避、
+  perception/bubble-clearance) が再検出なしで使えるように。
+
+  offline (vision なし) は各 render の faces が nil になり、:method
+  \"no-vision-offline\" で正直に報告する — 固定矩形を検出結果のふりをして
+  返さない (placeholder との決定的な違い)。"
+  (:require [mangaka.blob :as blob]
+            [mangaka.graphs.util :as util]
+            [mangaka.perception :as perception]
+            [mangaka.store :as store]))
+
+(defn- bad! [msg] (throw (ex-info msg {:type :bad-input})))
+
+(defn- panel-image [store blobs pid]
+  (let [p (store/load-panel store pid)]
+    (or (when (and blobs (:panel/image-key p))
+          (:b64 (blob/fetch blobs (:panel/image-key p))))
+        (:panel/image-b64 p))))
+
+(defn make
+  "opts (optional): {:detect-fn (fn [image-b64] → faces|nil)} — テスト注入用、
+  既定は perception/detect-faces (VLM)。"
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [detect-fn]}]
+   (let [detect (or detect-fn perception/detect-faces)]
+     (util/single-node :detect-faces
+       (fn [{:keys [input]}]
+         (let [pid (or (:panel-id input) (:panel_id input) (:panelId input))
+               doc-id (or (:doc-id input) (:doc_id input) (:docId input))
+               _ (when (and (nil? pid) (nil? doc-id))
+                   (bad! "provide :panel-id or :doc-id"))
+               t0 #?(:clj (System/currentTimeMillis) :cljs 0)
+               ids (if pid [pid]
+                       (map :id (store/renders-for-document store doc-id)))
+               per (into {}
+                         (map (fn [id] [id (detect (panel-image store blobs id))]))
+                         ids)
+               detected? (boolean (some some? (vals per)))]
+           ;; 検出できた顔は panel entity に焼き込む (下流の顔回避用)
+           (doseq [[id faces] per :when (some? faces)]
+             (store/save-panel! store {:id id :faces (pr-str faces)}))
+           {:status "ok" :docId doc-id :panelId pid
+            :faces (if pid (or (get per pid) []) [])
+            :perImage per
+            :method (if detected? "vlm" "no-vision-offline")
+            :latencyMs #?(:clj (- (System/currentTimeMillis) t0) :cljs 0)}))))))
+
+(def handler util/result-handler)

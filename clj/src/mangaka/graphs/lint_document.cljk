@@ -1,0 +1,95 @@
+(ns mangaka.graphs.lint-document
+  "lintDocument — deterministic storyboard QA over the decomposed datoms.
+  Flags authoring problems that a generator / preview / KAMI frame would
+  otherwise hit silently:
+
+    :empty-page        the document has no panels
+    :duplicate-index   two panels share a :panel/index
+    :missing-rect      (warn) a panel has no :panel/rect — it falls back to a
+                       default stacked position, so it renders but isn't placed
+    :rect-out-of-bounds (error) a panel's rect [x y w h] runs off the page (x+w
+                       or y+h > 1, or a negative/zero dimension) — renders clipped
+    :unknown-character a focal ref points at a character not in the cast
+                       (\":character/Nei\" → expected id \"char-nei\", the
+                        canonical id both generate_character and
+                        import_ghosthacker derive — so a typo'd ref shows up)
+    :unknown-scene     a :panel/scene points at a scene that doesn't exist
+                       (e.g. a deleted/typo'd ref — it would compose no
+                        background into the doc-aware render, silently)
+
+  No LLM — pure structural checks, so it runs offline and is fully
+  deterministic. Requires :doc-id. Returns
+  {:doc-id :ok :issues [{:code :severity :panel? :message}] :count}."
+  (:require [kotoba.lang.text :as str]
+            [mangaka.graphs.util :as util]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]))
+
+(defn- char-id-for-ref
+  "The canonical character id a focal ref resolves to: \":character/Nei\" →
+  \"char-nei\" (matches generate_character / import_ghosthacker id-space)."
+  [ref]
+  (str "char-" (str/lower (domain/focal-name ref))))
+
+(defn lint-page
+  "Pure: page + the sets of known character ids and scene ids → issue maps."
+  [page known-char-ids known-scene-ids]
+  (let [panels  (vec (:page/panels page))
+        dup-idx (->> (map :panel/index panels)
+                     (remove nil?)
+                     frequencies
+                     (filter (fn [[_ n]] (> n 1)))
+                     (map first)
+                     sort vec)]
+    (vec
+     (concat
+      (when (empty? panels)
+        [{:code :empty-page :severity :warn :message "document has no panels"}])
+      (when (seq dup-idx)
+        [{:code :duplicate-index :severity :error
+          :message (str "panels share indices: " dup-idx)}])
+      (for [p panels
+            issue (concat
+                   ;; missing rect → renders at a default stacked position
+                   ;; (panel-rect), so it's a warning (not positioned), not broken
+                   (when-not (:panel/rect p)
+                     [{:code :missing-rect :severity :warn :panel (:panel/index p)
+                       :message "panel has no :panel/rect — it will use a default stacked position"}])
+                   ;; rect is [x y w h] normalized 0..1; an out-of-bounds rect
+                   ;; renders OFF the page (clipped) — that's an error, not a warning
+                   (when-let [[x y w h] (:panel/rect p)]
+                     (when (or (neg? x) (neg? y) (not (pos? w)) (not (pos? h))
+                               (> (+ x w) 1.000001) (> (+ y h) 1.000001))
+                       [{:code :rect-out-of-bounds :severity :error :panel (:panel/index p)
+                         :message (str "panel rect extends outside the page: " (:panel/rect p))}]))
+                   (when-let [sid (:panel/scene p)]
+                     (when-not (contains? known-scene-ids sid)
+                       [{:code :unknown-scene :severity :warn :panel (:panel/index p)
+                         :message (str "panel scene not found: " sid)}]))
+                   (for [ref (:panel/focal p)
+                         :when (not (contains? known-char-ids (char-id-for-ref ref)))]
+                     {:code :unknown-character :severity :warn :panel (:panel/index p)
+                      :message (str "focal character not in cast: " ref)}))]
+        issue)))))
+
+(defn make [store]
+  (util/single-node
+   :lint
+   (fn [{:keys [input]}]
+     (domain/require-input! input [:doc-id])
+     (let [doc (or (store/load-document store (:doc-id input))
+                   (throw (ex-info (str "document not found: " (:doc-id input))
+                                   {:type :bad-input})))
+           known-chars  (set (map :id (store/list-characters store)))
+           known-scenes (set (map :id (store/list-scenes store)))
+           issues (lint-page (:page doc) known-chars known-scenes)
+           by-sev (frequencies (map :severity issues))]
+       {:doc-id (:doc-id input)
+        :ok (empty? issues)                 ; clean = no issues at all
+        :renderable (zero? (:error by-sev 0)) ; no *errors* → it lays out / renders
+        :issues issues
+        :count (count issues)
+        :errors (:error by-sev 0)
+        :warnings (:warn by-sev 0)}))))
+
+(def handler util/result-handler)

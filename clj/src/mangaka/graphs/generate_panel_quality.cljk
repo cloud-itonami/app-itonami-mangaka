@@ -1,0 +1,204 @@
+(ns mangaka.graphs.generate-panel-quality
+  "mangakaGeneratePanelQuality — 多候補品質ループ (ADR-2607164200)。
+
+  generate-panel-loop (単一候補の plan→render→score→revise) の上位互換で、
+  Python 時代の composeScene3d topology (lg/scripts/demo_outputs/) が持って
+  いた品質ハーネスの核 — 候補 fan-out + 8軸ルーブリック vision critique +
+  DMN refine gate — をパネル生成へ先行適用する:
+
+    plan → render-candidates → critique → (router) → refine → render-candidates…
+                                        └→ finish
+
+  langgraph-clj には Send 型 fan-out primitive が無い (Pregel は逐次・単一
+  スレッド前提) ので、fan-out は :render-candidates 1 ノード内での N 候補
+  mapv で表現する (composeScene3d の `Send(per pose_plan key)` の CLJ 表現)。
+  DMN policy (composeScene3dRefinement) は router 述語 — 最良候補が
+  :score-threshold に達したか round budget を使い切ったら :finish、
+  それ以外は :refine が最良候補の :fix-hint を prompt に畳み込み seed を
+  候補数ぶん進めて再挑戦 — として符号化する。
+
+  critique は候補ごとに composeScene3d の 8 軸ルーブリック (composition /
+  silhouette / characterRecognizability / framing / mangaShotGrammar /
+  lightingDrama / actionClarity / emotionAlignment、各 0–1) を採点させ、
+  集約 (平均×100 → 0–100、:panel/score と同スケール) で選抜する。offline /
+  mock では verdict が nil → score nil = no signal として扱い、決して
+  クラッシュせず budget 消尽で完走する (generate-panel-loop と同じ規約)。
+
+  :character 入力があり、その cast の LoRA が学習済み (store の :model/*
+  entity に :model/lora-cid が載っている — trainCharacterLora の register
+  出力) なら、spec に :lora {:id :cid} を通す (render 経路への forwards-
+  compatible passthrough; ADR-2607155500 の :character-lora-cid)。
+
+  Input: generate-panel と同じ (:prompt/:tags/:negative/:seed/:width/
+  :height/:model | :doc-id+:panel-index) に加えて :candidates (default 3)、
+  :max-rounds (default 2)、:score-threshold (default 80)、:character
+  (optional — LoRA 解決キー)。全 round・全候補は :rounds に監査証跡として
+  残る (どの prompt/seed がどの axes/score だったか)。"
+  (:require [mangaka.blob :as blob]
+            [mangaka.comfy :as comfy]
+            [mangaka.critique :as critique]
+            [mangaka.graphs.generate-panel :as panel]
+            [mangaka.models :as models]
+            [mangaka.perception :as perception]
+            [mangaka.store :as store]
+            [langgraph.graph :as g]))
+
+(def ^:private default-candidates 3)
+(def ^:private default-max-rounds 2)
+(def ^:private default-score-threshold 80)
+
+;; rubric-axes / critique-prompt / aggregate-score / best-of moved to
+;; mangaka.critique (ADR: shared with generate-panel-video's seedance frame
+;; fan-out) -- re-exported here so existing call sites in this ns keep working.
+(def rubric-axes critique/rubric-axes)
+(def critique-prompt critique/critique-prompt)
+
+(defn- offload
+  "Same offload-to-blob-store shape as mangaka.graphs.gen (kept local, like
+  generate-panel-loop, so node fns don't reach into that ns's private helper)."
+  [blobs render]
+  (if (and blobs (:image-b64 render))
+    (let [k (blob/put! blobs (:image-b64 render) (:mime render))]
+      (assoc render :image-key k :image-url (str "/blob/" k)))
+    render))
+
+(defn- candidate-image [blobs {:keys [image-key image-b64]}]
+  (or (when (and blobs image-key) (:b64 (blob/fetch blobs image-key))) image-b64))
+
+(def aggregate-score critique/aggregate-score)
+
+(defn- score-candidate
+  "Act→Observe for one candidate: vision-critique its render against the
+  rubric, then augment with the perception axes (:facePresence — VLM 顔検出
+  vs storyboard の期待 focal 数; offline は軸ごと欠けるだけで壊れない)。
+  Score preference: axes aggregate (faithful to the rubric), else the
+  model's own :score if it offered one, else nil (= no signal)."
+  [blobs critique-fn detect-fn {:keys [spec render]}]
+  (let [img (candidate-image blobs render)
+        verdict (critique-fn spec img)
+        axes (perception/augment-axes (:axes verdict) spec img detect-fn)]
+    (merge {:spec spec :seed (:seed spec)
+            :score nil :axes nil :notes "no vision model (offline/mock)"
+            :image-key (:image-key render) :image-url (:image-url render)
+            :source (:source render)
+            :image-b64 (:image-b64 render) :mime (:mime render)}
+           verdict
+           {:axes axes
+            :score (or (aggregate-score axes) (:score verdict))
+            :fix-hint (or (:fix-hint verdict) (:fix_hint verdict))})))
+
+(def ^:private best-of critique/best-of)
+
+(defn- with-lora
+  "Attaches :lora {:id :cid} to the spec when the input names a :character
+  whose LoRA has actually been trained (store entity carries :model/lora-cid).
+  A merely :planned/:queued slot adds nothing — generation must not reference
+  weights that don't exist yet."
+  [store input spec]
+  (if-let [slot (models/character-lora (:character input))]
+    (let [trained (store/load-model store (:model/id slot))
+          cid (:model/lora-cid trained)]
+      (if (seq (str cid))
+        (assoc spec :lora {:id (:model/id slot) :cid cid})
+        spec))
+    spec))
+
+(defn- revise-spec
+  "Refine gate's back-edge payload: folds the winning candidate's :fix-hint
+  into the positive prompt and advances the seed past this round's candidate
+  block so the next round explores fresh samples."
+  [n spec {:keys [fix-hint notes]}]
+  (-> spec
+      (update :prompt #(if (seq fix-hint) (str % ", " fix-hint) %))
+      (update :seed #(+ (or % 0) (max 1 n)))
+      (vary-meta assoc ::from-critique notes)))
+
+(defn- done? [{:keys [max-rounds score-threshold]} rounds]
+  (let [best (:best (peek rounds))]
+    (or (>= (count rounds) max-rounds)
+        (boolean (and (:score best) (>= (:score best) score-threshold))))))
+
+(defn make
+  "opts (optional):
+   {:critique-fn (fn [spec image-b64] → verdict-map|nil)  ; rubric judge
+    :detect-fn   (fn [image-b64] → faces|nil)}            ; 顔検出 (知覚軸)
+  injectable for deterministic tests; defaults are the live vision model
+  (llm/vision-json + rubric prompt) and perception/detect-faces — both
+  degrade to nil offline."
+  ([store blobs] (make store blobs {}))
+  ([store blobs {:keys [critique-fn detect-fn]}]
+   (let [critique-fn (or critique-fn critique/default-critique-fn)]
+     (-> (g/state-graph {:channels {:input {} :spec {} :candidates {}
+                                    :rounds {:reducer into :default []}
+                                    :result {}}})
+         (g/add-node :plan
+                     (fn [{:keys [input]}]
+                       {:spec (with-lora store input (panel/plan* store input))}))
+         (g/add-node :render-candidates
+                     (fn [{:keys [input spec]}]
+                       (let [n (or (:candidates input) default-candidates)]
+                         {:candidates
+                          (mapv (fn [i]
+                                  (let [s (assoc spec :seed (+ (or (:seed spec) 0) i))]
+                                    {:spec s
+                                     :render (offload blobs (comfy/render-panel
+                                                             (comfy/fresh-scratch) s))}))
+                                (range (max 1 n)))})))
+         (g/add-node :critique
+                     (fn [{:keys [candidates]}]
+                       (let [scored (mapv #(score-candidate blobs critique-fn detect-fn %)
+                                          candidates)]
+                         {:rounds [{:candidates scored :best (best-of scored)}]})))
+         (g/add-node :refine
+                     (fn [{:keys [input spec rounds]}]
+                       {:spec (revise-spec (or (:candidates input) default-candidates)
+                                           spec (:best (peek rounds)))}))
+         (g/add-node :finish
+                     (fn [{:keys [input spec rounds]}]
+                       (let [all (mapcat :candidates rounds)
+                             best (best-of all)
+                             idx (or (:panel-index input) (:index input))
+                             pid (or (:panel-id input)
+                                     (when (:doc-id input) (str "panel-" (:doc-id input) "-" idx))
+                                     (str "panel-" (hash [(:prompt (:spec best)) (:seed best)])))
+                             threshold (or (:score-threshold input) default-score-threshold)]
+                         (store/save-panel! store
+                                            {:id pid :doc-id (:doc-id input) :index idx
+                                             :prompt (:prompt (:spec best)) :seed (:seed best)
+                                             :model (:model (:spec best))
+                                             :score (:score best)
+                                             :critique (pr-str {:axes (:axes best) :notes (:notes best)
+                                                                :rounds (count rounds)})
+                                             :image-key (:image-key best)
+                                             :image-b64 (when-not (:image-key best)
+                                                          (candidate-image blobs best))
+                                             :image-mime (or (:mime best) "image/png")})
+                         {:result {:panel-id pid :doc-id (:doc-id input) :index idx
+                                   :best best :rounds (vec rounds)
+                                   :round-count (count rounds)
+                                   :candidates-per-round (or (:candidates input) default-candidates)
+                                   :lora (:lora spec)
+                                   :converged? (boolean (and (:score best)
+                                                             (>= (:score best) threshold)))}})))
+         (g/set-entry-point :plan)
+         (g/add-edge :plan :render-candidates)
+         (g/add-edge :render-candidates :critique)
+         (g/add-conditional-edges :critique
+                                  (fn [{:keys [input rounds]}]
+                                    (if (done? {:max-rounds (or (:max-rounds input) default-max-rounds)
+                                                :score-threshold (or (:score-threshold input)
+                                                                     default-score-threshold)}
+                                               rounds)
+                                      :finish
+                                      :refine))
+                                  {:finish :finish :refine :refine})
+         (g/add-edge :refine :render-candidates)
+         (g/set-finish-point :finish)
+         (g/compile-graph)))))
+
+(defn handler
+  "Input validation happens inside generate-panel's `plan*` at :plan-node time
+  (same :bad-input ex-info shape as generate-panel / generate-panel-loop)."
+  [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))

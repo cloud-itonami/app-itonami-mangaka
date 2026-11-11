@@ -1,0 +1,50 @@
+(ns mangaka.graphs.compose-komawari
+  "composeKomawari — proposes komawari (panel-division) geometry for a page
+  from an authored beat sequence and persists it, following this repo's
+  actor discipline even though it's not an LLM actor: a `:plan` step
+  *proposes* geometry, a `:govern` step validates the proposal, and
+  `:persist` writes it ONLY if the governor is satisfied — an unauthorized
+  layout is returned for inspection (with its SVG preview and violation
+  list) but never reaches the store. Requires :id + :rows; optional :style
+  (:toriyama default / :togashi, ADR-2607051530) and :gutter pass straight
+  through to `mangaka.layout.komawari/propose-page-layout` (see there for the
+  beat/row schema). See `mangaka.graphs.gen` for why this ISN'T built on that
+  scaffold (no comfy render — this graph computes geometry, not pixels)."
+  (:require [langgraph.graph :as g]
+            [mangaka.layout.komawari :as komawari]
+            [mangaka.domain :as domain]
+            [mangaka.store :as store]
+            [mangaka.preview :as preview]))
+
+(def ^:private page-keys [:page/number :page/title :page/layout :page/base-tags :page/negative-tags])
+
+(defn- plan [input]
+  (domain/require-input! input [:id :rows])
+  (merge (select-keys input page-keys)
+         {:page/panels (komawari/propose-page-layout (:rows input) (select-keys input [:gutter :style]))}))
+
+(defn make [store]
+  (-> (g/state-graph {:channels {:input {} :proposed {} :report {} :svg {} :result {}}})
+      (g/add-node :plan    (fn [{:keys [input]}] {:proposed (plan input)}))
+      (g/add-node :govern  (fn [{:keys [proposed]}] {:report (komawari/validate-layout (:page/panels proposed))}))
+      (g/add-node :render  (fn [{:keys [proposed]}] {:svg (preview/page->svg proposed)}))
+      (g/add-node :persist (fn [{:keys [input proposed report svg]}]
+                             {:result
+                              (if (:ok? report)
+                                (do (domain/valid-page! proposed)
+                                    (assoc (store/save-document! store {:id (:id input)
+                                                                        :kind (:kind input "storyboard")
+                                                                        :title (:title input)
+                                                                        :page proposed})
+                                           :report report :svg svg :page proposed))
+                                {:id (:id input) :ok false :report report :page proposed :svg svg})}))
+      (g/set-entry-point :plan)
+      (g/add-edge :plan :govern)
+      (g/add-edge :govern :render)
+      (g/add-edge :render :persist)
+      (g/set-finish-point :persist)
+      (g/compile-graph)))
+
+(defn handler [compiled]
+  (fn [input _thread-id]
+    (:result (g/invoke compiled {:input input}))))
