@@ -1,0 +1,100 @@
+(ns mangaka-reader.img
+  "GET /img/<key> resolution: R2 binding (legacy) or IMG_ORIGIN upstream.
+
+  The reader used to serve every page image from R2 (ai-gftd-cdn, key
+  `blobs/mng4k4x1.gftd.ai/<key>`) and a bucket that no longer exists made
+  /img a 500 (`get: The specified bucket does not exist.`). With the
+  `IMG_ORIGIN` var set, the Worker fetches `<IMG_ORIGIN>/<key>` instead
+  and the R2 binding is never touched; unset it and the legacy R2 path
+  below is used as before.
+
+  Either route failing resolves to 404
+  `{\"error\":\"image-unavailable\",\"key\":…,\"source\":\"origin\"|\"r2\"}`
+  — never the raw backend error surfaced as a 500. Keys are validated
+  (no leading `/`, no `..`, no backslash, no blank, no control chars) so a
+  crafted path cannot escape the image store."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:dynamic *fetch*
+  "Fetch injection point — defaults to the Worker's js/fetch. Tests bind a
+  stub so no network is touched."
+  (fn [url] (js/fetch url)))
+
+(def ^:private blob-prefix "blobs/mng4k4x1.gftd.ai/")
+
+(defn img-key-valid?
+  "True when `key` is a safe blob key: non-blank, no leading `/`, no
+  backslash, no `..` anywhere, and no control characters (C0 + DEL). This
+  is the path-traversal guard for /img/<key>."
+  [key]
+  (and (string? key)
+       (not (str/blank? key))
+       (not (str/starts-with? key "/"))
+       (not (str/includes? key "\\"))
+       (not (str/includes? key ".."))
+       (not (str/re-find #"[\u0000-\u001F\u007F]" key))))
+
+(defn img-origin-url
+  "Join IMG_ORIGIN and key with exactly one `/` (a trailing slash on the
+  origin is stripped first)."
+  [origin key]
+  (str (str/replace origin #"/+$" "") "/" key))
+
+(defn image-unavailable
+  "404 body when the configured route failed. `source` says which route was
+  tried: \"origin\" (IMG_ORIGIN set) or \"r2\" (unset, legacy binding)."
+  [key source]
+  {:error "image-unavailable" :key key :source source})
+
+(defn- json-response [m status]
+  (js/Response. (js/JSON.stringify (clj->js m))
+                (clj->js {:status status
+                          :headers {"content-type" "application/json; charset=utf-8"
+                                    "access-control-allow-origin" "*"}})))
+
+(defn- img-response [body content-type cache-control]
+  (js/Response. body
+                (clj->js {:headers {"content-type" content-type
+                                    "cache-control" cache-control
+                                    "access-control-allow-origin" "*"}})))
+
+(defn- unavailable [key source]
+  (json-response (image-unavailable key source) 404))
+
+(defn- origin-img [origin key]
+  (-> (*fetch* (img-origin-url origin key))
+      (.then (fn [^js res]
+               (if (.-ok res)
+                 (img-response (.-body res)
+                               (or (.get (.-headers res) "content-type") "image/png")
+                               "public, max-age=300")
+                 (unavailable key "origin"))))
+      (.catch (fn [_] (unavailable key "origin")))))
+
+(defn- r2-img [^js env key]
+  (-> (.get ^js (.-CDN ^js env) (str blob-prefix key))
+      (.then (fn [^js obj]
+               (if obj
+                 (img-response (.-body obj)
+                               (or (some-> obj .-httpMetadata .-contentType) "image/png")
+                               "public, max-age=31536000, immutable")
+                 (unavailable key "r2"))))
+      (.catch (fn [_] (unavailable key "r2")))))
+
+(defn handle-img
+  "Serve GET /img/<key>. IMG_ORIGIN set (non-blank) → upstream fetch, 200
+  passthrough with `public, max-age=300`; unset → legacy R2 binding with
+  the immutable cache. Keys failing img-key-valid? are rejected with 400
+  before either route runs; any route failure is a 404 image-unavailable,
+  never a 500."
+  [env key]
+  (let [origin (or (.-IMG_ORIGIN ^js env) "")]
+    (cond
+      (not (img-key-valid? key))
+      (js/Promise.resolve (json-response {:error "invalid-key" :key key} 400))
+
+      (str/blank? origin)
+      (r2-img env key)
+
+      :else
+      (origin-img origin key))))

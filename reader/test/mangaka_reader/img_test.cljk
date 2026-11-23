@@ -1,0 +1,160 @@
+(ns mangaka-reader.img-test
+  "GET /img/<key> resolution (mangaka-reader.img) — fetch and R2 are stubbed,
+  no network is touched."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [mangaka-reader.img :as img]))
+
+(defn- body->json [body]
+  (js->clj (js/JSON.parse body) :keywordize-keys true))
+
+(defn- cr
+  "Catch handler for an async test: a rejection fails the test and finishes
+  it so the suite never hangs."
+  [done]
+  (fn [e] (is false (str "unexpected reject: " e)) (done)))
+
+(defn- check-body
+  "Read the response body as text and call `f` with it, then finish."
+  [res done f]
+  (-> (.text res)
+      (.then (fn [body] (f body) (done)))
+      (.catch (cr done))))
+
+(deftest key-validation
+  (testing "safe blob keys pass"
+    (is (img/img-key-valid? "gh-arc0-1-v11-p01"))
+    (is (img/img-key-valid? "zankyo-1-p01")))
+  (testing "path traversal is rejected"
+    (is (not (img/img-key-valid? "..")))
+    (is (not (img/img-key-valid? "../secret")))
+    (is (not (img/img-key-valid? "a/../b")))
+    (is (not (img/img-key-valid? "..\\secret"))))
+  (testing "leading slash / empty / blank are rejected"
+    (is (not (img/img-key-valid? "/abs")))
+    (is (not (img/img-key-valid? "")))
+    (is (not (img/img-key-valid? "   "))))
+  (testing "control characters are rejected"
+    (is (not (img/img-key-valid? "a\u0000b")))
+    (is (not (img/img-key-valid? "a\u0009b")))
+    (is (not (img/img-key-valid? "a\u007Fb")))))
+
+(deftest origin-success
+  (let [seen (atom nil)
+        fake-fetch (fn [url]
+                     (reset! seen url)
+                     (js/Promise.resolve
+                      (js/Response. "PNGDATA"
+                                    #js {:headers #js {"content-type" "image/png"}})))]
+    (async done
+      (binding [img/*fetch* fake-fetch]
+        (-> (img/handle-img #js {:IMG_ORIGIN "https://img.example.com/"} "gh-arc0-1-v11-p01")
+            (.then (fn [res]
+                     (is (= 200 (.-status res)))
+                     (is (= "https://img.example.com/gh-arc0-1-v11-p01" @seen))
+                     (is (= "image/png" (.get (.-headers res) "content-type")))
+                     (is (= "public, max-age=300" (.get (.-headers res) "cache-control")))
+                     (check-body res done
+                                 #(is (= "PNGDATA" %)))))
+            (.catch (cr done)))))))
+
+(deftest r2-success-without-origin
+  (let [env #js {:CDN #js {:get (fn [_k]
+                                   (is (= "blobs/mng4k4x1.gftd.ai/gh-arc0-1-v11-p01" _k))
+                                   (js/Promise.resolve
+                                    #js {:body "R2DATA"
+                                         :httpMetadata #js {:contentType "image/png"}}))}}]
+    (async done
+      (-> (img/handle-img env "gh-arc0-1-v11-p01")
+          (.then (fn [res]
+                   (is (= 200 (.-status res)))
+                   (is (= "image/png" (.get (.-headers res) "content-type")))
+                   (is (= "public, max-age=31536000, immutable"
+                          (.get (.-headers res) "cache-control")))
+                   (check-body res done #(is (= "R2DATA" %)))))
+          (.catch (cr done))))))
+
+(deftest empty-origin-means-r2
+  (let [env #js {:IMG_ORIGIN ""
+                 :CDN (js-obj "get" (fn [_k] (js/Promise.resolve
+                                              #js {:body "R2DATA"
+                                                   :httpMetadata #js {:contentType "image/png"}})))}]
+    (async done
+      (-> (img/handle-img env "k")
+          (.then (fn [res]
+                   (is (= 200 (.-status res)))
+                   (done)))
+          (.catch (cr done))))))
+
+(deftest failure-is-404-never-500
+  (async done
+    (binding [img/*fetch* (fn [_url] (js/Promise.reject (js/Error. "network down")))]
+      (-> (img/handle-img #js {:IMG_ORIGIN "https://img.example.com"} "gh-arc0-1-v11-p01")
+          (.then (fn [res]
+                   (is (= 404 (.-status res)))
+                   (is (not= 500 (.-status res)))
+                   (check-body res done
+                               (fn [body]
+                                 (let [m (body->json body)]
+                                   (is (= "image-unavailable" (:error m)))
+                                   (is (= "gh-arc0-1-v11-p01" (:key m)))
+                                   (is (= "origin" (:source m))))))))
+          (.catch (cr done))))))
+
+(deftest missing-object-is-404-never-500
+  (let [env #js {:CDN #js {:get (fn [_k] (js/Promise.resolve nil))}}]
+    (async done
+      (-> (img/handle-img env "gh-arc0-1-v11-p01")
+          (.then (fn [res]
+                   (is (= 404 (.-status res)))
+                   (is (not= 500 (.-status res)))
+                   (check-body res done
+                               (fn [body]
+                                 (let [m (body->json body)]
+                                   (is (= "image-unavailable" (:error m)))
+                                   (is (= "r2" (:source m))))))))
+          (.catch (cr done))))))
+
+(deftest upstream-non-ok-is-404-never-500
+  (let [fake-fetch (fn [_url]
+                     (js/Promise.resolve
+                      (js/Response. "gone" #js {:status 404})))]
+    (async done
+      (binding [img/*fetch* fake-fetch]
+        (-> (img/handle-img #js {:IMG_ORIGIN "https://img.example.com"} "gh-arc0-1-v11-p01")
+            (.then (fn [res]
+                     (is (= 404 (.-status res)))
+                     (is (not= 500 (.-status res)))
+                     (check-body res done
+                                 (fn [body]
+                                   (let [m (body->json body)]
+                                     (is (= "image-unavailable" (:error m)))
+                                     (is (= "origin" (:source m))))))))
+            (.catch (cr done)))))))
+
+(deftest r2-throw-is-404-never-500
+  (let [env #js {:CDN #js {:get (fn [_k]
+                                   (js/Promise.reject
+                                    (js/Error. "get: The specified bucket does not exist.")))}}]
+    (async done
+      (-> (img/handle-img env "gh-arc0-1-v11-p01")
+          (.then (fn [res]
+                   (is (= 404 (.-status res)))
+                   (is (not= 500 (.-status res)))
+                   (check-body res done
+                               (fn [body]
+                                 (let [m (body->json body)]
+                                   (is (= "image-unavailable" (:error m)))
+                                   (is (= "r2" (:source m))))))))
+          (.catch (cr done))))))
+
+(deftest invalid-key-rejected-before-any-route
+  (let [boom (fn [_] (js/Promise.reject (js/Error. "must not be called")))
+        env #js {:IMG_ORIGIN "https://img.example.com"
+                 :CDN #js {:get boom}}]
+    (async done
+      (binding [img/*fetch* boom]
+        (-> (img/handle-img env "../secret")
+            (.then (fn [res]
+                     (is (= 400 (.-status res)))
+                     (done)))
+            (.catch (cr done)))))))

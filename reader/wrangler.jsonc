@@ -21,6 +21,14 @@
   "r2_buckets": [
     { "binding": "CDN", "bucket_name": "ai-gftd-cdn" }
   ],
+  // GET /img/<key> resolution — when IMG_ORIGIN is set (non-blank) the Worker
+  // fetches `<IMG_ORIGIN>/<key>` instead of the R2 binding (mangaka-reader.img).
+  // Empty = legacy R2 path (blobs/mng4k4x1.gftd.ai/<key> in bucket ai-gftd-cdn).
+  // Production sets the value at deploy time, e.g.
+  //   wrangler deploy --var IMG_ORIGIN:https://img.example.com
+  "vars": {
+    "IMG_ORIGIN": ""
+  },
   // Serves the public reader at manga.gftd.ai (route reassigned from the
   // empty placeholder worker magatama-mg5k2n7x, 2026-06-16).
   // itonami.cloud 配下に出すが、**静的サイト面ではなく service 面**に出す。
