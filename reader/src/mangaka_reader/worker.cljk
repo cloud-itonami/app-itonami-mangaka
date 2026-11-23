@@ -4,11 +4,12 @@
   :esm build emits `export default { fetch }`.
 
   Bindings (wrangler.jsonc): MANGAKA_DB (D1), CDN (R2),
-  MANGAKA_ADMIN_TOKEN (secret — studio write auth, ADR-2607071100 ③)."
+  MANGAKA_ADMIN_TOKEN (secret — studio write auth, ADR-2607071100 ③).
+  Optional var IMG_ORIGIN — when set, /img/<key> fetches `<IMG_ORIGIN>/<key>`
+  instead of the R2 binding (see mangaka-reader.img); unset = legacy R2."
   (:require [kotoba.lang.text :as str]
+            [mangaka-reader.img :as img]
             [mangaka-reader.render :as render]))
-
-(def ^:private blob-prefix "blobs/mng4k4x1.gftd.ai/")
 
 (def ^:private api-cors
   {"access-control-allow-origin" "*"
@@ -114,14 +115,7 @@
                               (html-response (render/index-html works))))))))))
 
 (defn- handle-img [env key]
-  (-> (.get ^js (.-CDN ^js env) (str blob-prefix key))
-      (.then (fn [^js obj]
-               (if-not obj
-                 (js/Response. "not found" #js {:status 404})
-                 (js/Response. (.-body obj)
-                               (clj->js {:headers {"content-type" (or (some-> obj .-httpMetadata .-contentType) "image/png")
-                                                   "cache-control" "public, max-age=31536000, immutable"
-                                                   "access-control-allow-origin" "*"}})))))))
+  (img/handle-img env key))
 
 (defn- handle-work [env rkey]
   (-> (work-row env rkey)
