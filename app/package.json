@@ -8,7 +8,8 @@
     "title": "mangaka (漫画家) — AI manga publishing and reworking",
     "source": "app-itonami-mangaka",
     "catalog": "https://mangaka.itonami.cloud/api",
-    "origin": "https://mangaka.itonami.cloud"
+    "origin": "https://mangaka.itonami.cloud",
+    "online": true
   },
   "scripts": {
     "build": "node scripts/build.mjs",
