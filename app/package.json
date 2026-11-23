@@ -1,0 +1,24 @@
+{
+  "name": "@itonami/mangaka",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "itonami": {
+    "id": "network.itonami.mangaka",
+    "title": "mangaka (漫画家) — AI manga publishing and reworking",
+    "source": "app-itonami-mangaka",
+    "catalog": "https://mangaka.itonami.cloud/api",
+    "origin": "https://mangaka.itonami.cloud",
+    "online": true
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "tauri": "tauri",
+    "build:desktop": "npm run build && tauri build --no-bundle",
+    "build:android": "sh scripts/android-apk.sh"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "3.0.0-alpha.6"
+  }
+}
