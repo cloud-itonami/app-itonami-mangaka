@@ -1,6 +1,17 @@
 # reader ビルドツールチェーン（実測記録）
 
-**結論（2026-11-23 実測）**: `npm run build`（= `amu compile --target wasm32-browser worker redirect`）は
+**結論（2026-11-24 更新）**: **ビルドは不要になりました**。Reader は plain JS の Worker
+（`src/worker.js`、依存ゼロ）がそのままデプロイされ、`wrangler.jsonc` の `main` は
+`src/worker.js` を指します。`dist/` は生成されません（`npm run build` は
+`node --check src/worker.js` の構文チェックのみ）。以下に残る 2026-11-23 の実測は
+旧 `.cljk` 経路（shadow-cljs / amu が通らなかった経緯）の履歴です。
+テストは `npm test`（`node --test test/worker.test.js`、ネットワーク不要・fetch スタブ）で通ります。
+
+---
+
+（以下、2026-11-23 実測の履歴）
+
+**旧結論（2026-11-23 実測）**: `npm run build`（= `amu compile --target wasm32-browser worker redirect`）は
 **この機械では通らない**。`amu` が無くても、有っても同じ（用法エラー exit 2）。
 `reader/dist/worker.js` は**生成されなかった**（sha256 なし）。`npm test` も同じ。
 実際に `dist/worker.js` を作れるのは **shadow-cljs**（`devDependencies` + `shadow-cljs.edn`）だが、

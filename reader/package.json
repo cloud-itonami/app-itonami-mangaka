@@ -1,12 +1,10 @@
 {
   "name": "mangaka-reader",
   "private": true,
+  "type": "module",
   "scripts": {
-    "test": "amu compile --target wasm32-browser test && node out/node-tests.js",
-    "build": "amu compile --target wasm32-browser worker redirect",
-    "deploy": "npm run build && wrangler deploy"
-  },
-  "devDependencies": {
-    "shadow-cljs": "^2.28.20"
+    "test": "node --test test/worker.test.js",
+    "build": "node --check src/worker.js",
+    "deploy": "wrangler deploy"
   }
 }
