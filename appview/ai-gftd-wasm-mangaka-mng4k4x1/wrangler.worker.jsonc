@@ -17,9 +17,6 @@
   "d1_databases": [
     { "binding": "MANGAKA_DB", "database_name": "ai-gftd-mangaka", "database_id": "534176d4-980b-44d9-ad09-0e3e0ff327d9" }
   ],
-  "r2_buckets": [
-    { "binding": "CACHE_R2", "bucket_name": "ai-gftd-cache" }
-  ],
   "build": {
     "command": "cd ../../clj-edge && kbb -M:cljs -m shadow.cljs.devtools.cli release worker"
   }

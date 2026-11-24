@@ -25,6 +25,9 @@ type Env = {
   KOTOBA_BEARER?: string;
   COMFYUI_URL?: string;
   COMFYUI_API_KEY?: string;
+  // CACHE_R2 (ai-gftd-cache) binding was removed from wrangler.worker.jsonc
+  // (GFTD prune, 2026-11). Kept optional so blobPut's no-cache path stays
+  // type-checked if a replacement cache binding is added later.
   CACHE_R2?: R2Bucket;
 };
 
@@ -50,6 +53,12 @@ async function comfyRender(env: Env, spec: any): Promise<Render> {
     return b64 ? { imageB64: b64, mime: "image/png", source: "gateway", seed: spec.seed ?? 0 } : stubRender(spec);
   } catch (e) { console.warn("[mangaka] comfy failed:", e); return stubRender(spec); }
 }
+// No-cache path: the CACHE_R2 / ai-gftd-cache R2 binding was removed from
+// wrangler.worker.jsonc (GFTD prune, 2026-11), so env.CACHE_R2 is absent in
+// production and this returns null. Callers must tolerate image-key /
+// image-url = null (hGeneratePanel does). The replacement (yataverse ingest
+// vs commit-pin raw) is undecided, so blobPut is kept as a no-op rather than
+// deleted. Do not re-add an R2 binding here without a new decision.
 async function blobPut(env: Env, b64: string, mime: string): Promise<string | null> {
   if (!env.CACHE_R2) return null;
   try {
